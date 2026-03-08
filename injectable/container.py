@@ -23,9 +23,9 @@ from dataclasses import (
 )
 from .binding import AnyBinding, ClassBinding, ProviderBinding,BindingDescriptor
 from .scanner import ContainerScanner, DefaultContainerScanner
-from .metadata import Scope,ScopeLeak,_is_scope_leak
+from .metadata import Scope,ScopeLeak, _is_scope_leak, _DI_METADATA_ATTR
 from .scope import ScopeContext
-from .type import InjectMeta, LazyMeta, LazyProxy,_has_injectable_metadata,_get_injectable_metadata
+from .type import InjectMeta, LazyMeta, LazyProxy, _has_injectable_metadata, _get_injectable_metadata
 from .exceptions import CircularDependencyError, ProviderBindingNotDecoratedError
 from .decorator.lifecycle import LifecycleMarker
 from .metadata import _get_provider_metadata
@@ -39,6 +39,14 @@ _resolution_stack: ContextVar[list[type]] = ContextVar(
     "resolution_stack",
     default=[],
 )
+
+# ── Sentinel — unresolved hint signal ────────────────────────────
+# DESIGN: plain object() instead of None — None is a valid resolved value
+# (e.g. an Optional dependency that was intentionally bound to None).
+# Final prevents accidental reassignment; the sentinel identity check
+# (resolved_value is _UNRESOLVED) must remain stable for the lifetime of
+# the process.
+_UNRESOLVED: Final[object] = object()
 
 def _current_stack() -> list[type]:
     """Returns the current resolution stack for this thread/task."""
@@ -543,7 +551,6 @@ class DIContainer:
         """
         # Shared helper — same filter semantics as warm_up, documented once.
         singleton_bindings = self._filter_singleton(qualifier=qualifier, priority=priority)
-        tasks = []
         for binding in singleton_bindings:
             if isinstance(binding, ProviderBinding) and binding.is_async:
                 # Async provider — must be awaited. Calling without await would
@@ -587,7 +594,7 @@ class DIContainer:
             TypeError: If *cls* has no ``__di_metadata__`` attribute, meaning
                 it was not decorated with ``@Component`` or ``@Singleton``.
         """
-        if not cls.__dict__.get("__di_metadata__"):
+        if not cls.__dict__.get(_DI_METADATA_ATTR):
             raise TypeError(
                 f"{cls.__name__} must be decorated with @Component or @Singleton."
             )
@@ -825,8 +832,8 @@ class DIContainer:
             priority:  Exact priority to match. ``None`` returns the best available.
 
         Returns:
-            The lowest-priority-value binding among all matching candidates
-            (lower value = higher precedence).
+            The highest-priority binding among all matching candidates
+            (higher value = higher precedence).
 
         Raises:
             LookupError: No binding is registered for ``cls`` with the given
@@ -1109,7 +1116,7 @@ class DIContainer:
         return resolved
     
 
-    def _collect_dependecies(
+    def _collect_dependencies(
         self,
         fn: Callable[..., Any],
         qualifier: str | None = None,
@@ -1154,7 +1161,7 @@ class DIContainer:
               raise; see above swallow behaviour.
 
         Example:
-            bindings = self._collect_dependecies(MyService.__init__, qualifier="primary")
+            bindings = self._collect_dependencies(MyService.__init__, qualifier="primary")
         """
         try:
             # _build_localns() supplies a cached dict of every registered
@@ -1326,8 +1333,6 @@ class DIContainer:
                     if inject_meta.optional:
                         return None
                     raise
-            else:
-                return await self.aget(base_type)
 
         elif isinstance(hint, type) and self._is_resolvable(hint):
             return await self.aget(hint)
@@ -1813,7 +1818,7 @@ class DIContainer:
         """
         Dispatch to the correct dependency-collection strategy for a binding.
 
-        Acts as a type-based router — delegates to ``_collect_dependecies``
+        Acts as a type-based router — delegates to ``_collect_dependencies``
         for both ``ClassBinding`` and ``ProviderBinding``.  Raises immediately
         for unknown binding types so that missing implementations are caught at
         resolve-time rather than silently returning an empty list.
@@ -1846,7 +1851,7 @@ class DIContainer:
         Edge cases:
             - Binding has no annotated parameters → returns ``[]`` cleanly.
             - Optional/unresolvable hints → silently skipped by
-              ``_collect_dependecies`` (see its edge-case notes).
+              ``_collect_dependencies`` (see its edge-case notes).
             - ``_visited`` is an empty frozenset → no filtering; equivalent to
               passing ``None``.
             - All deps already in ``_visited`` → returns ``[]``.
@@ -1859,13 +1864,13 @@ class DIContainer:
                     traverse(dep, visited)
         """
         if isinstance(binding, ClassBinding):
-            deps = self._collect_dependecies(
+            deps = self._collect_dependencies(
                 fn=binding.implementation.__init__,
                 qualifier=binding.qualifier,
                 priority=binding.priority,
             )
         elif isinstance(binding, ProviderBinding):
-            deps = self._collect_dependecies(
+            deps = self._collect_dependencies(
                 fn=binding.fn,
                 qualifier=binding.qualifier,
                 priority=binding.priority,
@@ -1895,10 +1900,3 @@ class DIContainer:
         return f"DIContainer({self._bindings})"
 
 
-# ── Sentinel — unresolved hint signal ────────────────────────────
-# DESIGN: plain object() instead of None — None is a valid resolved value
-# (e.g. an Optional dependency that was intentionally bound to None).
-# Final prevents accidental reassignment; the sentinel identity check
-# (resolved_value is _UNRESOLVED) must remain stable for the lifetime of
-# the process.
-_UNRESOLVED: Final[object] = object()

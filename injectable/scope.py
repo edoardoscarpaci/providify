@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 import uuid
-import asyncio
 import threading
 from contextlib import contextmanager, asynccontextmanager
 from contextvars import ContextVar

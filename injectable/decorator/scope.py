@@ -4,7 +4,6 @@ import inspect
 from typing import (
     Callable,
     Any,
-    Type,
     TypeVar,
     overload,
 )
@@ -40,7 +39,7 @@ def _is_function_provider(obj: Any) -> bool:
 # ─────────────────────────────────────────────────────────────────
 def _make_decorator(scope: Scope) -> Any:
     @overload
-    def decorator(__cls: Type[T]) -> Type[T]: ...
+    def decorator(__cls: type[T]) -> type[T]: ...
 
     @overload
     def decorator(
@@ -49,7 +48,7 @@ def _make_decorator(scope: Scope) -> Any:
         qualifier: str | None = None,
         priority: int = 0,
         inherited: bool = False,
-    ) -> Callable[[Type[T]], Type[T]]: ...
+    ) -> Callable[[type[T]], type[T]]: ...
 
     def decorator(
         __cls: Any = None,
@@ -58,7 +57,7 @@ def _make_decorator(scope: Scope) -> Any:
         priority: int = 0,
         inherited: bool = False,
     ) -> Any:
-        def stamp(c: Type[T]) -> Type[T]:
+        def stamp(c: type[T]) -> type[T]:
             existing = _get_own_metadata(c)
 
             _set_metadata(c,

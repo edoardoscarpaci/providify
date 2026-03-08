@@ -63,7 +63,7 @@ class CircularDependencyError(InjectableError):
             f"Circular dependency detected: {cycle}\n"
             f"Break the cycle by:\n"
             f"  1. Introducing an interface between the dependent classes\n"
-            f"  2. Using lazy injection — Lazy[T] (not yet implemented)\n"
+            f"  2. Using lazy injection — Lazy[T]\n"
             f"  3. Restructuring to remove the mutual dependency"
         )
 
@@ -71,9 +71,10 @@ class ValidationError(InjectableError):
     pass
 
 class ScopeViolationDetectedError(ValidationError):
-    def __init__(self,scope_violations : List[ScopeLeak]):
+    def __init__(self,scope_violations : list[ScopeLeak]):
         self.scope_violations = scope_violations
-        message = ""
-        for violation in scope_violations:
-            message += f"Scope leak detected from binding {violation.binding[0].__name__} with scope {violation.binding[1].name} to reference {violation.reference[0].__name__} with scope {violation.reference[1].name}"
+        message = "\n".join([
+            f"Scope leak detected from binding {violation.binding[0].__name__} with scope {violation.binding[1].name} to reference {violation.reference[0].__name__} with scope {violation.reference[1].name}"
+            for violation in self.scope_violations
+        ])
         super().__init__(message)

@@ -6,8 +6,6 @@ from typing import (
     Annotated,
     Any,
     Generic,
-    List,
-    Protocol,
     Type,
     TypeVar,
     overload,
@@ -80,16 +78,16 @@ class _InjectedAlias:
     """
 
     @overload
-    def __getitem__(self, tp: Type[T]) -> Type[T]: ...          # Injected[T] → Type[T] for checker
+    def __getitem__(self, tp: type[T]) -> type[T]: ...          # Injected[T] → type[T] for checker
 
     @overload
     def __getitem__(self, tp: Any) -> Any: ...                  # fallback for complex types
 
-    def __getitem__(self, tp: Any) -> Any:                      # ✅ Any — Annotated can't satisfy Type[T]
+    def __getitem__(self, tp: Any) -> Any:                      # ✅ Any — Annotated can't satisfy type[T]
         return Annotated[tp, InjectMeta()]
 
     @overload
-    def __call__(self, tp: Type[T], *, qualifier: str | None = ..., priority: int | None = ..., optional: bool = ...) -> Type[T]: ...
+    def __call__(self, tp: type[T], *, qualifier: str | None = ..., priority: int | None = ..., optional: bool = ...) -> type[T]: ...
     @overload
     def __call__(self, tp: Any, *, qualifier: str | None = ..., priority: int | None = ..., optional: bool = ...) -> Any: ...
     def __call__(
@@ -112,14 +110,14 @@ class _InjectedInstancesAlias:
         InjectInstances(NotificationService, qualifier=X) ← call with options
     """
     @overload
-    def __getitem__(self, tp: Type[T]) -> Type[List[T]]: ...    # InjectedInstances[T] → List[T] for checker
+    def __getitem__(self, tp: type[T]) -> Type[list[T]]: ...    # InjectedInstances[T] → list[T] for checker
     @overload
     def __getitem__(self, tp: Any) -> Any: ...                  # fallback
-    def __getitem__(self, tp: Any) -> Any:                      # Any — Annotated[List[T], ...] != Type[List[T]]
-        return Annotated[List[tp], InjectMeta(all=True)]
+    def __getitem__(self, tp: Any) -> Any:                      # Any — Annotated[list[T], ...] != Type[list[T]]
+        return Annotated[list[tp], InjectMeta(all=True)]
 
     @overload
-    def __call__(self, tp: Type[T], *, qualifier: str | None = ...) -> Type[List[T]]: ...
+    def __call__(self, tp: type[T], *, qualifier: str | None = ...) -> Type[list[T]]: ...
     @overload
     def __call__(self, tp: Any, *, qualifier: str | None = ...) -> Any: ...
 
@@ -129,7 +127,7 @@ class _InjectedInstancesAlias:
         *,
         qualifier: str | None = None,
     ) -> Any:
-        return Annotated[List[tp], InjectMeta(all=True, qualifier=qualifier)]
+        return Annotated[list[tp], InjectMeta(all=True, qualifier=qualifier)]
 
 
 Inject = _InjectedAlias()
@@ -318,7 +316,7 @@ def _has_injectable_metadata(hint: Any) -> bool:
 
     Args:
         hint: Any type hint — bare types (int, str, MyClass), Annotated[T, ...],
-              or complex generics (List[T], Optional[T]) are all accepted.
+              or complex generics (list[T], Optional[T]) are all accepted.
 
     Returns:
         True  — hint is Annotated[T, ..., <_Injectable>, ...] with at least

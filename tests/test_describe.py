@@ -11,7 +11,7 @@ WHY MODULE-LEVEL FIXTURES:
   parameters.
 
 WHY Inject[T] SYNTAX:
-  ``_collect_dependecies`` (called by ``_get_dependencies``) only recognises
+  ``_collect_dependencies`` (called by ``_get_dependencies``) only recognises
   ``Annotated[T, InjectMeta(...)]`` hints — produced by the ``Inject[T]`` alias.
   Plain type-hints (e.g. ``def __init__(self, dep: MyClass)``) are invisible to
   this layer, so all constructor parameters in these fixtures use ``Inject[T]``.
@@ -56,7 +56,7 @@ class _DescLeaf:
 
 @Component
 class _DescMiddle:
-    """One-level dep: uses Inject[_DescLeaf] so _collect_dependecies sees it."""
+    """One-level dep: uses Inject[_DescLeaf] so _collect_dependencies sees it."""
 
     def __init__(self, leaf: Inject[_DescLeaf]) -> None:  # type: ignore[valid-type]
         self.leaf = leaf

@@ -22,10 +22,11 @@ class LifecycleMarker:
     but now __get__ never fires because we're not a descriptor.
     """
 
-    __slots__ = ("fn_name", "is_async")
+    __slots__ = ("fn_name", "is_async","fn_module")
 
     def __init__(self, fn: Callable[..., Any]) -> None:
         self.fn_name  = fn.__name__     # store name only — not the function itself
+        self.fn_module = fn.__module__
         self.is_async = inspect.iscoroutinefunction(fn)
 
     def __getstate__(self) -> dict[str, Any]:
@@ -39,7 +40,10 @@ class LifecycleMarker:
         if not isinstance(other, LifecycleMarker):
             return NotImplemented
         return self.fn_name == other.fn_name and self.is_async == other.is_async
-
+    
+    def __hash__(self) -> int:
+        return hash(self.fn_name + self.fn_module)
+    
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.fn_name!r}, is_async={self.is_async})"
 
@@ -118,7 +122,7 @@ def _find_lifecycle_hook(
         )
 
     _, name, marker = found[0]
-    return marker     # ✅ return name + marker — container calls getattr(instance, name)
+    return marker
 
 
 def _find_post_construct(cls: type) -> LifecycleMarker | None:
