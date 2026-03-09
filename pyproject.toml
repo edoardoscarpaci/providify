@@ -1,10 +1,33 @@
 [tool.poetry]
 name = "injectpy"
 version = "0.1.0"
-description = ""
+description = "A Python dependency injection container inspired by Jakarta CDI and Spring. Supports sync and async resolution, multiple scopes, lifecycle hooks, and configuration modules."
 authors = ["edoardo.scarpaci <edoardo.scarpaci@gmail.com>"]
+license = "Apache-2.0"
 readme = "README.md"
 packages = [{ include = "injectpy" }]
+keywords = [
+    "dependency injection",
+    "di",
+    "ioc",
+    "inversion of control",
+    "container",
+    "async",
+    "jakarta",
+    "spring",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 
 [tool.poetry.dependencies]
 python = ">=3.12"
