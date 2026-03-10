@@ -373,6 +373,90 @@ All `@Provider` options (`qualifier=`, `priority=`, `singleton=`) work normally 
 
 ---
 
+## Autodiscovery — `scan()`
+
+`scan()` inspects a module (or an entire package tree) and automatically registers every
+class and function that carries a scope decorator or `@Provider` — no manual `bind()` /
+`register()` / `provide()` call needed.
+
+```python
+container = DIContainer()
+
+# Scan a single module by dotted name
+container.scan("myapp.services")
+
+# Scan a whole package and every sub-package inside it
+container.scan("myapp", recursive=True)
+
+# Pass an already-imported module object instead of a string
+import myapp.repositories
+container.scan(myapp.repositories)
+```
+
+### What gets discovered
+
+| Decorator on the member | What the scanner registers |
+|-------------------------|---------------------------|
+| `@Component` / `@Singleton` / `@RequestScoped` / `@SessionScoped` | The class, bound to every abstract base class it implements; self-bound if it has none |
+| `@Provider` function | The function, equivalent to calling `container.provide(fn)` |
+| `@Configuration` class | **Not** picked up by `scan()` — use `container.install()` instead |
+
+### Abstract base class auto-binding
+
+When a scanned class implements one or more abstract base classes (ABCs), the scanner
+automatically binds each ABC to the concrete class. You can then resolve by the interface
+without writing any `bind()` call yourself.
+
+```python
+from abc import ABC, abstractmethod
+from providify import Component
+
+class IRepository(ABC):
+    @abstractmethod
+    def find_all(self) -> list: ...
+
+@Component
+class SqlRepository(IRepository):
+    def find_all(self) -> list:
+        return []
+
+container.scan("myapp.repositories")
+# Equivalent to: container.bind(IRepository, SqlRepository)
+
+repo = container.get(IRepository)   # SqlRepository is resolved
+```
+
+### What the scanner skips
+
+- **Private members** — anything whose name starts with `_`
+- **Re-exports** — symbols imported *into* the scanned module from somewhere else;
+  only members *defined* in that module are registered (prevents duplicate bindings)
+- **Plain classes** — classes without a scope decorator are silently ignored
+
+### Idempotency
+
+Calling `scan()` multiple times on the same module is safe — the scanner checks for
+existing bindings before registering and skips any class or provider that is already
+registered.
+
+```python
+container.scan("myapp.services")
+container.scan("myapp.services")   # no-op — bindings already present
+```
+
+### Recursive scanning
+
+Pass `recursive=True` to discover every sub-package automatically. Sub-modules that
+fail to import are logged as warnings and skipped rather than halting the entire scan.
+
+```python
+# Registers decorated members from myapp, myapp.services,
+# myapp.repositories, myapp.utils, and so on
+container.scan("myapp", recursive=True)
+```
+
+---
+
 ## Named qualifiers and priority
 
 ### @Named and @Priority decorators
