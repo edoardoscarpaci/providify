@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "providify"
-version = "0.1.1"
+version = "0.1.2"
 description = "A Python dependency injection container inspired by Jakarta CDI and Spring. Supports sync and async resolution, multiple scopes, lifecycle hooks, and configuration modules."
 authors = ["edoardo.scarpaci <edoardo.scarpaci@gmail.com>"]
 license = "Apache-2.0"

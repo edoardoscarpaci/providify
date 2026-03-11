@@ -55,7 +55,7 @@ testing = ["coverage", "pytest", "pytest-benchmark"]
 
 [[package]]
 name = "providify"
-version = "0.1.1"
+version = "0.1.2"
 description = "A Python dependency injection container inspired by Jakarta CDI and Spring. Supports sync and async resolution, multiple scopes, lifecycle hooks, and configuration modules."
 optional = false
 python-versions = ">=3.12"
