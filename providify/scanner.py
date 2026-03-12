@@ -6,7 +6,7 @@ import inspect
 import pkgutil
 from abc import ABC, abstractmethod
 from types import ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Generic, get_origin
 
 from .binding import ClassBinding, ProviderBinding
 from .metadata import _has_own_metadata, _has_provider_metadata
@@ -166,12 +166,19 @@ class DefaultContainerScanner(ContainerScanner):
 
         interfaces = self._find_interfaces(cls)
         if interfaces:
-            # Bind the class against each abstract base it implements
+            # Bind the class against each abstract base it implements.
+            # This includes both ABC-style abstract bases and parameterised
+            # generic bases like Repository[User].
             for interface in interfaces:
                 bindings.append(ClassBinding(interface, cls))
         else:
             # No abstract base — self-bind so the class can be resolved directly
             bindings.append(ClassBinding(cls, cls))
+
+        # Invalidate the localns cache — bindings were appended directly without
+        # going through bind()/register() which would have reset it themselves.
+        self._container._localns_cache = None
+        self._container._validated = False
 
     def _autoregister_provider(self, fn: Any) -> None:
         """Register a DI-annotated provider function, skipping duplicates.
@@ -190,21 +197,75 @@ class DefaultContainerScanner(ContainerScanner):
 
         self._container.provide(fn)
 
-    def _find_interfaces(self, cls: type) -> list[type]:
-        """Return the abstract base classes that *cls* directly or indirectly implements.
+    def _find_interfaces(self, cls: type) -> list[Any]:
+        """Return all interfaces that *cls* should be bound against during auto-scan.
 
-        Walks the MRO (excluding ``object``) and collects every class for which
-        :func:`inspect.isabstract` returns ``True``.
+        Collects two distinct kinds of interface:
+
+        1. **Abstract base classes** — any class in the full MRO (excluding
+           ``object``) for which :func:`inspect.isabstract` returns ``True``.
+           This covers the classic ``ABCMeta`` / ``@abstractmethod`` pattern.
+
+        2. **Parameterised generic bases** — entries in ``cls.__orig_bases__``
+           whose :func:`~typing.get_origin` is a concrete type (not bare
+           ``Generic``).  This covers the ``class UserRepository(Repository[User])``
+           pattern where ``Repository`` is a plain ``Generic[T]`` class without any
+           ``@abstractmethod``, and therefore *not* caught by ``inspect.isabstract``.
+
+        DESIGN: only the **direct** ``__orig_bases__`` of *cls* are examined for
+        generics (not the whole MRO).  Walking the full MRO would double-register
+        generic parents of parents, which creates duplicate bindings.  For example:
+
+            class TypedRepo(Repository[User]): ...    # has __orig_bases__ = [Repository[User]]
+            class UserRepository(TypedRepo): ...      # has __orig_bases__ = [TypedRepo]
+
+        Scanning ``UserRepository`` would correctly add ``TypedRepo`` (abstract check)
+        but NOT ``Repository[User]`` a second time.
+
+        Tradeoffs:
+            ✅ Handles both ABC-style and Generic-style interfaces automatically
+            ✅ Only direct generic bases examined — no accidental double-registration
+            ❌ Bare ``Generic[T]`` itself is skipped (origin is ``Generic``) — correct,
+               since ``Generic`` is an implementation detail, not a DI interface
+            ❌ TypeVar-parameterised bases (e.g. ``Repository[T]``) are included as-is;
+               the args comparison in ``_interface_matches`` will require an exact
+               match, so ``Repository[T]`` ≠ ``Repository[User]`` at resolution time  ⚠️
 
         Args:
-            cls: The class whose MRO should be examined.
+            cls: The decorated class to inspect.
 
         Returns:
-            A list of abstract base classes, in MRO order.  Empty list if *cls*
-            implements no abstract bases.
+            A list of interfaces (concrete types or generic aliases), possibly empty.
+            Duplicates between the two collection strategies are suppressed.
+
+        Edge cases:
+            - cls has no abstract bases and no generic bases → returns ``[]``
+            - cls inherits from both an ABC and a generic → both are included
+            - cls has a generic base where origin equals an abstract base already
+              found → parameterised form is still added (different interface)
         """
-        return [
+        # ── 1. Abstract base classes from the full MRO ────────────────────────
+        abstract_bases: list[Any] = [
             base
             for base in cls.__mro__[1:]
             if base is not object and inspect.isclass(base) and inspect.isabstract(base)
         ]
+
+        # ── 2. Parameterised generic bases from cls's OWN __orig_bases__ ──────
+        # __orig_bases__ preserves the full generic form; __bases__ strips args.
+        # We check only cls's direct bases (not ancestors) to prevent the
+        # MRO-duplication problem described above.
+        generic_bases: list[Any] = []
+        for base in getattr(cls, "__orig_bases__", ()):
+            origin = get_origin(base)
+            # Skip non-generic bases (origin is None) and bare Generic[T]
+            # (origin is Generic) — Generic itself is not a DI interface.
+            if origin is None or origin is Generic:
+                continue
+            generic_bases.append(base)
+
+        # Deduplicate: if a generic base is already represented by its origin in
+        # abstract_bases, still include the parameterised form — it is a distinct
+        # interface (Repository[User] ≠ Repository for lookup purposes).
+        seen = set(id(i) for i in abstract_bases)
+        return abstract_bases + [b for b in generic_bases if id(b) not in seen]

@@ -36,6 +36,7 @@ from .type import (
     LazyProxy,
     _has_providify_metadata,
 )
+from .utils import _interface_matches, _type_name
 
 T = TypeVar("T")
 
@@ -293,12 +294,20 @@ class DIContainer:
 
     # ── Registration ──────────────────────────────────────────────
 
-    def bind(self, interface: type[T], implementation: type[T]) -> None:
+    def bind(self, interface: Any, implementation: type) -> None:
         """Bind an interface type to a concrete implementation class.
+
+        *interface* may be a concrete type (``Repository``) or a parameterised
+        generic alias (``Repository[User]``).  The container will match any
+        ``get(Repository[User])`` call — or a plain ``repo: Repository[User]``
+        annotation — to this binding.
 
         Args:
             interface:      The abstract type (or base class) callers will resolve.
+                            Accepts both concrete types and generic aliases.
             implementation: The concrete class that will be instantiated.
+                            Must be a subclass of *interface*'s origin type and
+                            must implement the exact type parameterisation.
 
         Returns:
             None
@@ -468,7 +477,7 @@ class DIContainer:
 
     def get(
         self,
-        cls: type[T],
+        cls: type[T] | Any,
         qualifier: str | None = None,
         priority: int | None = None,
     ) -> T:
@@ -504,7 +513,7 @@ class DIContainer:
 
     def get_all(
         self,
-        cls: type[T],
+        cls: type[T] | Any,
         qualifier: str | None = None,
     ) -> list[T]:
         """Resolve every binding that matches *cls*, synchronously.
@@ -525,7 +534,7 @@ class DIContainer:
         """
         candidates = self._filter(cls, qualifier=qualifier)
         if not candidates:
-            raise LookupError(f"No bindings found for '{cls.__name__}'.")
+            raise LookupError(f"No bindings found for '{_type_name(cls)}'.")
 
         # Guard — fail early if any candidate is async
         async_providers = [
@@ -549,7 +558,7 @@ class DIContainer:
 
     async def aget(
         self,
-        cls: type[T],
+        cls: type[T] | Any,
         qualifier: str | None = None,
         priority: int | None = None,
     ) -> T:
@@ -580,7 +589,7 @@ class DIContainer:
 
     async def aget_all(
         self,
-        cls: type[T],
+        cls: type[T] | Any,
         qualifier: str | None = None,
     ) -> list[T]:
         """Resolve every binding that matches *cls*, asynchronously.
@@ -603,7 +612,7 @@ class DIContainer:
         """
         candidates = self._filter(cls, qualifier=qualifier)
         if not candidates:
-            raise LookupError(f"No bindings found for '{cls.__name__}'.")
+            raise LookupError(f"No bindings found for '{_type_name(cls)}'.")
         if not self._validated:
             self.validate_bindings()
             self._validated = True
@@ -636,9 +645,10 @@ class DIContainer:
         return [
             b
             for b in self._bindings
-            # DESIGN: all three predicates in one comprehension — avoids building
-            # intermediate lists when optional filters are active.
-            if issubclass(b.interface, cls)
+            # DESIGN: _interface_matches replaces plain issubclass so that generic
+            # aliases like Repository[User] are matched correctly — issubclass does
+            # not accept parameterised types as its second argument.
+            if _interface_matches(b.interface, cls)
             and (qualifier is None or b.qualifier == qualifier)
             and (priority is None or b.priority == priority)
         ]
@@ -697,7 +707,7 @@ class DIContainer:
         candidates = self._filter(cls, qualifier=qualifier, priority=priority)
         if not candidates:
             raise LookupError(
-                f"No binding found for '{cls.__name__}'"
+                f"No binding found for '{_type_name(cls)}'"
                 + (f" qualifier={qualifier!r}" if qualifier else "")
                 + ". Did you forget container.bind() or container.provide()?"
             )
@@ -729,7 +739,7 @@ class DIContainer:
                 cache = self.scope_context.get_request_cache()
                 if cache is None:
                     raise RuntimeError(
-                        f"Cannot resolve @RequestScoped '{binding.interface.__name__}' "
+                        f"Cannot resolve @RequestScoped '{_type_name(binding.interface)}' "
                         f"outside of an active request context. "
                         f"Use: with container.scope_context.request(): ..."
                         f" or async with container.scope_context.arequest(): ..."
@@ -740,7 +750,7 @@ class DIContainer:
                 cache = self.scope_context.get_session_cache()
                 if cache is None:
                     raise RuntimeError(
-                        f"Cannot resolve @SessionScoped '{binding.interface.__name__}' "
+                        f"Cannot resolve @SessionScoped '{_type_name(binding.interface)}' "
                         f"outside of an active session context. "
                         f"Use: with container.scope_context.session(): ..."
                         f" or async with container.scope_context.asession(): ..."
@@ -823,16 +833,19 @@ class DIContainer:
 
     # ── Type-hint resolution ──────────────────────────────────────
 
-    def _is_resolvable(self, hint: type) -> bool:
-        """Return ``True`` if at least one binding's interface is a subclass of *hint*.
+    def _is_resolvable(self, hint: Any) -> bool:
+        """Return ``True`` if at least one binding's interface satisfies *hint*.
+
+        Accepts both concrete types and parameterised generic aliases.
 
         Args:
-            hint: The type to check.
+            hint: The type or generic alias to check.
 
         Returns:
             ``True`` if a matching binding exists, ``False`` otherwise.
         """
-        return any(issubclass(b.interface, hint) for b in self._bindings)
+        # _interface_matches replaces issubclass — handles generic aliases safely
+        return any(_interface_matches(b.interface, hint) for b in self._bindings)
 
     def _build_localns(self) -> dict[str, type]:
         """Return a cached ``localns`` dict for use with ``get_type_hints()``.
@@ -863,12 +876,42 @@ class DIContainer:
         if self._localns_cache is None:
             localns: dict[str, type] = {}
             for b in self._bindings:
-                # Interface — what callers annotate against (e.g. Repository)
-                localns[b.interface.__name__] = b.interface
+                # Interface — what callers annotate against (e.g. Repository).
+                # For generic aliases (Repository[User]), __name__ does not exist;
+                # map the origin type (Repository) instead so string annotations
+                # like "Repository" in PEP-563 deferred mode still resolve.
+                iface_origin = get_origin(b.interface)
+                if iface_origin is not None:
+                    # Generic alias: map "Repository" → Repository (origin type)
+                    localns[iface_origin.__name__] = iface_origin
+                else:
+                    localns[b.interface.__name__] = b.interface  # type: ignore[union-attr]
                 if isinstance(b, ClassBinding):
                     # Implementation — annotations may reference the concrete
                     # class directly rather than the abstract interface.
                     localns[b.implementation.__name__] = b.implementation
+
+                    # Also add any generic origin types and their type arguments
+                    # from the implementation's __orig_bases__.
+                    #
+                    # DESIGN: PEP-563 (from __future__ import annotations) makes
+                    # ALL annotations lazy strings.  When a caller annotates a
+                    # parameter as `repo: Repository[User]`, the string
+                    # `"Repository[User]"` must be eval'd by get_type_hints().
+                    # That eval needs both `Repository` (the generic class) and
+                    # `User` (the type argument) in the namespace.
+                    #
+                    # These are often locally-defined types that are absent from
+                    # fn.__globals__, so we harvest them here from the MRO of
+                    # each registered implementation — the only place where the
+                    # full parameterised form is preserved.
+                    for base in getattr(b.implementation, "__orig_bases__", ()):
+                        origin = get_origin(base)
+                        if origin is not None and isinstance(origin, type):
+                            localns[origin.__name__] = origin
+                        for arg in get_args(base):
+                            if isinstance(arg, type):
+                                localns[arg.__name__] = arg
             self._localns_cache = localns
         return self._localns_cache
 
@@ -1107,7 +1150,12 @@ class DIContainer:
                         return None
                     raise
 
-        elif isinstance(hint, type) and self._is_resolvable(hint):
+        elif (
+            isinstance(hint, type) or get_origin(hint) is not None
+        ) and self._is_resolvable(hint):
+            # DESIGN: also accept generic aliases (e.g. Repository[User]) which are
+            # not `type` instances but do have a get_origin().  Plain annotations
+            # like `repo: Repository[User]` land here when no Inject[] wrapper is used.
             return self.get(hint)
 
         return _UNRESOLVED  # signal: no binding found, caller decides
@@ -1163,7 +1211,10 @@ class DIContainer:
                         return None
                     raise
 
-        elif isinstance(hint, type) and self._is_resolvable(hint):
+        elif (
+            isinstance(hint, type) or get_origin(hint) is not None
+        ) and self._is_resolvable(hint):
+            # Mirror of _resolve_hint_sync — accept generic aliases here too
             return await self.aget(hint)
 
         return _UNRESOLVED

@@ -23,6 +23,7 @@ from .metadata import (
     _get_metadata,
     _get_provider_metadata,
 )
+from .utils import _is_generic_subtype, _type_name
 
 if TYPE_CHECKING:
     from .container import DIContainer
@@ -144,9 +145,15 @@ class ClassBinding(Binding):
                 metadata — i.e. it was not decorated with ``@Component`` or
                 ``@Singleton``.
         """
-        if not issubclass(implementation, interface):
+        # DESIGN: use _is_generic_subtype instead of plain issubclass so that
+        # parameterised interfaces like Repository[User] are accepted.
+        # issubclass(UserRepository, Repository[User]) raises TypeError at runtime
+        # because Python's issubclass does not accept generic aliases as the second
+        # argument.  _is_generic_subtype extracts the origin type for the subclass
+        # check and then validates the type args via an __orig_bases__ MRO walk.
+        if not _is_generic_subtype(implementation, interface):
             raise TypeError(
-                f"{implementation.__name__} must be a subclass of {interface.__name__}"
+                f"{implementation.__name__} must be a subclass of {_type_name(interface)}"
             )
 
         self.interface = interface
@@ -164,9 +171,10 @@ class ClassBinding(Binding):
 
     def __repr__(self) -> str:
         qualifier_part = f", qualifier={self.qualifier!r}" if self.qualifier else ""
+        # _type_name handles both concrete types (__name__) and generic aliases (str())
         return (
             f"ClassBinding("
-            f"{self.interface.__name__} → {self.implementation.__name__}, "
+            f"{_type_name(self.interface)} → {self.implementation.__name__}, "
             f"scope={self.scope.name}"
             f"{qualifier_part})"
         )
@@ -265,7 +273,7 @@ class ClassBinding(Binding):
         visited = _visited or frozenset()
         if self.interface in visited:
             return BindingDescriptor(
-                interface=f"{self.interface.__name__} [CYCLE DETECTED]",
+                interface=f"{_type_name(self.interface)} [CYCLE DETECTED]",
                 implementation="—",
                 scope=self.scope,
             )
@@ -278,7 +286,7 @@ class ClassBinding(Binding):
         ]
 
         return BindingDescriptor(
-            interface=self.interface.__name__,
+            interface=_type_name(self.interface),
             implementation=self.implementation.__name__,
             scope=self.scope,
             qualifier=self.qualifier,
@@ -392,9 +400,10 @@ class ProviderBinding(Binding):
     def __repr__(self) -> str:
         qualifier_part = f", qualifier={self.qualifier!r}" if self.qualifier else ""
         async_part = ", async" if self.is_async else ""
+        # _type_name handles both concrete types (__name__) and generic aliases (str())
         return (
             f"ProviderBinding("
-            f"{self.interface.__name__} ← {self.fn.__name__}, "
+            f"{_type_name(self.interface)} ← {self.fn.__name__}, "
             f"scope={self.scope.name}"
             f"{qualifier_part}"
             f"{async_part})"
@@ -476,7 +485,7 @@ class ProviderBinding(Binding):
         visited = _visited or frozenset()
         if self.interface in visited:
             return BindingDescriptor(
-                interface=f"{self.interface.__name__} [CYCLE DETECTED]",
+                interface=f"{_type_name(self.interface)} [CYCLE DETECTED]",
                 implementation="—",
                 scope=self.scope,
             )
@@ -489,7 +498,7 @@ class ProviderBinding(Binding):
         ]
 
         return BindingDescriptor(
-            interface=self.interface.__name__,
+            interface=_type_name(self.interface),
             implementation=self.fn.__name__,
             scope=self.scope,
             qualifier=self.qualifier,
