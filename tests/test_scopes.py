@@ -19,7 +19,7 @@ import pytest
 
 from providify.container import DIContainer
 from providify.decorator.scope import Component, RequestScoped, SessionScoped, Singleton
-from providify.exceptions import ScopeViolationDetectedError
+from providify.exceptions import LiveInjectionRequiredError
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -219,11 +219,12 @@ class TestScopeViolation:
     def test_singleton_depending_on_request_scoped_raises(
         self, container: DIContainer
     ) -> None:
-        """A SINGLETON that holds a REQUEST-scoped dep must raise ScopeViolationDetectedError.
+        """A SINGLETON that holds a REQUEST-scoped dep without Live[T] raises LiveInjectionRequiredError.
 
-        DESIGN: This is a "scope leak" — the singleton would cache the first
-        request instance and serve it to all future requests, leaking data across
-        request boundaries. The container detects this during validate_bindings().
+        DESIGN: Using Inject[T] or a bare type annotation for a REQUEST-scoped dep
+        inside a SINGLETON captures one instance at construction time — that instance
+        becomes stale across request boundaries. The container detects this during
+        validate_bindings() and requires the developer to use Live[T] instead.
         """
 
         @Singleton
@@ -234,8 +235,10 @@ class TestScopeViolation:
         container.register(RequestService)
         container.register(BadSingleton)
 
-        # First get() triggers validate_bindings() which calls ClassBinding.validate()
-        with pytest.raises(ScopeViolationDetectedError):
+        # First get() triggers validate_bindings() which calls ClassBinding.validate().
+        # LiveInjectionRequiredError is raised because Inject[T]/bare type is unsafe
+        # for REQUEST-scoped deps in longer-lived components.
+        with pytest.raises(LiveInjectionRequiredError):
             container.get(BadSingleton)
 
 

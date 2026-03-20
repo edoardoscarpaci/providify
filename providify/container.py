@@ -17,9 +17,10 @@ from typing import (
 
 from .binding import AnyBinding, ClassBinding, ProviderBinding
 from .descriptor import DIContainerDescriptor
-from .exceptions import CircularDependencyError
+from .exceptions import CircularDependencyError, LiveInjectionRequiredError
 from .decorator.lifecycle import LifecycleMarker
 from .metadata import (
+    LiveInjectionViolation,
     Scope,
     ScopeLeak,
     _has_own_metadata,
@@ -34,7 +35,10 @@ from .type import (
     InjectMeta,
     LazyMeta,
     LazyProxy,
+    LiveMeta,
+    LiveProxy,
     _has_providify_metadata,
+    _providify,
 )
 from .utils import _interface_matches, _type_name
 
@@ -741,8 +745,8 @@ class DIContainer:
                     raise RuntimeError(
                         f"Cannot resolve @RequestScoped '{_type_name(binding.interface)}' "
                         f"outside of an active request context. "
-                        f"Use: with container.scope_context.request(): ..."
-                        f" or async with container.scope_context.arequest(): ..."
+                        f"Use: with container.request(): ..."
+                        f" or async with container.arequest(): ..."
                     )
                 return cache
 
@@ -752,8 +756,8 @@ class DIContainer:
                     raise RuntimeError(
                         f"Cannot resolve @SessionScoped '{_type_name(binding.interface)}' "
                         f"outside of an active session context. "
-                        f"Use: with container.scope_context.session(): ..."
-                        f" or async with container.scope_context.asession(): ..."
+                        f"Use: with container.session(...): ..."
+                        f" or async with container.asession(...): ..."
                     )
                 return cache
 
@@ -1113,13 +1117,23 @@ class DIContainer:
         if get_origin(hint) is Annotated:
             args = get_args(hint)
             base_type = args[0]
-            # Check LazyMeta first — a hint can't be both Lazy and Inject simultaneously.
-            # Lazy wins because it wraps the resolution in a proxy; if it were treated as
-            # a plain Inject, resolution would happen eagerly and break the deferral guarantee.
+            # Priority order: LiveMeta → LazyMeta → InjectMeta.
+            # A hint can only carry one _providify marker at a time, but we
+            # check in this order so the most specific proxy type wins.
+            live_meta = next((a for a in args[1:] if isinstance(a, LiveMeta)), None)
             lazy_meta = next((a for a in args[1:] if isinstance(a, LazyMeta)), None)
             inject_meta = next((a for a in args[1:] if isinstance(a, InjectMeta)), None)
 
-            if lazy_meta:
+            if live_meta:
+                # Return a LiveProxy — re-resolves on every .get() call.
+                # Correct for REQUEST/SESSION scoped deps held by longer-lived components.
+                return LiveProxy(
+                    self,
+                    base_type,
+                    qualifier=live_meta.qualifier,
+                    priority=live_meta.priority,
+                )
+            elif lazy_meta:
                 # Return a proxy now — actual resolution is deferred to .get() call time.
                 # This breaks circular dependency cycles: both constructors return before
                 # either dependency is resolved, so the stack never sees a cycle.
@@ -1180,11 +1194,20 @@ class DIContainer:
         if get_origin(hint) is Annotated:
             args = get_args(hint)
             base_type = args[0]
-            # Mirror of _resolve_hint_sync — LazyMeta checked first for the same reason.
+            # Mirror of _resolve_hint_sync — same priority order: Live → Lazy → Inject.
+            live_meta = next((a for a in args[1:] if isinstance(a, LiveMeta)), None)
             lazy_meta = next((a for a in args[1:] if isinstance(a, LazyMeta)), None)
             inject_meta = next((a for a in args[1:] if isinstance(a, InjectMeta)), None)
 
-            if lazy_meta:
+            if live_meta:
+                # Proxy creation is always sync — the proxy's .aget() method is async.
+                return LiveProxy(
+                    self,
+                    base_type,
+                    qualifier=live_meta.qualifier,
+                    priority=live_meta.priority,
+                )
+            elif lazy_meta:
                 # Proxy creation is always sync — the proxy's .aget() method is async.
                 return LazyProxy(
                     self,
@@ -1443,6 +1466,158 @@ class DIContainer:
         else:
             bound()
 
+    # ── Scope context — convenience façade ───────────────────────
+    #
+    # DESIGN: these methods delegate to self.scope_context so callers
+    # never need to access the attribute directly.  The container is
+    # the single public entry point; scope_context is an implementation
+    # detail.
+    #
+    #   Before:  with container.scope_context.request(): ...
+    #   After:   with container.request(): ...
+
+    def request(self) -> Any:
+        """Activate a sync request scope context.
+
+        Shorthand for ``container.scope_context.request()``.
+        All @RequestScoped components resolved inside this block share one
+        instance; a fresh instance is created for each new block.
+
+        Returns:
+            A sync context manager that yields the request ID string.
+
+        Example:
+            with container.request():
+                svc = container.get(MyRequestScopedService)
+        """
+        return self.scope_context.request()
+
+    def arequest(self) -> Any:
+        """Activate an async request scope context.
+
+        Shorthand for ``container.scope_context.arequest()``.
+
+        Returns:
+            An async context manager that yields the request ID string.
+
+        Example:
+            async with container.arequest():
+                svc = await container.aget(MyRequestScopedService)
+        """
+        return self.scope_context.arequest()
+
+    def session(self, session_id: str | None = None) -> Any:
+        """Activate a sync session scope context.
+
+        Shorthand for ``container.scope_context.session(session_id)``.
+        Reuses an existing session cache when the same session_id is
+        provided, creating a new one on first use.
+
+        Args:
+            session_id: Explicit session identifier (e.g. a user ID or
+                        cookie value). A random UUID is used when omitted.
+
+        Returns:
+            A sync context manager that yields the session ID string.
+
+        Example:
+            with container.session("user-abc"):
+                profile = container.get(UserProfile)
+        """
+        return self.scope_context.session(session_id)
+
+    def asession(self, session_id: str | None = None) -> Any:
+        """Activate an async session scope context.
+
+        Shorthand for ``container.scope_context.asession(session_id)``.
+
+        Args:
+            session_id: Explicit session identifier. A random UUID is
+                        used when omitted.
+
+        Returns:
+            An async context manager that yields the session ID string.
+
+        Example:
+            async with container.asession("user-abc"):
+                async with container.arequest():
+                    profile = await container.aget(UserProfile)
+        """
+        return self.scope_context.asession(session_id)
+
+    def invalidate_session(self, session_id: str) -> None:
+        """Destroy a session cache — call on logout or session expiry.
+
+        Shorthand for ``container.scope_context.invalidate_session(session_id)``.
+
+        Args:
+            session_id: The session ID to invalidate. No-op if unknown.
+        """
+        self.scope_context.invalidate_session(session_id)
+
+    def set_scoped(self, tp: type, instance: object) -> None:
+        """Register a pre-built instance into the currently active scope cache.
+
+        This lets middleware (or any code that runs inside a ``request()`` /
+        ``session()`` block) push an already-constructed value into the DI
+        container so that later ``get(tp)`` calls return it directly — without
+        invoking any provider or constructor.
+
+        The request cache is preferred when both are active (request scope is
+        more specific than session scope).
+
+        Args:
+            tp:       The type to register the instance under — must match
+                      the type used in ``container.get(tp)`` at resolution time.
+            instance: The pre-built instance to store.
+
+        Returns:
+            None
+
+        Raises:
+            RuntimeError: If neither a request nor a session scope context
+                is currently active.
+
+        Edge cases:
+            - Calling set_scoped() twice with the same type overwrites the
+              first value — last write wins within a scope.
+            - The instance is only visible for the lifetime of the current
+              scope block; it is discarded when the context manager exits.
+            - set_scoped() uses the class itself as the cache key, matching
+              the key produced by ClassBinding._get_cache_key().  Registering
+              under a base class / interface requires a separate call.
+
+        Example — FastAPI JWT middleware::
+
+            @app.middleware("http")
+            async def jwt_middleware(request: Request, call_next):
+                raw = request.headers.get("Authorization", "")
+                if raw.startswith("Bearer "):
+                    token = decode_jwt(raw.removeprefix("Bearer "))
+                    container.set_scoped(JWTToken, token)
+                return await call_next(request)
+
+        Thread safety:  ✅ Safe — writes to the per-request dict which is
+                        isolated to the current ContextVar scope.
+        Async safety:   ✅ Safe — each asyncio Task has its own request cache
+                        via ContextVar; concurrent requests never interfere.
+        """
+        # Prefer the request cache — it is more specific and shorter-lived.
+        # Fall back to session cache so set_scoped() also works inside
+        # session-only blocks (e.g. session setup middleware without an
+        # inner request block).
+        cache = self.scope_context.get_request_cache()
+        if cache is None:
+            cache = self.scope_context.get_session_cache()
+        if cache is None:
+            raise RuntimeError(
+                f"set_scoped({tp.__name__!r}) called outside any active scope context. "
+                f"Wrap the call inside `with container.request():` or "
+                f"`with container.session(...):` first."
+            )
+        # Cache key matches _get_cache_key() for ClassBinding — the concrete class.
+        cache[tp] = instance
+
     # ── Shutdown ──────────────────────────────────────────────────
 
     def shutdown(self) -> None:
@@ -1538,27 +1713,69 @@ class DIContainer:
             per violating dependency. An empty list means no leaks were found.
         """
         leaks: list[ScopeLeak] = []
+        # Accumulated Live[T] violations — raised as a group so the developer
+        # sees all affected parameters at once, not just the first one.
+        live_violations: list[LiveInjectionViolation] = []
         try:
+            # include_extras=True preserves Annotated wrappers — we need the
+            # InjectMeta / LazyMeta / LiveMeta inside them to distinguish HOW
+            # each dep is wired, not just what type it resolves to.
             hints = get_type_hints(binding.implementation.__init__, include_extras=True)
         except Exception:
             return leaks
 
         hints.pop("return", None)
-        for _, hint in hints.items():
-            base_type = get_args(hint)[0] if get_origin(hint) is Annotated else hint
+        for param_name, hint in hints.items():
+            # Extract the injection marker BEFORE stripping Annotated — we need
+            # to know whether the caller used Inject[T], Lazy[T], Live[T], or a
+            # bare type.  Bare type and Inject[T] are wrong for scoped deps;
+            # Lazy[T] is also wrong (it caches after the first call); Live[T] is correct.
+            inject_marker: _providify | None = None
+            if get_origin(hint) is Annotated:
+                args = get_args(hint)
+                base_type = args[0]
+                inject_marker = next(
+                    (a for a in args[1:] if isinstance(a, _providify)), None
+                )
+            else:
+                base_type = hint
+
             if not isinstance(base_type, type):
                 continue
+
             dep_bindings = self._filter(
                 base_type, qualifier=qualifier, priority=priority
             )
             for dep in dep_bindings:
-                if _is_scope_leak(parent_scope=binding.scope, dep_scope=dep.scope):
+                if not _is_scope_leak(parent_scope=binding.scope, dep_scope=dep.scope):
+                    continue
+
+                if dep.scope in (Scope.REQUEST, Scope.SESSION):
+                    # REQUEST and SESSION scoped deps must always be wrapped in Live[T]
+                    # when held by a longer-lived component.  Inject[T] and Lazy[T]
+                    # both capture one instance at construction time — that instance
+                    # becomes stale the moment the scope boundary rotates.
+                    if not isinstance(inject_marker, LiveMeta):
+                        live_violations.append(
+                            LiveInjectionViolation(
+                                binding=(binding.implementation, binding.scope),
+                                dep=(base_type, dep.scope),
+                                param_name=param_name,
+                            )
+                        )
+                else:
+                    # Non-scoped leak (e.g. SINGLETON holding a DEPENDENT dep) —
+                    # kept as a regular ScopeLeak, not a Live injection error.
                     leaks.append(
                         ScopeLeak(
                             binding=(binding.implementation, binding.scope),
                             reference=(dep.interface, dep.scope),
                         )
                     )
+
+        if live_violations:
+            raise LiveInjectionRequiredError(violations=live_violations)
+
         return leaks
 
     def validate_bindings(self) -> None:

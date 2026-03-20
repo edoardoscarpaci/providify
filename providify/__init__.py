@@ -21,6 +21,8 @@ __all__ = [
     "Inject",
     "InjectInstances",
     "Lazy",
+    "Live",
+    "LiveProxy",
 ]
 from .container import DIContainer, ScopeContext
 from .decorator.scope import (
@@ -34,7 +36,7 @@ from .decorator.scope import (
 )
 from .decorator.lifecycle import PostConstruct, PreDestroy
 from .decorator.module import Configuration
-from .type import Inject, InjectInstances, Lazy
+from .type import Inject, InjectInstances, Lazy, Live, LiveProxy
 
 import logging
 

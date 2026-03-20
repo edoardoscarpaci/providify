@@ -453,6 +453,7 @@ def Provider(
     qualifier: str | None = None,
     priority: int = 0,
     singleton: bool = False,
+    scope: Scope | None = None,
 ) -> Callable[[Callable[..., R]], Callable[..., R]]: ...
 
 
@@ -462,6 +463,11 @@ def Provider(
     qualifier: str | None = None,
     priority: int = 0,
     singleton: bool = False,
+    # scope — explicit Scope value, overrides singleton flag when set.
+    # Enables @Provider to produce REQUEST or SESSION scoped values,
+    # mirroring Jakarta CDI's @Produces @RequestScoped pattern.
+    # Example: @Provider(scope=Scope.REQUEST)
+    scope: Scope | None = None,
 ) -> Any:
     """
     Marks a function as a DI provider.
@@ -472,6 +478,11 @@ def Provider(
     so ProviderBinding never needs to call inspect at resolution time.
 
     Equivalent to Jakarta's @Produces / @Bean.
+
+    Scope resolution priority:
+        1. ``scope=Scope.REQUEST`` / ``scope=Scope.SESSION`` — explicit scope
+        2. ``singleton=True``                                — Scope.SINGLETON
+        3. default                                           — Scope.DEPENDENT
 
     Usage:
         @Provider
@@ -487,6 +498,12 @@ def Provider(
             pool = DatabasePool()
             await pool.connect()    # async initialisation ✅
             return pool
+
+        # Mimic Jakarta's @Produces @RequestScoped —
+        # factory runs once per request, result cached for its duration.
+        @Provider(scope=Scope.REQUEST)
+        def jwt_token(header: Inject[AuthHeader]) -> JWTToken:
+            return JWTToken.decode(header.value)
     """
 
     def decorator(fn: Callable[..., R]) -> Callable[..., R]:
@@ -499,6 +516,7 @@ def Provider(
                     singleton=singleton,
                     qualifier=qualifier,
                     priority=priority,
+                    scope=scope,
                     is_async=inspect.iscoroutinefunction(
                         fn
                     ),  # detected once at decoration time
@@ -508,6 +526,7 @@ def Provider(
                     singleton=singleton,
                     qualifier=qualifier,
                     priority=priority,
+                    scope=scope,
                     is_async=inspect.iscoroutinefunction(
                         fn
                     ),  # detected once at decoration

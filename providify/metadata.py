@@ -45,6 +45,28 @@ class ScopeLeak:
     reference: tuple[Type, Scope]
 
 
+@dataclass(frozen=True)
+class LiveInjectionViolation:
+    """Records a single case where a REQUEST/SESSION dep was not wrapped in Live[T].
+
+    Produced by the container's scope-violation check when a longer-lived
+    component (e.g. SINGLETON) injects a REQUEST or SESSION scoped dep via
+    Inject[T], Lazy[T], or a bare type annotation — all of which capture a
+    single instance at construction time and become stale across scope boundaries.
+
+    Attributes:
+        binding:    (owning class, its scope) — the component that declared the dep.
+        dep:        (dep type, dep scope)      — the scoped dependency being injected.
+        param_name: Constructor parameter name where the violation occurred.
+    """
+
+    binding: tuple[Type, Scope]
+    dep: tuple[Type, Scope]
+    # Tracks which parameter the violation came from — used in error messages
+    # so developers can find the exact injection point without reading stack traces.
+    param_name: str
+
+
 _DI_METADATA_ATTR = "__di_metadata__"  # storage slot only — not a semantic key
 _DI_PROVIDER_ATTR = "__di_provider__"  # storage slot only
 _DI_CONFIGURATION_ATTR = "__di_module__"
@@ -108,9 +130,14 @@ class ProviderMetadata:
     """
     Holds all DI metadata for a @Provider function.
     Stored directly on the function via __dict__ — same guarantees.
+
+    Scope resolution priority (highest wins):
+        1. ``scope`` — explicit Scope value, covers all four scopes
+        2. ``singleton=True`` — shorthand for Scope.SINGLETON (backward compat)
+        3. default — Scope.DEPENDENT (new instance on every resolution)
     """
 
-    __slots__ = ("qualifier", "priority", "singleton", "is_async")
+    __slots__ = ("qualifier", "priority", "singleton", "is_async", "scope")
 
     def __init__(
         self,
@@ -118,11 +145,16 @@ class ProviderMetadata:
         priority: int = 0,
         singleton: bool = False,
         is_async: bool = False,
+        # Explicit scope — when set, overrides singleton flag.
+        # Allows @Provider to produce REQUEST or SESSION scoped values,
+        # mirroring Jakarta CDI's @Produces @RequestScoped pattern.
+        scope: Scope | None = None,
     ) -> None:
         self.qualifier = qualifier
         self.priority = priority
         self.singleton = singleton
         self.is_async = is_async
+        self.scope = scope
 
     def merge(self, **updates: Any) -> ProviderMetadata:
         return ProviderMetadata(
@@ -130,13 +162,14 @@ class ProviderMetadata:
             priority=updates.get("priority", self.priority),
             singleton=updates.get("singleton", self.singleton),
             is_async=updates.get("is_async", self.is_async),
+            scope=updates.get("scope", self.scope),
         )
 
     def __repr__(self) -> str:
         return (
             f"ProviderMetadata(qualifier={self.qualifier!r}, "
             f"priority={self.priority}, singleton={self.singleton}, "
-            f"is_async={self.is_async})"
+            f"scope={self.scope}, is_async={self.is_async})"
         )
 
     def __getstate__(self) -> dict[str, Any]:

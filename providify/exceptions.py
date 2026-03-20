@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any, Callable
-from .metadata import ScopeLeak
+from .metadata import LiveInjectionViolation, ScopeLeak
 
 
 class providifyError(Exception):
@@ -80,6 +80,43 @@ class CircularDependencyError(providifyError):
 
 class ValidationError(providifyError):
     pass
+
+
+class LiveInjectionRequiredError(ValidationError):
+    """Raised when a REQUEST or SESSION scoped dep is not wrapped in Live[T].
+
+    A longer-lived component (SINGLETON or SESSION) that injects a scoped dep
+    via ``Inject[T]``, ``Lazy[T]``, or a plain type annotation will capture a
+    single instance at construction time. That instance becomes stale the moment
+    the scope rotates to a new request or session — wrong and often a security
+    issue (e.g. one user's JWT leaking into another user's request).
+
+    ``Live[T]`` is the correct fix: it wraps the dep in a proxy that re-resolves
+    from the container on every access, always returning the instance that belongs
+    to the *currently active* scope context.
+
+    Attributes:
+        violations: Structured list of all violating parameters — one entry per
+            constructor parameter that should be changed to Live[T].
+    """
+
+    def __init__(self, violations: list[LiveInjectionViolation]) -> None:
+        self.violations = violations
+        lines = [
+            f"  - '{v.param_name}' in {v.binding[0].__name__} "
+            f"(scope={v.binding[1].name}) injects {v.dep[0].__name__} "
+            f"(scope={v.dep[1].name}) without Live[T].\n"
+            f"    Fix: change `{v.param_name}: Inject[{v.dep[0].__name__}]` "
+            f"→ `{v.param_name}: Live[{v.dep[0].__name__}]`\n"
+            f"    Reason: Inject[T] and Lazy[T] capture one instance at "
+            f"construction time — that instance becomes stale across "
+            f"{v.dep[1].name.lower()} boundaries."
+            for v in violations
+        ]
+        super().__init__(
+            "Live[T] required for REQUEST/SESSION scoped dependencies:\n"
+            + "\n".join(lines)
+        )
 
 
 class ScopeViolationDetectedError(ValidationError):

@@ -390,10 +390,18 @@ class ProviderBinding(Binding):
         # run once; resolutions run many times.
         self.is_async: bool = inspect.iscoroutinefunction(fn)
 
-        # DESIGN: only SINGLETON and DEPENDENT are available to providers.
-        # REQUEST / SESSION require an active scope context that providers
-        # cannot participate in — they are stateless factory functions.
-        self.scope = Scope.SINGLETON if meta.singleton else Scope.DEPENDENT
+        # DESIGN: scope resolution priority — explicit scope wins, then
+        # singleton flag, then DEPENDENT as the safe default.
+        # REQUEST and SESSION scopes are now supported: the container's
+        # existing _get_cache() routing handles all four scopes uniformly.
+        # The provider factory runs once per scope lifetime and its result
+        # is cached exactly like a ClassBinding — no extra logic needed.
+        if meta.scope is not None:
+            self.scope = meta.scope
+        elif meta.singleton:
+            self.scope = Scope.SINGLETON
+        else:
+            self.scope = Scope.DEPENDENT
         self.qualifier = meta.qualifier
         self.priority = meta.priority
 
