@@ -1242,6 +1242,123 @@ class DIContainer:
 
         return _UNRESOLVED
 
+    # ── Class-variable injection ───────────────────────────────────
+
+    def _inject_class_vars_sync(self, instance: object, cls: type) -> None:
+        """Resolve and set class-level annotated attributes on a freshly constructed instance.
+
+        Class-level annotations like ``var: Inject[Something]`` are not part of
+        ``__init__`` — they live in ``cls.__annotations__`` and are invisible to
+        :meth:`_collect_kwargs_sync`. This method reads the full MRO-resolved hints
+        for *cls* via ``get_type_hints(cls, include_extras=True)``, filters to those
+        carrying providify metadata (``Inject[T]``, ``Live[T]``, ``Lazy[T]``), and
+        sets each resolved value on the instance via ``setattr``.
+
+        Called after ``cls(**kwargs)`` returns but before ``@PostConstruct`` fires,
+        so injected class vars are visible to lifecycle hooks.
+
+        Thread safety:  ✅ Safe — operates on a freshly constructed instance not yet
+                        shared with other threads or tasks.
+        Async safety:   ✅ Safe — no awaits, no shared state.
+
+        Args:
+            instance: The freshly constructed instance to inject into.
+            cls:      The class whose type hints are inspected. Full MRO traversal
+                      via ``get_type_hints`` — includes annotations from parent classes.
+
+        Returns:
+            None
+
+        Raises:
+            LookupError: If a required class-var annotation (non-optional) refers to
+                         a type that has no registered binding.
+
+        Edge cases:
+            - cls has no annotations at all       → no-op (hints is empty)
+            - annotation has no providify marker  → silently skipped
+            - name also appears in __init__ sig   → skipped; constructor kwargs win
+            - get_type_hints raises               → swallowed; no class-var injection
+        """
+        try:
+            # include_extras=True preserves Annotated[T, InjectMeta(...)] wrappers.
+            # Without it, get_type_hints strips Annotated and the metadata is lost.
+            hints = get_type_hints(
+                cls, include_extras=True, localns=self._build_localns()
+            )
+        except Exception:
+            # Annotation evaluation can fail for locally-defined types absent from
+            # __globals__ (same failure mode as _collect_kwargs_sync). Bail out.
+            hints = {}
+
+        if not hints:
+            return
+
+        # Constructor params already injected via _collect_kwargs_sync take priority.
+        # Skip matching names to avoid overwriting values set by __init__.
+        try:
+            init_params = set(inspect.signature(cls.__init__).parameters.keys()) - {
+                "self"
+            }
+        except (ValueError, TypeError):
+            # __init__ may not be inspectable (e.g. C-extension types). Safe default.
+            init_params = set()
+
+        for name, hint in hints.items():
+            if name in init_params:
+                # Constructor already handled this — do not overwrite.
+                continue
+            if not _has_providify_metadata(hint):
+                # Plain type annotation or ClassVar — not a DI injection target.
+                continue
+            resolved = self._resolve_hint_sync(hint, name, cls.__name__)
+            if resolved is not _UNRESOLVED:
+                setattr(instance, name, resolved)
+
+    async def _inject_class_vars_async(self, instance: object, cls: type) -> None:
+        """Async mirror of :meth:`_inject_class_vars_sync`.
+
+        Resolves class-level providify-annotated attributes asynchronously.
+        ``Live[T]`` and ``Lazy[T]`` proxy objects are still created synchronously
+        here — their ``.aget()`` methods are called later by the caller.
+
+        Args:
+            instance: The freshly constructed instance to inject into.
+            cls:      The class whose type hints are inspected.
+
+        Returns:
+            None
+
+        Raises:
+            LookupError: If a required class-var annotation refers to an unregistered type.
+
+        Edge cases: same as :meth:`_inject_class_vars_sync`.
+        """
+        try:
+            hints = get_type_hints(
+                cls, include_extras=True, localns=self._build_localns()
+            )
+        except Exception:
+            hints = {}
+
+        if not hints:
+            return
+
+        try:
+            init_params = set(inspect.signature(cls.__init__).parameters.keys()) - {
+                "self"
+            }
+        except (ValueError, TypeError):
+            init_params = set()
+
+        for name, hint in hints.items():
+            if name in init_params:
+                continue
+            if not _has_providify_metadata(hint):
+                continue
+            resolved = await self._resolve_hint_async(hint, name, cls.__name__)
+            if resolved is not _UNRESOLVED:
+                setattr(instance, name, resolved)
+
     # ── Constructor & provider resolution ─────────────────────────
 
     def _resolve_constructor(self, cls: type) -> object:
@@ -1270,7 +1387,12 @@ class DIContainer:
 
         try:
             resolved_kwargs = self._collect_kwargs_sync(cls.__init__, cls.__name__)
-            return cls(**resolved_kwargs)
+            instance = cls(**resolved_kwargs)
+            # Inject class-level annotations (var: Inject[T], var: Live[T], etc.)
+            # after construction — these are invisible to _collect_kwargs_sync which
+            # only reads __init__ parameters.
+            self._inject_class_vars_sync(instance, cls)
+            return instance
         finally:
             _resolution_stack.reset(token)
 
@@ -1296,7 +1418,10 @@ class DIContainer:
             resolved_kwargs = await self._collect_kwargs_async(
                 cls.__init__, cls.__name__
             )
-            return cls(**resolved_kwargs)
+            instance = cls(**resolved_kwargs)
+            # Async mirror — same class-var injection after construction.
+            await self._inject_class_vars_async(instance, cls)
+            return instance
         finally:
             _resolution_stack.reset(token)
 
@@ -1685,6 +1810,56 @@ class DIContainer:
 
     # ── Scope-leak validation ─────────────────────────────────────
 
+    def _collect_class_var_hints(self, cls: type) -> dict[str, Any]:
+        """Return class-level type hints that carry providify metadata, excluding ``__init__`` params.
+
+        Shared by :meth:`_check_scope_violation` and :meth:`_get_dependencies` so both
+        scope-validation and dependency-graph construction see the same set of
+        class-level injection points.
+
+        Args:
+            cls: The class whose annotations are inspected via full MRO traversal
+                 (``get_type_hints`` walks parent classes too).
+
+        Returns:
+            ``dict[attr_name → hint]`` — only entries that carry providify metadata
+            (``Inject[T]``, ``Live[T]``, ``Lazy[T]``) and are NOT ``__init__``
+            parameters.  Empty dict if ``get_type_hints`` raises.
+
+        Edge cases:
+            - cls has no annotations              → ``{}``
+            - ``get_type_hints`` raises            → ``{}``
+            - name is an ``__init__`` param       → excluded (already handled by
+                                                    the ``__init__``-based callers)
+            - name has no providify metadata      → excluded
+        """
+        try:
+            # include_extras=True — without it Annotated[T, InjectMeta(...)] is
+            # stripped to bare T and the metadata marker is lost.
+            hints = get_type_hints(
+                cls, include_extras=True, localns=self._build_localns()
+            )
+        except Exception:
+            # Annotation evaluation can fail for locally-defined types absent from
+            # __globals__.  Same defensive swallow used throughout the container.
+            return {}
+
+        # Exclude __init__ params — they're already validated / graphed via the
+        # existing __init__-based path.  Keeping them here would double-count them.
+        try:
+            init_params = set(inspect.signature(cls.__init__).parameters.keys()) - {
+                "self"
+            }
+        except (ValueError, TypeError):
+            # __init__ not inspectable (rare — C-extension types). Safe empty set.
+            init_params = set()
+
+        return {
+            name: hint
+            for name, hint in hints.items()
+            if name not in init_params and _has_providify_metadata(hint)
+        }
+
     def _check_scope_violation(
         self,
         binding: ClassBinding,
@@ -1720,11 +1895,20 @@ class DIContainer:
             # include_extras=True preserves Annotated wrappers — we need the
             # InjectMeta / LazyMeta / LiveMeta inside them to distinguish HOW
             # each dep is wired, not just what type it resolves to.
-            hints = get_type_hints(binding.implementation.__init__, include_extras=True)
+            init_hints = get_type_hints(
+                binding.implementation.__init__, include_extras=True
+            )
         except Exception:
             return leaks
 
-        hints.pop("return", None)
+        init_hints.pop("return", None)
+
+        # DESIGN: merge __init__ hints with class-level annotation hints so the
+        # scope-leak check covers ALL injection points on the class, not just
+        # constructor parameters.  _collect_class_var_hints already excludes
+        # names present in __init__, so the merge is collision-free.
+        hints = {**init_hints, **self._collect_class_var_hints(binding.implementation)}
+
         for param_name, hint in hints.items():
             # Extract the injection marker BEFORE stripping Annotated — we need
             # to know whether the caller used Inject[T], Lazy[T], Live[T], or a
@@ -1841,6 +2025,19 @@ class DIContainer:
                 qualifier=binding.qualifier,
                 priority=binding.priority,
             )
+            # Extend with class-level annotated attributes — these are injection
+            # points too (var: Inject[T]), but invisible to _collect_dependencies
+            # which only reads __init__.  The helper already filters to hints that
+            # carry providify metadata and excludes __init__ param names.
+            class_var_hints = self._collect_class_var_hints(binding.implementation)
+            for hint in class_var_hints.values():
+                resolved = self._resolve_dependency(
+                    hint,
+                    qualifier=binding.qualifier,
+                    priority=binding.priority,
+                )
+                if resolved is not None:
+                    deps.append(resolved)
         elif isinstance(binding, ProviderBinding):
             deps = self._collect_dependencies(
                 fn=binding.fn,

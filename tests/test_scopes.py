@@ -11,6 +11,8 @@ Covered:
     - Scope isolation: two concurrent request contexts get different instances
     - Scope violation: SINGLETON depending on REQUEST raises ScopeViolationDetectedError
     - Resolving @RequestScoped outside a request context raises RuntimeError
+    - Scope violation via class-level annotation (var: Inject[T]) is also detected
+    - Live[T] class-level annotation does NOT trigger scope violation
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import pytest
 from providify.container import DIContainer
 from providify.decorator.scope import Component, RequestScoped, SessionScoped, Singleton
 from providify.exceptions import LiveInjectionRequiredError
+from providify.type import Inject, Live
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -402,3 +405,105 @@ class TestInvalidateSession:
         """invalidate_session() on an unknown session ID must not raise."""
         # Should not raise — idempotent / defensive behaviour
         container.scope_context.invalidate_session("no-such-session-id")
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Scope violation via class-level annotations
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestClassVarScopeViolation:
+    """Verifies that scope-leak detection covers class-level Inject[T] annotations.
+
+    Before this feature, only ``__init__`` parameters were validated.  A SINGLETON
+    could silently hold a stale REQUEST-scoped dep via a class-level annotation
+    and no error would be raised at validate_bindings() time.
+    """
+
+    def test_classvar_inject_request_scoped_in_singleton_raises(
+        self, container: DIContainer
+    ) -> None:
+        """A SINGLETON with a class-level Inject[RequestScoped] must raise LiveInjectionRequiredError.
+
+        The class-level annotation ``svc: Inject[RequestService]`` is semantically
+        identical to the constructor pattern ``def __init__(self, svc: Inject[...])``:
+        both capture a single instance at construction time, which becomes stale
+        across request boundaries.  validate_bindings() must catch both.
+        """
+
+        @Singleton
+        class BadSingleton:
+            # Class-level injection — NOT safe for REQUEST-scoped deps in a SINGLETON.
+            # The container must detect this the same way it detects the __init__ form.
+            svc: Inject[RequestService]  # type: ignore[valid-type]
+
+        container.register(RequestService)
+        container.register(BadSingleton)
+
+        # First get() triggers validate_bindings() — must raise, not silently inject.
+        with pytest.raises(LiveInjectionRequiredError):
+            container.get(BadSingleton)
+
+    def test_classvar_inject_session_scoped_in_singleton_raises(
+        self, container: DIContainer
+    ) -> None:
+        """A SINGLETON with a class-level Inject[SessionScoped] must also raise."""
+
+        @Singleton
+        class BadSingleton:
+            svc: Inject[SessionService]  # type: ignore[valid-type]
+
+        container.register(SessionService)
+        container.register(BadSingleton)
+
+        with pytest.raises(LiveInjectionRequiredError):
+            container.get(BadSingleton)
+
+    def test_classvar_live_request_scoped_in_singleton_is_safe(
+        self, container: DIContainer
+    ) -> None:
+        """A SINGLETON with a class-level Live[RequestScoped] must NOT raise.
+
+        Live[T] re-resolves on every .get() call — it never captures a stale instance.
+        The validator must distinguish Inject[T] (unsafe) from Live[T] (safe).
+        """
+
+        @Singleton
+        class GoodSingleton:
+            # Live[T] is the correct pattern — proxy re-resolves per request.
+            svc: Live[RequestService]  # type: ignore[valid-type]
+
+        container.register(RequestService)
+        container.register(GoodSingleton)
+
+        # Should NOT raise — Live[T] is explicitly allowed for scoped deps.
+        with container.scope_context.request():
+            instance = container.get(GoodSingleton)
+        assert isinstance(instance, GoodSingleton)
+
+    def test_mixed_init_and_classvar_violations_both_reported(
+        self, container: DIContainer
+    ) -> None:
+        """Both __init__-param and class-var violations must be caught in one error.
+
+        LiveInjectionRequiredError aggregates all violations so the developer
+        sees everything at once — not just the first bad parameter.
+        """
+
+        @Singleton
+        class DoublyBad:
+            # Class-level violation
+            class_svc: Inject[RequestService]  # type: ignore[valid-type]
+
+            # Constructor-level violation (same pattern, both should appear)
+            def __init__(self, init_svc: RequestService) -> None:
+                self.init_svc = init_svc
+
+        container.register(RequestService)
+        container.register(DoublyBad)
+
+        with pytest.raises(LiveInjectionRequiredError) as exc_info:
+            container.get(DoublyBad)
+
+        # Both violations must be captured — not just the first one encountered.
+        assert len(exc_info.value.violations) == 2

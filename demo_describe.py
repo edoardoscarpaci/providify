@@ -53,7 +53,7 @@ class DatabaseConnection:
 class OrderRepository:
     """Fetches orders — DEPENDENT (new instance per resolution)."""
 
-    def __init__(self, db: Inject[DatabaseConnection]) -> None:  # type: ignore[valid-type]
+    def __init__(self, db: Inject[DatabaseConnection]) -> None:
         self.db = db
 
 
@@ -61,7 +61,7 @@ class OrderRepository:
 class UserRepository:
     """Fetches users — DEPENDENT."""
 
-    def __init__(self, db: Inject[DatabaseConnection]) -> None:  # type: ignore[valid-type]
+    def __init__(self, db: Inject[DatabaseConnection]) -> None:
         self.db = db
 
 
@@ -74,7 +74,7 @@ class UserRepository:
 class AppService:
     """Top-level singleton service that depends on OrderRepository."""
 
-    def __init__(self, repo: Inject[OrderRepository]) -> None:  # type: ignore[valid-type]
+    def __init__(self, repo: Inject[OrderRepository]) -> None:
         self.repo = repo
 
 
@@ -87,7 +87,7 @@ class RequestCache:
 class ReportService:
     """SINGLETON that mistakenly injects a REQUEST-scoped cache — scope leak!"""
 
-    def __init__(self, cache: Inject[RequestCache]) -> None:  # type: ignore[valid-type]
+    def __init__(self, cache: Inject[RequestCache]) -> None:
         self.cache = cache
 
 
@@ -95,7 +95,7 @@ class ReportService:
 class UserService:
     """Depends on UserRepository which depends on DatabaseConnection."""
 
-    def __init__(self, repo: Inject[UserRepository]) -> None:  # type: ignore[valid-type]
+    def __init__(self, repo: Inject[UserRepository]) -> None:
         self.repo = repo
 
 
@@ -103,7 +103,7 @@ class UserService:
 class OrderService:
     """Depends on OrderRepository which depends on DatabaseConnection."""
 
-    def __init__(self, repo: Inject[OrderRepository]) -> None:  # type: ignore[valid-type]
+    def __init__(self, repo: Inject[OrderRepository]) -> None:
         self.repo = repo
 
 
@@ -113,8 +113,8 @@ class Dashboard:
 
     def __init__(
         self,
-        users: Inject[UserService],  # type: ignore[valid-type]
-        orders: Inject[OrderService],  # type: ignore[valid-type]
+        users: Inject[UserService],
+        orders: Inject[OrderService],
     ) -> None:
         self.users = users
         self.orders = orders

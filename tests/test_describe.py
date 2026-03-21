@@ -60,7 +60,7 @@ class _DescLeaf:
 class _DescMiddle:
     """One-level dep: uses Inject[_DescLeaf] so _collect_dependencies sees it."""
 
-    def __init__(self, leaf: Inject[_DescLeaf]) -> None:  # type: ignore[valid-type]
+    def __init__(self, leaf: Inject[_DescLeaf]) -> None:
         self.leaf = leaf
 
 
@@ -73,7 +73,7 @@ class _DescMiddle:
 class _DescRoot:
     """Root of a three-level chain; depends on _DescMiddle → _DescLeaf."""
 
-    def __init__(self, middle: Inject[_DescMiddle]) -> None:  # type: ignore[valid-type]
+    def __init__(self, middle: Inject[_DescMiddle]) -> None:
         self.middle = middle
 
 
@@ -88,7 +88,7 @@ class _DescRoot:
 class _DescSingletonParent:
     """SINGLETON that directly injects a DEPENDENT dep — scope leak scenario."""
 
-    def __init__(self, leaf: Inject[_DescLeaf]) -> None:  # type: ignore[valid-type]
+    def __init__(self, leaf: Inject[_DescLeaf]) -> None:
         self.leaf = leaf
 
 
@@ -115,7 +115,7 @@ class _DescQualified(_DescLeaf):
 class _DescCycleA:
     """First leg of a two-class cycle: A → B → A."""
 
-    def __init__(self, b: Inject[_DescCycleB]) -> None:  # type: ignore[valid-type]
+    def __init__(self, b: Inject[_DescCycleB]) -> None:
         self.b = b
 
 
@@ -123,7 +123,7 @@ class _DescCycleA:
 class _DescCycleB:
     """Second leg of a two-class cycle: A → B → A."""
 
-    def __init__(self, a: Inject[_DescCycleA]) -> None:  # type: ignore[valid-type]
+    def __init__(self, a: Inject[_DescCycleA]) -> None:
         self.a = a
 
 
@@ -321,7 +321,7 @@ class TestProviderBindingDescribe:
         container.register(_DescLeaf)
 
         @Provider
-        def make_middle(leaf: Inject[_DescLeaf]) -> _DescMiddle:  # type: ignore[valid-type]
+        def make_middle(leaf: Inject[_DescLeaf]) -> _DescMiddle:
             return _DescMiddle.__new__(_DescMiddle)
 
         container.provide(make_middle)

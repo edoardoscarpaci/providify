@@ -93,9 +93,27 @@ class InjectMeta(_providify):
 class _InjectedAlias:
     """Sugar over Annotated[T, InjectMeta(...)].
 
-    Supports both subscript and call syntax:
-        Inject[NotificationService]                          ← subscript
-        Inject(NotificationService, qualifier="smtp")        ← call with options
+    Three equivalent forms — choose based on what options you need:
+
+        # 1. Subscript — no options, cleanest syntax, Pylance shows Inject[T]
+        store: Inject[Storage]
+
+        # 2. Call — options available, but requires # type: ignore[valid-type]
+        #    because a call expression is not valid in annotation position.
+        store: Inject(Storage, qualifier="cloud")  # type: ignore[valid-type]
+
+        # 3. Annotated — recommended when options are needed.
+        #    Fully valid Python; Pylance hover shows bare `Storage`; no ignore comment.
+        from providify import InjectMeta
+        from typing import Annotated
+        store: Annotated[Storage, InjectMeta(qualifier="cloud")]
+        store: Annotated[Storage, InjectMeta(qualifier="cloud", optional=True)]
+        store: Annotated[Storage, InjectMeta(priority=2)]
+
+    The Annotated form is the underlying expansion that Inject[...] produces
+    at runtime — it is not a second code path, just a more explicit notation.
+    Use it whenever qualifier / priority / optional options are needed and
+    you want proper Pylance hover without ignore comments.
 
     ⚠️  Resolved ONCE at the owning component's construction time.
         The resolved instance is stored as a plain attribute — not a proxy.
@@ -154,10 +172,25 @@ class _InjectedAlias:
 
 
 class _InjectedInstancesAlias:
-    """
-    Supports both call and subscript syntax:
-        InjectInstances[NotificationService]              ← subscript
-        InjectInstances(NotificationService, qualifier=X) ← call with options
+    """Sugar over Annotated[list[T], InjectMeta(all=True, ...)].
+
+    Three equivalent forms — choose based on what options you need:
+
+        # 1. Subscript — no options, cleanest syntax, Pylance shows InjectInstances[T]
+        stores: InjectInstances[Storage]
+
+        # 2. Call — options available, but requires # type: ignore[valid-type]
+        #    because a call expression is not valid in annotation position.
+        stores: InjectInstances(Storage, qualifier="cloud")  # type: ignore[valid-type]
+
+        # 3. Annotated — recommended when qualifier is needed.
+        #    Fully valid Python; Pylance hover shows bare `list[Storage]`; no ignore comment.
+        from providify import InjectMeta
+        from typing import Annotated
+        stores: Annotated[list[Storage], InjectMeta(all=True, qualifier="cloud")]
+
+    The Annotated form is the underlying expansion that InjectInstances[...] produces
+    at runtime — same resolution path, just explicit notation.
     """
 
     @overload
@@ -187,71 +220,37 @@ class _InjectedInstancesAlias:
         return Annotated[list[tp], InjectMeta(all=True, qualifier=qualifier)]
 
 
-# DESIGN: TYPE_CHECKING split — Pylance and mypy only see the class stubs
-# below; the runtime path keeps the original alias singleton instances.
+# DESIGN: Python 3.12 `type` statement (PEP 695) for type-checker visibility.
 #
-# Without this, Pylance fires reportInvalidTypeForm on every annotation like
-# `svc: Inject[Database]` because it sees Inject as a plain value (an instance
-# of _InjectedAlias), not a type.  By presenting a class with __class_getitem__
-# under TYPE_CHECKING, the type checker treats Inject[T] as a generic
-# specialization and infers the correct resolved type from the overload return.
+# The previous approach defined class stubs with __class_getitem__ returning T,
+# hoping type checkers would propagate that return type into annotation context.
+# They don't. Pylance and mypy treat `Inject[MyService]` in an annotation as a
+# parameterised generic form of the Inject class — the __class_getitem__ return
+# type is only used for *expression* context, not annotation context. Result:
+# `param: Inject[MyService]` showed as `Inject[MyService]` in hover/completion,
+# not the useful `MyService` — breaking autocomplete for the injected dependency.
 #
-# TYPE_CHECKING is False at runtime — the class stubs never exist at runtime.
-# Only the else branch runs: Inject = _InjectedAlias(), unchanged from before.
-# This is the same pattern used above for `from .container import DIContainer`.
+# `type Inject[T] = T` creates a TypeAliasType. When a type checker resolves
+# `param: Inject[MyService]`, it substitutes T=MyService in the alias and
+# arrives at `MyService` directly — giving correct completions and hover types.
 #
-# The __new__ overloads cover the call syntax: Inject(T, qualifier="x").
-# Returning T from __new__ is non-standard; # type: ignore[misc] silences mypy.
+# Tradeoffs:
+#   ✅ `param: Inject[MyService]`         → linter shows MyService
+#   ✅ `param: InjectInstances[MyService]` → linter shows list[MyService]
+#   ❌ Call form Inject(MyService, qualifier="x") loses type-checker support
+#      (TypeAliasType is not callable — type checkers flag it as an error).
+#      For qualified injection with full type precision, use:
+#          Annotated[MyService, InjectMeta(qualifier="x")]
+#      The container resolves it identically at runtime.
+#   ✅ Runtime unaffected — TYPE_CHECKING is always False at runtime;
+#      the else branch still provides the callable _InjectedAlias() singleton.
+#
+# Alternative considered: class stub with __class_getitem__ (previous approach)
+# Rejected: type checkers resolve ClassName[T] in annotations as a parameterised
+# generic, ignoring __class_getitem__ return types in that context.
 if TYPE_CHECKING:
-
-    class Inject:
-        """Type-checker stub — see _InjectedAlias for runtime behaviour."""
-
-        @overload
-        @classmethod
-        def __class_getitem__(cls, tp: type[T]) -> T: ...
-
-        @overload
-        @classmethod
-        def __class_getitem__(cls, tp: Any) -> Any: ...
-
-        @classmethod
-        def __class_getitem__(
-            cls, tp: Any
-        ) -> Any: ...  # implementation required in .py files
-
-        def __new__(
-            cls,
-            _tp: type[T],
-            *,
-            qualifier: str | None = None,
-            priority: int | None = None,
-            optional: bool = False,
-        ) -> T: ...  # type: ignore[misc]
-
-    class InjectInstances:
-        """Type-checker stub — see _InjectedInstancesAlias for runtime behaviour."""
-
-        @overload
-        @classmethod
-        def __class_getitem__(cls, tp: type[T]) -> list[T]: ...
-
-        @overload
-        @classmethod
-        def __class_getitem__(cls, tp: Any) -> Any: ...
-
-        @classmethod
-        def __class_getitem__(
-            cls, tp: Any
-        ) -> Any: ...  # implementation required in .py files
-
-        def __new__(
-            cls,
-            _tp: type[T],
-            *,
-            qualifier: str | None = None,
-        ) -> list[T]: ...  # type: ignore[misc]
-
+    type Inject[T] = T
+    type InjectInstances[T] = list[T]
 else:
     Inject = _InjectedAlias()
     InjectInstances = _InjectedInstancesAlias()
@@ -399,12 +398,25 @@ class LazyProxy(Generic[T]):
 
 
 class _LazyAlias:
-    """Supports both subscript and call syntax for Lazy[T].
+    """Sugar over Annotated[T, LazyMeta(...)].
 
-    Subscript:  Lazy[NotificationService]
-    Call:       Lazy(NotificationService, qualifier="sms", priority=1)
+    Three equivalent forms — choose based on what options you need:
 
-    Both forms expand to Annotated[T, LazyMeta(...)], which the container
+        # 1. Subscript — no options, cleanest syntax, Pylance shows LazyProxy[T]
+        store: Lazy[Storage]
+
+        # 2. Call — options available, but requires # type: ignore[valid-type]
+        #    because a call expression is not valid in annotation position.
+        store: Lazy(Storage, qualifier="cloud")  # type: ignore[valid-type]
+
+        # 3. Annotated — recommended when qualifier / priority are needed.
+        #    Fully valid Python; Pylance hover shows bare `LazyProxy[Storage]`; no ignore comment.
+        from providify import LazyMeta
+        from typing import Annotated
+        store: Annotated[Storage, LazyMeta(qualifier="cloud")]
+        store: Annotated[Storage, LazyMeta(priority=2)]
+
+    Both expand to Annotated[T, LazyMeta(...)], which the container
     detects in _resolve_hint_sync/_async and converts to a LazyProxy.
 
     Thread safety:  ✅ Safe — stateless singleton, no mutable state.
@@ -593,10 +605,23 @@ class LiveProxy(Generic[T]):
 
 
 class _LiveAlias:
-    """Supports both subscript and call syntax for Live[T].
+    """Sugar over Annotated[T, LiveMeta(...)].
 
-    Subscript:  Live[JsonWebToken]
-    Call:       Live(JsonWebToken, qualifier="bearer", priority=1)
+    Three equivalent forms — choose based on what options you need:
+
+        # 1. Subscript — no options, cleanest syntax, Pylance shows LiveProxy[T]
+        token: Live[JsonWebToken]
+
+        # 2. Call — options available, but requires # type: ignore[valid-type]
+        #    because a call expression is not valid in annotation position.
+        token: Live(JsonWebToken, qualifier="bearer")  # type: ignore[valid-type]
+
+        # 3. Annotated — recommended when qualifier / priority are needed.
+        #    Fully valid Python; Pylance hover shows bare `LiveProxy[JsonWebToken]`; no ignore comment.
+        from providify import LiveMeta
+        from typing import Annotated
+        token: Annotated[JsonWebToken, LiveMeta(qualifier="bearer")]
+        token: Annotated[JsonWebToken, LiveMeta(priority=1)]
 
     Both forms expand to Annotated[T, LiveMeta(...)], which the container
     detects in _resolve_hint_sync/_async and converts to a LiveProxy.

@@ -53,8 +53,12 @@ The container operates in two phases:
 1. **Registration** — declare bindings via `bind()`, `register()`, `provide()`, `scan()`, or `install()`
 2. **Resolution** — the first `get()` / `aget()` call validates all bindings, then resolves them
 
-Constructor parameters are injected automatically when a matching binding exists.
-No annotation is needed for plain type hints — the container inspects `__init__` at resolution time.
+Dependencies can be declared in two places:
+
+- **Constructor parameters** — `def __init__(self, svc: Service) -> None` — resolved automatically
+- **Class-level annotations** — `svc: Inject[Service]` on the class body — resolved after the constructor runs
+
+Both forms support `Inject[T]`, `Live[T]`, and `Lazy[T]`.
 
 ---
 
@@ -175,6 +179,7 @@ async with container:             # calls ashutdown() on __aexit__
 ### Plain type annotation
 
 The simplest case — annotate the parameter with the type to inject.
+Pylance / mypy see the real type directly; no special import needed.
 
 ```python
 @Component
@@ -183,27 +188,54 @@ class OrderService:
         self.db = db
 ```
 
-### Inject[T] — with options
+### Inject[T] — subscript form (recommended)
 
-Use `Inject[T]` when you need a qualifier, exact priority, or optional injection.
+Use `Inject[T]` when you want to be explicit that this parameter is managed
+by the DI container. Linters and type checkers resolve `Inject[Database]`
+directly to `Database`, so hover, completion, and type errors work normally.
 
 ```python
 from providify import Inject
 
 @Component
+class OrderService:
+    def __init__(self, db: Inject[Database]) -> None:
+        self.db = db   # linter sees: db: Database ✅
+```
+
+### Annotated[T, InjectMeta(...)] — for qualifier / priority / optional (recommended)
+
+When you need injection **options** (qualifier, priority, optional), use
+`Annotated` with `InjectMeta` directly. This is the underlying form that
+`Inject[T]` expands to at runtime, and it is fully valid Python — no
+`# type: ignore` comment needed. Pylance hover shows the bare type `T`.
+
+```python
+from typing import Annotated
+from providify import Inject, InjectMeta
+
+@Component
 class ReportService:
     def __init__(
         self,
-        db:      Inject[Database],
-        cache:   Inject(Cache, qualifier="redis"),
-        metrics: Inject(Metrics, optional=True),   # None if nothing is bound
-        audit:   Inject(AuditLog, priority=1),
+        db:      Inject[Database],                                    # simple — no options needed
+        cache:   Annotated[Cache,   InjectMeta(qualifier="redis")],   # named qualifier ✅
+        metrics: Annotated[Metrics, InjectMeta(optional=True)],       # None if not bound ✅
+        audit:   Annotated[AuditLog, InjectMeta(priority=1)],         # exact priority ✅
     ) -> None: ...
 ```
+
+> **Why not `Inject(T, qualifier=...)`?**
+> The call form `Inject(Cache, qualifier="redis")` works at runtime but is **not
+> recommended** — type checkers (Pylance, mypy, pyright) flag it as invalid in
+> annotation position and cannot infer the return type, so hover and completion
+> show `Unknown` instead of `Cache`. Use `Annotated[T, InjectMeta(...)]` instead.
+> It resolves identically and keeps the full type-checker experience intact.
 
 ### InjectInstances[T] — all bindings as a list
 
 Inject every registered implementation of an interface, sorted by priority.
+Pylance resolves `InjectInstances[Sender]` to `list[Sender]`.
 
 ```python
 from providify import InjectInstances
@@ -211,21 +243,67 @@ from providify import InjectInstances
 @Component
 class NotificationFanout:
     def __init__(self, senders: InjectInstances[Sender]) -> None:
-        self.senders = senders   # list[Sender]
+        self.senders = senders   # linter sees: senders: list[Sender] ✅
 
     def notify(self, msg: str) -> None:
         for sender in self.senders:
             sender.send(msg)
 ```
 
+For qualifier filtering on `InjectInstances`, use `Annotated` with `InjectMeta(all=True)`:
+
+```python
+from typing import Annotated
+from providify import InjectMeta
+
+@Component
+class CloudFanout:
+    def __init__(
+        self,
+        senders: Annotated[list[Sender], InjectMeta(all=True, qualifier="cloud")],
+    ) -> None:
+        self.senders = senders
+```
+
+### Class-level attributes
+
+Injection annotations can be placed directly on class-level attributes instead of (or alongside) constructor parameters. They are resolved and set on the instance **after** the constructor runs, and **before** `@PostConstruct` fires — so lifecycle hooks can access them.
+
+```python
+from providify import Inject, Live, Lazy
+
+@Singleton
+class ReportService:
+    # Class-level — resolved after __init__ returns
+    storage: Inject[StorageBackend]
+    logger:  Live[RequestLogger]    # re-resolves per request (see Live[T] below)
+
+    # Constructor parameters still work normally alongside class-level annotations
+    def __init__(self, db: Database) -> None:
+        self.db = db
+```
+
+All three injection forms (`Inject[T]`, `Live[T]`, `Lazy[T]`) work as class-level annotations.
+For options (`qualifier=`, `priority=`, `optional=`), use `Annotated` + the corresponding meta type:
+
+```python
+from typing import Annotated
+from providify import InjectMeta, LiveMeta, LazyMeta
+
+@Singleton
+class ReportService:
+    storage:  Annotated[StorageBackend, InjectMeta(qualifier="primary")]
+    logger:   Annotated[RequestLogger,  LiveMeta(qualifier="request")]
+    slow_svc: Annotated[HeavyService,   LazyMeta(qualifier="heavy")]
+```
+
+> **Constructor takes priority** — if the same name appears both as a class-level annotation and as an `__init__` parameter, the constructor value is used and the class-level annotation is skipped.
+
 ### Lazy[T] — deferred injection
 
-Wraps the dependency in a `LazyProxy`. The real instance is not resolved until
-`.get()` (or `.aget()`) is called for the first time. Useful for two things:
+Wraps the dependency in a `LazyProxy`. The real instance is **not resolved until `.get()` (or `.aget()`) is called for the first time**, after which the result is cached.
 
-1. **Breaking circular dependencies** — `A` can hold `Lazy[B]` while `B` holds `A` directly
-2. **Scope-safe singletons** — a `@Singleton` holding `Lazy[T]` for a `@RequestScoped` dep will
-   re-resolve on every `.get()` call instead of caching a stale request instance
+The primary use case is **breaking circular dependencies** — `A` can hold `Lazy[B]` while `B` holds `A` directly:
 
 ```python
 from providify import Lazy
@@ -244,11 +322,65 @@ async def run_async(self) -> Report:
     return await repo.fetch_all_async()
 ```
 
-`Lazy` also accepts `qualifier=` and `priority=`:
+`Lazy` also accepts `qualifier=` and `priority=` via `Annotated` + `LazyMeta`:
 
 ```python
-Lazy(Cache, qualifier="redis", priority=1)
+from typing import Annotated
+from providify import LazyMeta
+
+repo: Annotated[Cache, LazyMeta(qualifier="redis", priority=1)]
 ```
+
+> ⚠️ **`Lazy[T]` is not scope-safe for `@RequestScoped` or `@SessionScoped` deps.**
+> After the first `.get()` call the proxy caches the resolved instance — subsequent calls return the same (stale) object regardless of which request is active.
+> Use **`Live[T]`** instead when a longer-lived component needs a scoped dep.
+
+### Live[T] — always-fresh injection
+
+Returns a `LiveProxy` that calls `container.get(T)` on **every `.get()` or `.aget()` invocation** — it never caches. The correct choice when a longer-lived component (`@Singleton`, `@SessionScoped`) holds a `@RequestScoped` or `@SessionScoped` dependency.
+
+```python
+from providify import Live
+
+@Singleton
+class AuthService:
+    def __init__(self, token: Live[JsonWebToken]) -> None:
+        self._token = token   # LiveProxy — not the token itself
+
+    def get_user_id(self) -> str:
+        # Re-resolves from the active request scope on every call
+        return self._token.get().subject
+
+    async def get_user_id_async(self) -> str:
+        token = await self._token.aget()
+        return token.subject
+```
+
+Works as a class-level annotation too:
+
+```python
+@Singleton
+class AuthService:
+    token: Live[JsonWebToken]   # set after construction, re-resolves per request
+```
+
+`Live` also accepts `qualifier=` and `priority=` via `Annotated` + `LiveMeta`:
+
+```python
+from typing import Annotated
+from providify import LiveMeta
+
+token: Annotated[JsonWebToken, LiveMeta(qualifier="bearer")]
+```
+
+**`Lazy[T]` vs `Live[T]` at a glance:**
+
+| | `Lazy[T]` | `Live[T]` |
+|---|---|---|
+| First `.get()` | Resolves and **caches** | Resolves (no cache) |
+| Subsequent `.get()` | Returns **cached** instance | Re-resolves every time |
+| Circular deps | ✅ Breaks A→B→A cycles | ❌ Does not help |
+| Scoped deps in singletons | ❌ Stale after first access | ✅ Always fresh |
 
 ---
 
@@ -279,6 +411,46 @@ container.scope_context.invalidate_session("user-abc")
 
 > Resolving a `@RequestScoped` or `@SessionScoped` binding outside an active context
 > raises `RuntimeError` immediately.
+
+---
+
+## Scope safety
+
+The container detects scope leaks at `validate_bindings()` time (triggered by the first `get()` call) and raises before any instance is created.
+
+A **scope leak** occurs when a longer-lived component holds a direct reference to a shorter-lived one, causing it to silently serve a stale instance across scope boundaries.
+
+### LiveInjectionRequiredError
+
+Raised when a `@Singleton` (or `@SessionScoped`) injects a `@RequestScoped` or `@SessionScoped` dep via `Inject[T]`, `Lazy[T]`, or a bare type annotation — all of which capture one instance at construction time:
+
+```python
+@Singleton
+class Bad:
+    def __init__(self, ctx: RequestContext) -> None:  # ❌ captured once, stale forever
+        self.ctx = ctx
+```
+
+Fix: wrap with `Live[T]` so the dep is re-resolved on every access:
+
+```python
+@Singleton
+class Good:
+    def __init__(self, ctx: Live[RequestContext]) -> None:  # ✅ re-resolves per request
+        self._ctx = ctx
+```
+
+Scope safety is checked for **both** constructor parameters and class-level annotations:
+
+```python
+@Singleton
+class AlsoDetected:
+    ctx: Inject[RequestContext]   # ❌ also caught — same rule applies to class-level attrs
+```
+
+### ScopeViolationDetectedError
+
+Raised for other scope leaks — e.g. a `@Singleton` holding a `@Component` (DEPENDENT) dep directly. This is less critical but still signals a design issue: the singleton pins one `@Component` instance for its entire lifetime instead of getting a fresh one.
 
 ---
 
@@ -490,6 +662,55 @@ def make_replica() -> Database:
     return ReplicaDB(url=os.environ["REPLICA_URL"])
 ```
 
+### Resolving by qualifier and priority
+
+```python
+@Singleton(qualifier="primary")
+class PrimaryDB(Database): ...
+
+@Singleton(qualifier="replica", priority=1)
+class ReplicaDB(Database): ...
+
+# Resolve by name
+db = container.get(Database, qualifier="primary")
+
+# Resolve all, sorted by priority (lowest number first)
+all_dbs = container.get_all(Database)
+```
+
+---
+
+## Generic types
+
+The container resolves parameterised generic types — bind and get `Repository[User]`
+as a distinct interface from `Repository[Post]`.
+
+```python
+from typing import Generic, TypeVar
+from abc import ABC, abstractmethod
+from providify import Component
+
+T = TypeVar("T")
+
+class Repository(ABC, Generic[T]):
+    @abstractmethod
+    def find(self, id: int) -> T: ...
+
+@Component
+class UserRepository(Repository[User]):
+    def find(self, id: int) -> User: ...
+
+@Component
+class PostRepository(Repository[Post]):
+    def find(self, id: int) -> Post: ...
+
+container.bind(Repository[User], UserRepository)
+container.bind(Repository[Post], PostRepository)
+
+user_repo = container.get(Repository[User])   # UserRepository
+post_repo = container.get(Repository[Post])   # PostRepository
+```
+
 ---
 
 ## Warm-up — eager singleton instantiation
@@ -512,24 +733,6 @@ await container.awarm_up(qualifier="db")
 `warm_up()` is all-or-nothing: if any matching singleton is backed by an async
 provider it raises **before** touching the cache, so the cache is never left
 partially warmed.  Use `awarm_up()` when you have async providers.
-
----
-
-## Named qualifiers and priority (resolution)
-
-```python
-@Singleton(qualifier="primary")
-class PrimaryDB(Database): ...
-
-@Singleton(qualifier="replica", priority=1)
-class ReplicaDB(Database): ...
-
-# Resolve by name
-db = container.get(Database, qualifier="primary")
-
-# Resolve all, sorted by priority (lowest number first)
-all_dbs = container.get_all(Database)
-```
 
 ---
 
@@ -572,15 +775,21 @@ Tests are organised by feature — one file per subsystem:
 |------|--------|
 | `test_binding.py` | `ClassBinding`, `ProviderBinding` construction and errors |
 | `test_container.py` | `bind`, `register`, `provide`, `get`, `get_all`, `current`, `scoped` |
-| `test_scopes.py` | SINGLETON, DEPENDENT, REQUEST, SESSION, scope violation detection |
-| `test_inject.py` | `Inject[T]`, `InjectInstances[T]`, `optional=True/False` |
+| `test_scopes.py` | SINGLETON, DEPENDENT, REQUEST, SESSION, scope violation detection, class-level attr scope safety |
+| `test_inject.py` | `Inject[T]`, `InjectInstances[T]`, `optional=True/False`, class-level attribute injection |
 | `test_lazy.py` | `LazyProxy` unit tests, `Lazy[T]` injection, circular-via-lazy |
+| `test_live.py` | `LiveProxy` unit tests, `Live[T]` injection, always-fresh resolution |
 | `test_lifecycle.py` | `@PostConstruct`, `@PreDestroy`, `shutdown`, `ashutdown` |
 | `test_async.py` | `aget`, `aget_all`, async providers, async context manager |
 | `test_configuration.py` | `@Configuration`, `install()`, `ainstall()`, Spring-style injection |
 | `test_circular.py` | `CircularDependencyError`, diamond dependency, `Lazy` cycle-break |
+| `test_generics.py` | Generic[T] binding and resolution, parameterised interfaces |
+| `test_scoped_providers.py` | `@Provider(scope=Scope.REQUEST/SESSION)` — factory result cached per scope |
 | `test_warmup.py` | `warm_up()`, `awarm_up()`, all-or-nothing guard, qualifier/priority filter |
 | `test_decorators.py` | `@Named`, `@Priority`, `@Inheritable`, stacking, error paths |
+| `test_scanner.py` | `scan()`, recursive scan, ABC auto-binding, idempotency |
+| `test_describe.py` | `BindingDescriptor`, `ClassBinding.describe()`, ASCII tree output |
+| `test_localns_cache.py` | `_build_localns()` caching and invalidation on `bind`/`register`/`provide` |
 
 ---
 
