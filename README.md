@@ -188,6 +188,77 @@ class OrderService:
         self.db = db
 ```
 
+### Optional[T] and T | None — nullable injection
+
+Use Python's standard `Optional[T]` or the pipe-union syntax `T | None` when
+a dependency may not be registered. If no binding is found, the parameter
+receives `None` instead of raising `LookupError`.
+
+```python
+from typing import Optional
+
+@Component
+class Notifier:
+    def __init__(
+        self,
+        sms:   Optional[SmsService],    # None if SmsService is not registered
+        push:  PushService | None,      # equivalent pipe-syntax form
+    ) -> None:
+        self._sms  = sms   # may be None at runtime
+        self._push = push
+```
+
+No import from `providify` is needed — plain `Optional[T]` / `T | None` is
+enough. The container detects the union at resolution time and handles the
+missing-binding case automatically.
+
+> **`Optional[T]` vs `Annotated[T, InjectMeta(optional=True)]`**: both inject
+> `None` when the binding is absent, but the `Optional[T]` form is more
+> idiomatic Python and works without importing `InjectMeta`.
+
+### Union[T1, T2] — first-match injection
+
+A `Union` with multiple non-`None` types is resolved by trying each candidate
+in declaration order. The first type that has a registered binding is used;
+`LookupError` is raised only if **no** candidate resolves.
+
+```python
+from typing import Union
+
+@Component
+class StorageService:
+    def __init__(
+        self,
+        # Prefers S3Storage if registered; falls back to LocalStorage otherwise
+        backend: Union[S3Storage, LocalStorage],
+    ) -> None:
+        self.backend = backend
+```
+
+Combining with `None` makes the whole injection optional:
+
+```python
+@Component
+class AnalyticsCollector:
+    def __init__(
+        self,
+        # Uses SegmentAnalytics if available, Mixpanel as fallback, skipped if neither
+        tracker: Union[SegmentAnalytics, MixpanelAnalytics, None] = None,
+    ) -> None:
+        self.tracker = tracker
+```
+
+**Resolution rules:**
+
+| Annotation | First candidate bound? | Second candidate bound? | Result |
+|---|---|---|---|
+| `Optional[T]` / `T \| None` | yes | — | T instance |
+| `Optional[T]` / `T \| None` | no | — | `None` |
+| `Union[T1, T2]` | yes | — | T1 instance |
+| `Union[T1, T2]` | no | yes | T2 instance |
+| `Union[T1, T2]` | no | no | raises `LookupError` |
+| `Union[T1, T2, None]` | no | no | `None` |
+
 ### Inject[T] — subscript form (recommended)
 
 Use `Inject[T]` when you want to be explicit that this parameter is managed
@@ -592,6 +663,38 @@ import myapp.repositories
 container.scan(myapp.repositories)
 ```
 
+### Auto-scan at construction time
+
+Pass `scan=` to the `DIContainer` constructor to scan one or more modules
+**immediately when the container is created** — before any `bind()` / `get()` call.
+This keeps the bootstrap code declarative and ensures every decorated class is
+registered before any other code interacts with the container.
+
+```python
+from providify import DIContainer
+
+# Single package — all sub-packages walked recursively (default)
+container = DIContainer(scan="myapp")
+
+# Explicit list — both packages scanned, left-to-right
+container = DIContainer(scan=["myapp.services", "myapp.repositories"])
+
+# Opt out of recursive walking
+container = DIContainer(scan="myapp.services", recursive=False)
+```
+
+| Parameter | Type | Default | Meaning |
+|-----------|------|---------|---------|
+| `scan` | `str \| list[str] \| None` | `None` | Module(s) to scan at construction. `None` = no auto-scan (backward-compatible). |
+| `recursive` | `bool` | `True` | Walk sub-packages recursively. Forwarded to each `scan()` call. |
+
+> **`ModuleNotFoundError`** is raised at construction time if a module name
+> cannot be imported — errors surface at the point of misconfiguration rather
+> than at the first `get()` call.
+
+The constructor `scan=` is purely additive — you can still call `container.scan()`
+manually afterward to register additional modules.
+
 ### What gets discovered
 
 | Decorator on the member | What the scanner registers |
@@ -803,7 +906,7 @@ Tests are organised by feature — one file per subsystem:
 | `test_binding.py` | `ClassBinding`, `ProviderBinding` construction and errors |
 | `test_container.py` | `bind`, `register`, `provide`, `get`, `get_all`, `current`, `scoped` |
 | `test_scopes.py` | SINGLETON, DEPENDENT, REQUEST, SESSION, scope violation detection, class-level attr scope safety |
-| `test_inject.py` | `Inject[T]`, `InjectInstances[T]`, `optional=True/False`, class-level attribute injection |
+| `test_inject.py` | `Inject[T]`, `InjectInstances[T]`, `optional=True/False`, `Optional[T]` / `T \| None` / `Union[T1, T2]`, class-level attribute injection |
 | `test_lazy.py` | `LazyProxy` unit tests, `Lazy[T]` injection, circular-via-lazy |
 | `test_live.py` | `LiveProxy` unit tests, `Live[T]` injection, always-fresh resolution |
 | `test_instance.py` | `InstanceProxy` unit tests, `Instance[T]` injection, `is_resolvable()`, scope-safety, async |
@@ -815,7 +918,7 @@ Tests are organised by feature — one file per subsystem:
 | `test_scoped_providers.py` | `@Provider(scope=Scope.REQUEST/SESSION)` — factory result cached per scope |
 | `test_warmup.py` | `warm_up()`, `awarm_up()`, all-or-nothing guard, qualifier/priority filter |
 | `test_decorators.py` | `@Named`, `@Priority`, `@Inheritable`, stacking, error paths |
-| `test_scanner.py` | `scan()`, recursive scan, ABC auto-binding, idempotency |
+| `test_scanner.py` | `scan()`, recursive scan, ABC auto-binding, idempotency, `DIContainer(scan=...)` constructor |
 | `test_describe.py` | `BindingDescriptor`, `ClassBinding.describe()`, ASCII tree output |
 | `test_localns_cache.py` | `_build_localns()` caching and invalidation on `bind`/`register`/`provide` |
 
