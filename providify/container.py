@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import threading
+import types
 from types import ModuleType
 from typing import (
     Annotated,
@@ -10,6 +11,7 @@ from typing import (
     Callable,
     ClassVar,
     TypeVar,
+    Union,
     get_args,
     get_origin,
     get_type_hints,
@@ -46,6 +48,64 @@ from .type import (
 from .utils import _interface_matches, _type_name
 
 T = TypeVar("T")
+
+
+def _unwrap_union(hint: Any) -> tuple[list[Any], bool] | None:
+    """Decompose a Union type hint into its candidate types and optionality.
+
+    Handles both union representations Python provides:
+    - ``typing.Union[T1, T2]`` and ``Optional[T]`` (== ``Union[T, None]``) —
+      detected via ``get_origin(hint) is Union``.
+    - Python 3.10+ pipe syntax ``T1 | T2`` — produces ``types.UnionType``,
+      detected via ``isinstance(hint, types.UnionType)``.
+
+    Returns ``None`` for any hint that is not a union, so callers can use a
+    simple ``if _unwrap_union(hint) is not None:`` guard without worrying about
+    false positives from plain concrete types or generics.
+
+    Args:
+        hint: Any type annotation, already evaluated (not a string).
+
+    Returns:
+        A ``(candidates, is_optional)`` tuple where:
+        - ``candidates`` — non-``NoneType`` args, preserving declaration order.
+        - ``is_optional`` — ``True`` iff ``NoneType`` appeared in the union args
+          (i.e. the whole union is nullable / optional).
+        Or ``None`` if *hint* is not a union type at all.
+
+    Edge cases:
+        - ``Union[None]``          → candidates=[], is_optional=True (degenerate)
+        - ``Union[T]``             → not produced by Python; ``Union[T]`` collapses
+          to bare ``T`` at parse time, so this helper never sees it.
+        - Nested unions (Python flattens them) → already handled by ``get_args``.
+
+    Example:
+        >>> _unwrap_union(Optional[int])
+        ([<class 'int'>], True)
+        >>> _unwrap_union(int | str | None)
+        ([<class 'int'>, <class 'str'>], True)
+        >>> _unwrap_union(int)
+        None
+    """
+    # DESIGN: Two separate isinstance/get_origin checks are needed because
+    # Python uses different runtime representations for the two union syntaxes:
+    #   - typing.Union produces a _GenericAlias whose get_origin() returns Union
+    #   - X | Y produces a types.UnionType which has no get_origin() result
+    # Unifying them here avoids duplicating this detection in every call site.
+    if isinstance(hint, types.UnionType):
+        # Python 3.10+ pipe syntax: int | str | None
+        args = get_args(hint)
+    elif get_origin(hint) is Union:
+        # typing.Union[...] and Optional[T] (which is Union[T, None])
+        args = get_args(hint)
+    else:
+        return None
+
+    none_type = type(None)
+    is_optional = none_type in args
+    # Preserve declaration order — important for Union[T1, T2] where T1 is tried first
+    candidates = [a for a in args if a is not none_type]
+    return candidates, is_optional
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -146,14 +206,48 @@ class DIContainer:
 
     # ── Initialisation ────────────────────────────────────────────
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        scan: str | list[str] | None = None,
+        recursive: bool = True,
+    ) -> None:
         """Initialise an empty container with no bindings.
 
         All state is instance-local — multiple containers can coexist in the
         same process without interfering (e.g. one per test via ``scoped()``).
 
+        Args:
+            scan:      A fully-qualified module name (``str``), a list of module
+                       names, or ``None`` (default).  When provided, each module
+                       is scanned immediately at construction time — equivalent
+                       to calling ``container.scan(name, recursive=recursive)``
+                       for each name after the container is created.
+                       Useful for applications that want a single, declarative
+                       registration step:
+
+                       .. code-block:: python
+
+                           container = DIContainer(scan="myapp", recursive=True)
+                           # all @Component/@Singleton/@Provider in myapp are
+                           # registered before the first get() call.
+
+            recursive: When ``True`` (default), sub-packages under each *scan*
+                       entry are walked recursively.  Has no effect when *scan*
+                       is ``None``.
+
         Returns:
             None
+
+        Raises:
+            ModuleNotFoundError: If a module name in *scan* cannot be imported.
+
+        Edge cases:
+            - ``scan=None`` (default) — no scanning, backward-compatible.
+            - ``scan=[]`` — empty list is treated the same as ``None``.
+            - ``scan="myapp"`` — single string, scanned once with *recursive*.
+            - ``scan=["a", "b"]`` — each module scanned left-to-right; later
+              modules may add bindings that complement earlier ones.
         """
         self._bindings: list[AnyBinding] = []
         self._singleton_cache: dict[Any, object] = {}
@@ -166,6 +260,26 @@ class DIContainer:
         # In the common case (all bindings registered before the first get()),
         # the dict is built exactly once and reused for every resolution.
         self._localns_cache: dict[str, type] | None = None
+
+        # ── Auto-scan at construction time ────────────────────────
+        # DESIGN: Eager scan (at __init__) rather than lazy scan (deferred to
+        # first get()) was chosen because it makes errors surface at the point
+        # of misconfiguration (container creation) rather than later at first
+        # resolution, which is harder to trace.
+        #
+        # Tradeoffs:
+        #   ✅ Fail-fast — ModuleNotFoundError pinpoints the bad module name
+        #   ✅ All bindings present before any manual bind() / register() call
+        #   ❌ If scan modules have side-effects on import, they run at __init__
+        #      rather than deferred (acceptable; import side-effects are rare)
+        #
+        # Alternative considered: lazy scan triggered by first get() — rejected
+        # because it would surface import errors far from the registration site.
+        if scan is not None:
+            # Normalise to a list so the loop below is uniform
+            modules = [scan] if isinstance(scan, str) else list(scan)
+            for module_name in modules:
+                self.scan(module_name, recursive=recursive)
 
     # ── Global accessor ───────────────────────────────────────────
 
@@ -1224,6 +1338,30 @@ class DIContainer:
                         return None
                     raise
 
+        # ── Union / Optional resolution ───────────────────────────
+        # Handles: Optional[T], T | None, Union[T1, T2], Union[T1, T2, None]
+        # Must come BEFORE the plain-type check below because Union types have
+        # get_origin() != None (for typing.Union) or are types.UnionType instances,
+        # neither of which is a registered binding — the plain-type branch would
+        # call _is_resolvable(Union[T, None]) which always returns False.
+        union_result = _unwrap_union(hint)
+        if union_result is not None:
+            candidates, is_optional = union_result
+            # Try each non-None candidate in declaration order; return the first
+            # that resolves. This mirrors how Python's runtime picks the first
+            # match in isinstance() checks — predictable and declaration-order stable.
+            for candidate in candidates:
+                try:
+                    return self.get(candidate)
+                except LookupError:
+                    # Binding not found for this candidate; try the next one.
+                    continue
+            # No candidate resolved. If NoneType was in the union, inject None
+            # (same semantics as InjectMeta(optional=True)). Otherwise signal
+            # _collect_kwargs that no binding was found — it will raise or fall
+            # back to the parameter's default value.
+            return None if is_optional else _UNRESOLVED
+
         elif (
             isinstance(hint, type) or get_origin(hint) is not None
         ) and self._is_resolvable(hint):
@@ -1300,6 +1438,19 @@ class DIContainer:
                     if inject_meta.optional:
                         return None
                     raise
+
+        # ── Union / Optional resolution (async mirror) ───────────────
+        # Mirrors _resolve_hint_sync Union branch exactly — see that method
+        # for the full design rationale.
+        union_result = _unwrap_union(hint)
+        if union_result is not None:
+            candidates, is_optional = union_result
+            for candidate in candidates:
+                try:
+                    return await self.aget(candidate)
+                except LookupError:
+                    continue
+            return None if is_optional else _UNRESOLVED
 
         elif (
             isinstance(hint, type) or get_origin(hint) is not None

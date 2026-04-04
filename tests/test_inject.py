@@ -21,7 +21,7 @@ in _resolve_hint_sync and acts on the metadata.
 from __future__ import annotations
 
 import pytest
-from typing import ClassVar
+from typing import ClassVar, Optional, Union
 
 from providify.container import DIContainer
 from providify.decorator.scope import Component
@@ -657,3 +657,214 @@ class TestClassVarLiveAndLazyAnnotations:
         svc = container.get(Service)
 
         assert isinstance(svc.store, FileStorage)
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Union / Optional injection
+#
+#  DESIGN: All helper types must be defined at module level.
+#  With `from __future__ import annotations`, annotations are stored as
+#  strings and evaluated lazily by get_type_hints().  Locally-defined
+#  (method-scoped) types are NOT in fn.__globals__ (the module dict) and
+#  are only added to localns if they have been registered as bindings.
+#  If a type is intentionally unregistered (to test the "not found" path),
+#  it must still be in __globals__ so get_type_hints() can parse the
+#  annotation string without raising NameError.
+# ─────────────────────────────────────────────────────────────────
+
+
+# Sentinel types used by TestUnionOptionalInjection.
+# Some are @Component-decorated (resolvable), some are plain classes (unresolvable).
+# All are at module level so get_type_hints() can resolve the annotation strings.
+
+
+@Component
+class _UnionDep:
+    """Bound sentinel — used to verify Optional[T] and T|None resolution."""
+
+
+class _UnionMissingDep:
+    """Unbound sentinel — not decorated, never registered, used to verify None injection."""
+
+
+@Component
+class _UnionT1:
+    """First candidate in Union[T1, T2] tests — decorated so it can be registered."""
+
+
+@Component
+class _UnionT2:
+    """Second candidate in Union[T1, T2] tests — decorated so it can be registered."""
+
+
+class _UnionUnresolvable1:
+    """Unbound first candidate — plain class, never registered."""
+
+
+class _UnionUnresolvable2:
+    """Unbound second candidate — plain class, never registered."""
+
+
+class TestUnionOptionalInjection:
+    """Tests for Optional[T], T | None, and Union[T1, T2, ...] constructor hints.
+
+    Covered:
+        - Optional[T] with T bound   → resolves the concrete type
+        - Optional[T] with T missing → injects None (does NOT raise)
+        - T | None (pipe syntax) bound   → resolves the concrete type
+        - T | None (pipe syntax) missing → injects None
+        - Union[T1, T2] T1 bound         → resolves T1
+        - Union[T1, T2] T1 missing, T2 bound → resolves T2 (fallback)
+        - Union[T1, T2] neither bound    → raises LookupError
+        - Union[T1, T2, None] neither bound  → injects None
+        - Union[T1, T2, None] T1 bound   → resolves T1
+
+    DESIGN: Union hints are decomposed by _unwrap_union() into candidate types
+    and an is_optional flag. Candidates are tried in declaration order; if none
+    resolve and the union includes NoneType the parameter receives None.
+    """
+
+    def test_optional_resolves_type_when_bound(self, container: DIContainer) -> None:
+        """Optional[T] with T registered → the concrete instance is injected."""
+
+        @Component
+        class Consumer:
+            def __init__(self, dep: Optional[_UnionDep]) -> None:
+                self.dep = dep
+
+        container.register(_UnionDep)
+        container.register(Consumer)
+
+        c = container.get(Consumer)
+        assert isinstance(c.dep, _UnionDep)
+
+    def test_optional_injects_none_when_not_bound(self, container: DIContainer) -> None:
+        """Optional[T] with T NOT registered → parameter receives None, no error."""
+
+        @Component
+        class Consumer:
+            def __init__(self, dep: Optional[_UnionMissingDep] = None) -> None:
+                self.dep = dep
+
+        # _UnionMissingDep intentionally NOT registered — no binding exists for it
+        container.register(Consumer)
+
+        c = container.get(Consumer)
+        assert c.dep is None
+
+    def test_pipe_syntax_resolves_type_when_bound(self, container: DIContainer) -> None:
+        """T | None (Python 3.10+ pipe syntax) with T registered → instance injected."""
+
+        @Component
+        class Consumer:
+            # Pipe union syntax — produces types.UnionType at runtime, not typing.Union
+            def __init__(self, dep: _UnionDep | None) -> None:
+                self.dep = dep
+
+        container.register(_UnionDep)
+        container.register(Consumer)
+
+        c = container.get(Consumer)
+        assert isinstance(c.dep, _UnionDep)
+
+    def test_pipe_syntax_injects_none_when_not_bound(
+        self, container: DIContainer
+    ) -> None:
+        """T | None with T NOT registered → parameter receives None."""
+
+        @Component
+        class Consumer:
+            def __init__(self, dep: _UnionMissingDep | None = None) -> None:
+                self.dep = dep
+
+        # _UnionMissingDep intentionally NOT registered
+        container.register(Consumer)
+
+        c = container.get(Consumer)
+        assert c.dep is None
+
+    def test_union_resolves_first_candidate_when_t1_bound(
+        self, container: DIContainer
+    ) -> None:
+        """Union[T1, T2] — T1 registered, T2 not → T1 instance returned."""
+
+        @Component
+        class Consumer:
+            def __init__(self, dep: Union[_UnionT1, _UnionMissingDep]) -> None:
+                self.dep = dep
+
+        # Register T1 only — T2 (_UnionMissingDep) has no binding
+        container.register(_UnionT1)
+        container.register(Consumer)
+
+        c = container.get(Consumer)
+        assert isinstance(c.dep, _UnionT1)
+
+    def test_union_falls_back_to_second_candidate(self, container: DIContainer) -> None:
+        """Union[T1, T2] — T1 not registered, T2 registered → T2 instance returned."""
+
+        @Component
+        class Consumer:
+            def __init__(self, dep: Union[_UnionMissingDep, _UnionT2]) -> None:
+                self.dep = dep
+
+        # Register T2 only — T1 (_UnionMissingDep) has no binding
+        container.register(_UnionT2)
+        container.register(Consumer)
+
+        c = container.get(Consumer)
+        assert isinstance(c.dep, _UnionT2)
+
+    def test_union_raises_when_no_candidate_resolves(
+        self, container: DIContainer
+    ) -> None:
+        """Union[T1, T2] — neither registered → LookupError raised."""
+
+        @Component
+        class Consumer:
+            def __init__(
+                self, dep: Union[_UnionUnresolvable1, _UnionUnresolvable2]
+            ) -> None:
+                self.dep = dep
+
+        # Neither _UnionUnresolvable1 nor _UnionUnresolvable2 are registered
+        container.register(Consumer)
+
+        with pytest.raises(LookupError):
+            container.get(Consumer)
+
+    def test_union_with_none_injects_none_when_no_candidate_resolves(
+        self, container: DIContainer
+    ) -> None:
+        """Union[T1, T2, None] — neither T1 nor T2 registered → None injected."""
+
+        @Component
+        class Consumer:
+            def __init__(
+                self, dep: Union[_UnionUnresolvable1, _UnionUnresolvable2, None] = None
+            ) -> None:
+                self.dep = dep
+
+        # Neither candidate is registered — NoneType in the union means None is returned
+        container.register(Consumer)
+
+        c = container.get(Consumer)
+        assert c.dep is None
+
+    def test_union_with_none_resolves_first_bound_candidate(
+        self, container: DIContainer
+    ) -> None:
+        """Union[T1, T2, None] — T1 registered → T1 instance returned (not None)."""
+
+        @Component
+        class Consumer:
+            def __init__(
+                self, dep: Union[_UnionT1, _UnionUnresolvable1, None] = None
+            ) -> None:
+                self.dep = dep
+
+        container.register(_UnionT1)
+        container.register(Consumer)
+
+        c = container.get(Consumer)
+        assert isinstance(c.dep, _UnionT1)
