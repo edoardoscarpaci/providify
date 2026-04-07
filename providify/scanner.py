@@ -219,6 +219,7 @@ class DefaultContainerScanner(ContainerScanner):
             if (
                 callable(fn)
                 and name != "__init__"
+                and _has_provider_metadata(fn)
                 and any(isinstance(b, ProviderBinding) and b.fn is fn for b in bindings)
             ):
                 return
