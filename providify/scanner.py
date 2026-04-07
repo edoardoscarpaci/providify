@@ -9,7 +9,11 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, Generic, get_origin
 
 from .binding import ClassBinding, ProviderBinding
-from .metadata import _has_own_metadata, _has_provider_metadata
+from .metadata import (
+    _has_own_metadata,
+    _has_provider_metadata,
+    _has_configuration_module,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -113,6 +117,8 @@ class DefaultContainerScanner(ContainerScanner):
                 self._autoregister_class(obj)
             elif inspect.isfunction(obj) and _has_provider_metadata(obj):
                 self._autoregister_provider(obj)
+            elif inspect.isclass(obj) and _has_configuration_module(obj):
+                self._autoregister_configurator(obj)
 
     def _scan_recursive(self, package: ModuleType) -> None:
         """Walk all sub-packages of *package* and scan each one.
@@ -196,6 +202,28 @@ class DefaultContainerScanner(ContainerScanner):
             return
 
         self._container.provide(fn)
+
+    def _autoregister_configurator(self, cls: type) -> None:
+        """Register a DI-annotated provider function, skipping duplicates.
+
+        Args:
+            fn: The decorated provider callable (sync or async).
+
+        Returns:
+            None
+        """
+        bindings = self._container._bindings
+
+        # Guard against scanning the same module twice
+        for name, fn in vars(cls).items():
+            if (
+                callable(fn)
+                and name != "__init__"
+                and any(isinstance(b, ProviderBinding) and b.fn is fn for b in bindings)
+            ):
+                return
+
+        self._container.install(cls)
 
     def _find_interfaces(self, cls: type) -> list[Any]:
         """Return all interfaces that *cls* should be bound against during auto-scan.
