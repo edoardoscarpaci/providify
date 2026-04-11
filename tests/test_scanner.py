@@ -6,9 +6,12 @@ Covered:
     - scan() registers @Component-decorated classes
     - scan() registers @Singleton-decorated classes
     - scan() registers @Provider-decorated functions
+    - scan() registers @Configuration classes (installs them via container.install)
+    - scan() discovers all @Provider methods inside a @Configuration class
     - scan() skips members whose name starts with '_'
     - scan() skips symbols re-exported from other modules (inspect.getmodule guard)
     - scan() is idempotent — scanning the same module twice doesn't double-register
+    - scan() is idempotent for @Configuration — no double-install on repeated scans
     - scan() autobinds to an abstract base class when the impl inherits from one
     - scan() self-binds when the class has no abstract base
     - scan() raises ModuleNotFoundError for unknown module names
@@ -28,7 +31,9 @@ from abc import ABC, abstractmethod
 
 import pytest
 
+from providify.binding import ProviderBinding
 from providify.container import DIContainer
+from providify.decorator.module import Configuration
 from providify.decorator.scope import Component, Provider, Singleton
 
 
@@ -46,6 +51,22 @@ from providify.decorator.scope import Component, Provider, Singleton
 
 class _ProviderWidget:
     """Module-level sentinel used as @Provider return type in scanner tests."""
+
+
+class _ConfigService:
+    """Module-level sentinel used as @Provider return type inside @Configuration classes.
+
+    DESIGN: get_type_hints(fn) resolves return annotations by looking up names in
+    fn.__globals__ — the globals dict of the module where the function was *defined*.
+    Methods on locally-scoped @Configuration classes defined inside test functions
+    still reference the test module's globals, so module-level types resolve correctly.
+    Locally-defined return-type classes would be absent from __globals__ and raise
+    NameError at ProviderBinding registration time.
+    """
+
+
+class _ConfigServiceB:
+    """Second module-level sentinel for multi-provider @Configuration tests."""
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -287,12 +308,130 @@ class TestScanIdempotency:
         container.scan(fake_mod)
         container.scan(fake_mod)
 
-        from providify.binding import ProviderBinding
-
         matching = [
             b
             for b in container._bindings
             if isinstance(b, ProviderBinding) and b.fn.__name__ == "make_widget"
+        ]
+        assert len(matching) == 1
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Tests: @Configuration scanning
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestScanConfiguration:
+    """Verify that scan() discovers @Configuration classes and installs them.
+
+    DESIGN: A @Configuration class does NOT carry DIMetadata (no scope decorator),
+    so it falls through the _has_own_metadata() branch and is handled separately
+    by the _has_configuration_module() branch. The scanner calls container.install()
+    which instantiates the module and registers each @Provider method as a bound-method
+    ProviderBinding. All of this must happen transparently during scan().
+    """
+
+    def test_scan_registers_configuration_class(
+        self, container: DIContainer, fake_mod: types.ModuleType
+    ) -> None:
+        """A @Configuration class defined in the module must be installed on scan.
+
+        The @Provider method's return type (_ConfigService) must be resolvable
+        from the container after scanning, with no explicit install() call.
+        """
+
+        @Configuration
+        class InfraModule:
+            @Provider
+            def make_service(self) -> _ConfigService:
+                # self is the live InfraModule instance — bound method ✅
+                return _ConfigService()
+
+        _add(fake_mod, InfraModule)
+        container.scan(fake_mod)
+
+        result = container.get(_ConfigService)
+        assert isinstance(result, _ConfigService)
+
+    def test_scan_configuration_installs_all_providers(
+        self, container: DIContainer, fake_mod: types.ModuleType
+    ) -> None:
+        """All @Provider methods inside a @Configuration class must be registered.
+
+        Even when the module declares multiple providers, every one of them
+        must become a binding after a single scan().
+        """
+
+        @Configuration
+        class MultiProviderModule:
+            @Provider
+            def service_a(self) -> _ConfigService:
+                return _ConfigService()
+
+            @Provider
+            def service_b(self) -> _ConfigServiceB:
+                return _ConfigServiceB()
+
+        _add(fake_mod, MultiProviderModule)
+        container.scan(fake_mod)
+
+        # Both provider return types must be independently resolvable
+        assert isinstance(container.get(_ConfigService), _ConfigService)
+        assert isinstance(container.get(_ConfigServiceB), _ConfigServiceB)
+
+    def test_scan_configuration_provider_singleton_scope_preserved(
+        self, container: DIContainer, fake_mod: types.ModuleType
+    ) -> None:
+        """@Provider(singleton=True) inside a @Configuration must stay SINGLETON after scan.
+
+        ProviderMetadata carries the singleton flag; scan() must not strip it.
+        """
+
+        @Configuration
+        class SingletonModule:
+            @Provider(singleton=True)
+            def singleton_service(self) -> _ConfigService:
+                return _ConfigService()
+
+        _add(fake_mod, SingletonModule)
+        container.scan(fake_mod)
+
+        a = container.get(_ConfigService)
+        b = container.get(_ConfigService)
+        # SINGLETON scope — same instance on every resolution
+        assert a is b
+
+    def test_scan_is_idempotent_for_configurations(
+        self, container: DIContainer, fake_mod: types.ModuleType
+    ) -> None:
+        """Scanning the same module twice must not double-install a @Configuration class.
+
+        DESIGN: The old guard compared ``b.fn is fn`` (ProviderBinding stores the
+        *bound* method from install(), but vars(cls) yields the *unbound* function —
+        they are never the same object). The fix uses a ``set[type]`` on the scanner
+        keyed by class identity, which is always reliable.
+
+        If double-installation occurred the container would have two ProviderBindings
+        for _ConfigService and container.get(_ConfigService) would raise AmbiguousBindingError
+        (multiple bindings without a distinguishing qualifier/priority).
+        """
+
+        @Configuration
+        class IdempotentModule:
+            @Provider
+            def make_service(self) -> _ConfigService:
+                return _ConfigService()
+
+        _add(fake_mod, IdempotentModule)
+
+        container.scan(fake_mod)
+        container.scan(fake_mod)  # second scan — must be a no-op
+
+        # Exactly one ProviderBinding for _ConfigService — not two
+        matching = [
+            b
+            for b in container._bindings
+            if isinstance(b, ProviderBinding) and b.interface is _ConfigService
         ]
         assert len(matching) == 1
 

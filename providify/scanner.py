@@ -50,8 +50,9 @@ class ContainerScanner(ABC):
 
 
 class DefaultContainerScanner(ContainerScanner):
-    """Default scanner — discovers ``@Component``, ``@Singleton``, and ``@Provider``
-    decorated objects in a module tree and registers them with the container.
+    """Default scanner — discovers ``@Component``, ``@Singleton``, ``@Provider``,
+    and ``@Configuration`` decorated objects in a module tree and registers them
+    with the container.
 
     Uses :func:`inspect.getmembers` to walk each module's public namespace.
     Only objects whose defining module matches the scanned module are registered,
@@ -66,6 +67,20 @@ class DefaultContainerScanner(ContainerScanner):
                 that discovered bindings will be registered into.
         """
         self._container = container
+
+        # DESIGN: Track installed @Configuration classes by identity (set[type]).
+        #
+        # Tradeoffs:
+        #   ✅ O(1) lookup — no linear scan of bindings on every scan call
+        #   ✅ Handles the bound-method vs unbound-function identity mismatch:
+        #      install() registers *bound* methods via getattr(instance, name),
+        #      but vars(cls) yields the *unbound* function. They are never the
+        #      same object, so comparing b.fn is fn would always be False.
+        #   ❌ The set lives on the scanner, not the container — if a second
+        #      scanner instance is created for the same container it won't
+        #      inherit this history. Acceptable: container.scan() always
+        #      delegates to self._scanner, so only one scanner is ever active.
+        self._installed_configurations: set[type] = set()
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -204,26 +219,32 @@ class DefaultContainerScanner(ContainerScanner):
         self._container.provide(fn)
 
     def _autoregister_configurator(self, cls: type) -> None:
-        """Register a DI-annotated provider function, skipping duplicates.
+        """Install a ``@Configuration`` class into the container, skipping duplicates.
+
+        Uses a class-identity set (``_installed_configurations``) to detect
+        repeated scans of the same module.  A naïve comparison of ``b.fn is fn``
+        would not work here because ``install()`` registers *bound* methods
+        (``getattr(instance, name)``), whereas ``vars(cls)`` yields the *unbound*
+        function — they are never the same object.
 
         Args:
-            fn: The decorated provider callable (sync or async).
+            cls: The class decorated with ``@Configuration``.
 
         Returns:
             None
+
+        Edge cases:
+            - cls has no @Provider methods → install() is still called once,
+              which is a no-op from a bindings perspective but initialises the module.
+            - Same cls encountered in two different module scans → skipped on second
+              encounter because the set tracks the class object, not the module path.
         """
-        bindings = self._container._bindings
+        # Guard against scanning the same @Configuration class twice.
+        # See __init__ for why we use a set[type] rather than inspecting bindings.
+        if cls in self._installed_configurations:
+            return
 
-        # Guard against scanning the same module twice
-        for name, fn in vars(cls).items():
-            if (
-                callable(fn)
-                and name != "__init__"
-                and _has_provider_metadata(fn)
-                and any(isinstance(b, ProviderBinding) and b.fn is fn for b in bindings)
-            ):
-                return
-
+        self._installed_configurations.add(cls)
         self._container.install(cls)
 
     def _find_interfaces(self, cls: type) -> list[Any]:
