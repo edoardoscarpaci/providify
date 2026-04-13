@@ -393,6 +393,42 @@ to the plain annotation form.
 
 > **Constructor takes priority** — if the same name appears both as a class-level annotation and as an `__init__` parameter, the constructor value is used and the class-level annotation is skipped.
 
+### Inheritance and MRO
+
+The two injection paths intentionally have **different MRO behaviour**:
+
+| Injection path | MRO walk? | Why |
+|---|---|---|
+| `__init__` parameters | ❌ No | The declared signature is an explicit contract. If a child overrides `__init__`, it is asserting its own construction semantics. |
+| Class-level annotations | ✅ Yes | `get_type_hints(cls)` walks the full MRO — annotations declared on a parent class are inherited and injected automatically. |
+
+**When `__init__` is *not* overridden** the parent's `__init__` is already picked up via Python's own MRO — no special handling is needed. The asymmetry only matters when the child *does* override `__init__`.
+
+**Recommended patterns for inheritance:**
+
+```python
+# Option A — re-declare the parent dep in the child signature (explicit, zero magic)
+class Base:
+    def __init__(self, svc_a: Inject[ServiceA]) -> None:
+        self.svc_a = svc_a
+
+class Child(Base):
+    def __init__(self, svc_a: Inject[ServiceA], svc_b: Inject[ServiceB]) -> None:
+        super().__init__(svc_a)   # explicit hand-off — no surprise injections
+        self.svc_b = svc_b
+
+# Option B — use class-level annotations for inherited deps (MRO is walked)
+class Base:
+    svc_a: Inject[ServiceA]   # injected after construction; inherited by all subclasses
+
+class Child(Base):
+    def __init__(self, svc_b: Inject[ServiceB]) -> None:
+        self.svc_b = svc_b
+    # svc_a is still set on self via the class-var injection path ✓
+```
+
+> ⚠️ **Avoid injecting parent `__init__` params via MRO manually.** If the container were to merge parent and child `__init__` signatures automatically, it would conflict with any `super().__init__(arg)` call inside the child — the same instance could be resolved twice, producing two separate objects for what should be a single dep.
+
 ### Lazy[T] — deferred injection
 
 Wraps the dependency in a `LazyProxy`. The real instance is **not resolved until `.get()` (or `.aget()`) is called for the first time**, after which the result is cached.

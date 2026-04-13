@@ -122,7 +122,13 @@ class ClassBinding(Binding):
         - ``pre_destroy`` is ``None`` for classes without ``@PreDestroy``.
     """
 
-    def __init__(self, interface: type, implementation: type) -> None:
+    def __init__(
+        self,
+        interface: type,
+        implementation: type,
+        *,
+        exact_only: bool = False,
+    ) -> None:
         """Create a class binding between *interface* and *implementation*.
 
         Validates the subclass relationship, reads DI metadata, and discovers
@@ -135,6 +141,12 @@ class ClassBinding(Binding):
             implementation: The concrete class to instantiate. Must be a
                             subclass of *interface* and decorated with
                             ``@Component`` or ``@Singleton``.
+            exact_only:     When ``True`` this binding only participates in
+                            lookups where the requested type is *exactly*
+                            ``interface`` — it is excluded from supertype sweeps
+                            such as ``get_all(BaseClass)``.  Set to ``True`` for
+                            auto-generated self-bindings so that they do not
+                            pollute ``get_all`` queries on parent interfaces.
 
         Returns:
             None
@@ -144,6 +156,13 @@ class ClassBinding(Binding):
             ClassBindingNotDecoratedError: If *implementation* has no DI
                 metadata — i.e. it was not decorated with ``@Component`` or
                 ``@Singleton``.
+
+        Edge cases:
+            - ``exact_only=True`` with ``interface == implementation`` is the
+              canonical self-binding pattern — safe and expected.
+            - ``exact_only=True`` with ``interface != implementation`` is valid
+              but unusual; the binding will only be found by callers that request
+              the concrete type directly, not the interface.
         """
         # DESIGN: use _is_generic_subtype instead of plain issubclass so that
         # parameterised interfaces like Repository[User] are accepted.
@@ -158,6 +177,8 @@ class ClassBinding(Binding):
 
         self.interface = interface
         self.implementation = implementation
+        # Controls participation in supertype sweeps — see docstring above.
+        self.exact_only = exact_only
 
         meta: DIMetadata | None = _get_metadata(implementation)
         if meta is None:

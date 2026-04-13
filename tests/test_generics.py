@@ -911,8 +911,9 @@ class TestScannerGenericAutoBinding:
             for b in container._bindings
             if isinstance(b, ClassBinding) and b.implementation is ItemService
         ]
-        # Only one binding must exist, not two
-        assert len(matching) == 1
+        # Two bindings per implementation: one interface binding and one
+        # exact_only self-binding.  Scanning twice must not create four.
+        assert len(matching) == 2
 
     def test_scan_generic_base_not_abstract_still_bound(
         self, container: DIContainer, fake_mod: types.ModuleType

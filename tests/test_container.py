@@ -63,10 +63,14 @@ class TestRegistration:
     """Tests for bind(), register(), and provide()."""
 
     def test_bind_adds_class_binding(self, container: DIContainer) -> None:
-        """bind(Interface, Impl) should add one ClassBinding to _bindings."""
+        """bind(Interface, Impl) should add two ClassBindings to _bindings:
+        one for the interface→implementation mapping and one exact_only
+        self-binding so the concrete type is resolvable directly."""
         container.bind(Notifier, EmailNotifier)
 
-        assert len(container._bindings) == 1
+        # Two bindings: Notifier→EmailNotifier (interface) +
+        # EmailNotifier→EmailNotifier (exact_only self-binding)
+        assert len(container._bindings) == 2
 
     def test_register_adds_self_binding(self, container: DIContainer) -> None:
         """register(Cls) should add a self-binding (interface == implementation)."""

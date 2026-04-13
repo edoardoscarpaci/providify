@@ -194,6 +194,24 @@ class DIContainer:
         - A singleton provider called concurrently (before caching completes)
           may be invoked more than once — the last write wins.  This is safe
           for pure factories but not for providers with side effects.
+
+    Inheritance and MRO:
+        The two injection paths differ deliberately in how they handle MRO:
+
+        * **``__init__`` parameters** — the container reads *only* the
+          declared signature of the class being constructed.  If a subclass
+          overrides ``__init__``, only the subclass's parameters are injected.
+          When ``__init__`` is *not* overridden, Python's own MRO already
+          resolves ``cls.__init__`` to the parent's method, so parent params
+          are injected automatically with no special handling.  Walking parent
+          ``__init__`` signatures on top of that would conflict with any
+          ``super().__init__(arg)`` call the developer writes — the same dep
+          could be resolved twice, producing two separate instances.
+
+        * **Class-level annotations** — ``get_type_hints(cls)`` walks the full
+          MRO, so ``var: Inject[T]`` annotations declared on a parent class are
+          inherited and injected on every subclass instance automatically.  This
+          is the right extension point for shared deps that all subclasses need.
     """
 
     _global: ClassVar[DIContainer | None] = None
@@ -436,6 +454,21 @@ class DIContainer:
         self._validated = False
         self._localns_cache = None  # new binding — localns must be rebuilt
         self._bindings.append(ClassBinding(interface, implementation))
+
+        # When the caller binds an interface to a *different* implementation,
+        # also self-bind the implementation so it is resolvable directly via
+        # container.get(ConcreteClass) — not just via the interface key.
+        # Without this, any injection point that declares the concrete type
+        # (rather than the interface) gets a LookupError.
+        # Guard: skip when interface IS implementation to avoid a duplicate
+        # self-binding that would create ambiguous resolution.
+        # exact_only=True ensures this synthetic entry is invisible to
+        # supertype sweeps like get_all(BaseClass) — it only answers to
+        # container.get(ConcreteClass) directly.
+        if interface is not implementation:
+            self._bindings.append(
+                ClassBinding(implementation, implementation, exact_only=True)
+            )
 
     def register(self, cls: type[T]) -> None:
         """Register a concrete class so it resolves to itself.
@@ -770,6 +803,14 @@ class DIContainer:
             # aliases like Repository[User] are matched correctly — issubclass does
             # not accept parameterised types as its second argument.
             if _interface_matches(b.interface, cls)
+            # DESIGN: exact_only bindings are self-bindings auto-generated to make
+            # a concrete class resolvable by its own type.  They must NOT participate
+            # in supertype sweeps (e.g. get_all(BaseClass)) because they would surface
+            # every concrete subclass registered under its parent interface — creating
+            # duplicates.  We allow them only when the requested type is exactly the
+            # binding's interface (identity check is safe here: self-bindings are
+            # always concrete classes, never generic aliases).
+            and (not getattr(b, "exact_only", False) or b.interface is cls)
             and (qualifier is None or b.qualifier == qualifier)
             and (priority is None or b.priority == priority)
         ]

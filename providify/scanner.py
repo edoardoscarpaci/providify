@@ -192,6 +192,16 @@ class DefaultContainerScanner(ContainerScanner):
             # generic bases like Repository[User].
             for interface in interfaces:
                 bindings.append(ClassBinding(interface, cls))
+
+            # Always self-bind alongside the interface bindings so that the
+            # concrete class itself is resolvable via container.get(ConcreteClass).
+            # Without this, classes that declare an ABC dependency on the concrete
+            # type (e.g. PostRouter → PostService) would get a LookupError even
+            # though PostService is registered — it only exists under its ABC key.
+            # exact_only=True keeps this synthetic entry invisible to supertype
+            # sweeps like get_all(AsyncService) — it only responds to a direct
+            # container.get(PostService) request.
+            bindings.append(ClassBinding(cls, cls, exact_only=True))
         else:
             # No abstract base — self-bind so the class can be resolved directly
             bindings.append(ClassBinding(cls, cls))
