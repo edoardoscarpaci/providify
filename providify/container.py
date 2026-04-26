@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import inspect
+import logging
 import threading
 import types
+import warnings
 from types import ModuleType
 from typing import (
     Annotated,
@@ -18,9 +21,9 @@ from typing import (
 )
 
 from .binding import AnyBinding, ClassBinding, ProviderBinding
+from .decorator.lifecycle import LifecycleMarker
 from .descriptor import DIContainerDescriptor
 from .exceptions import CircularDependencyError, LiveInjectionRequiredError
-from .decorator.lifecycle import LifecycleMarker
 from .metadata import (
     LiveInjectionViolation,
     Scope,
@@ -48,6 +51,8 @@ from .type import (
 from .utils import _interface_matches, _type_name
 
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 
 def _unwrap_union(hint: Any) -> tuple[list[Any], bool] | None:
@@ -191,9 +196,9 @@ class DIContainer:
           resolution re-runs ``validate_bindings()`` over the full registry.
         - Resolving a ``REQUEST``/``SESSION``-scoped binding outside an active
           scope context raises ``RuntimeError`` immediately.
-        - A singleton provider called concurrently (before caching completes)
-          may be invoked more than once — the last write wins.  This is safe
-          for pure factories but not for providers with side effects.
+        - Singleton resolution is protected by per-key double-check locking
+          (Feature 4) — exactly one instance is created even under concurrent
+          access from multiple threads or tasks.
 
     Inheritance and MRO:
         The two injection paths differ deliberately in how they handle MRO:
@@ -269,7 +274,19 @@ class DIContainer:
         """
         self._bindings: list[AnyBinding] = []
         self._singleton_cache: dict[Any, object] = {}
-        self.scope_context: ScopeContext = ScopeContext()
+        # DESIGN: ScopeContext receives @PreDestroy callbacks so it can run
+        # lifecycle hooks exactly when a request/session scope frame exits —
+        # before the cache is popped.  Both sync and async callbacks are wired
+        # here; ScopeContext calls whichever is appropriate for its context manager.
+        #
+        # Tradeoffs:
+        #   ✅ Lifecycle hooks fire at the right moment (scope exit, not shutdown)
+        #   ✅ Container logic stays in the container; ScopeContext stays generic
+        #   ❌ Two extra bound-method references stored on every ScopeContext
+        self.scope_context: ScopeContext = ScopeContext(
+            on_scope_exit=self._run_pre_destroy_for_scope,
+            on_scope_exit_async=self._arun_pre_destroy_for_scope,
+        )
         self._scanner: ContainerScanner = DefaultContainerScanner(self)
         # Starts unvalidated — first resolution triggers validate_bindings()
         self._validated: bool = False
@@ -278,6 +295,30 @@ class DIContainer:
         # In the common case (all bindings registered before the first get()),
         # the dict is built exactly once and reused for every resolution.
         self._localns_cache: dict[str, type] | None = None
+
+        # ── Feature 4: per-key singleton locks (double-check locking) ──────
+        # DESIGN: _singleton_locks maps a cache key to a per-key threading.Lock.
+        # _singleton_lock_guard protects the creation of per-key locks so that
+        # two threads that simultaneously reach a cold cache entry do not both
+        # create new lock objects — only the first one's lock is used.
+        #
+        # Tradeoffs:
+        #   ✅ True double-check locking: one instance created per singleton key
+        #   ✅ Only SINGLETON scope is affected — REQUEST/SESSION use ContextVar
+        #      isolation which already prevents races at the scope level
+        #   ❌ Small overhead for the guard lock on first access per key
+        #   ❌ Lock dict grows with the number of distinct singleton keys (bounded)
+        self._singleton_locks: dict[Any, threading.Lock] = {}
+        self._singleton_lock_guard: threading.Lock = threading.Lock()
+
+        # ── Feature 4: per-key asyncio locks ────────────────────────────────
+        # Created lazily inside _instantiate_async — asyncio.Lock() requires a
+        # running event loop at creation time, so we cannot create them here.
+        # _async_singleton_locks is the dict; the guard is the same
+        # _singleton_lock_guard (creating asyncio.Lock also needs protection).
+        # DESIGN: asyncio.Lock instances must NEVER be created at module level
+        # or in __init__ — they require an active event loop.
+        self._async_singleton_locks: dict[Any, asyncio.Lock] = {}
 
         # ── Auto-scan at construction time ────────────────────────
         # DESIGN: Eager scan (at __init__) rather than lazy scan (deferred to
@@ -906,8 +947,8 @@ class DIContainer:
             priority:  Exact priority to match. ``None`` returns the best available.
 
         Returns:
-            The lowest-priority-value binding among all matching candidates
-            (lower value = higher precedence).
+            The highest-priority-value binding among all matching candidates
+            (higher value = higher precedence).
 
         Raises:
             LookupError: No binding is registered for ``cls`` with the given
@@ -992,52 +1033,130 @@ class DIContainer:
     def _instantiate_sync(self, binding: AnyBinding) -> Any:
         """Instantiate *binding* synchronously, respecting scope caching.
 
-        Looks up the appropriate cache for the binding's scope. If a cached
-        instance exists it is returned immediately; otherwise ``binding.create()``
-        is called and the result is stored before being returned.
+        For SINGLETON scope, uses per-key double-check locking to guarantee
+        exactly one instance is created under concurrent access from multiple
+        threads.
+
+        Pattern (singleton path only):
+            1. Check cache without lock — fast path for already-cached singletons.
+            2. Lazy-create a per-key threading.Lock (under guard lock).
+            3. Check cache again inside the per-key lock — another thread may
+               have won the race between steps 1 and 2.
+            4. Create instance and store under the per-key lock.
+
+        For REQUEST/SESSION scope, the ContextVar isolation guarantees that each
+        task sees its own cache — no additional locking is needed.
+        For DEPENDENT scope, no cache exists — a new instance is always created.
 
         Args:
             binding: The binding to instantiate.
 
         Returns:
             The (possibly cached) resolved instance.
+
+        Thread safety:  ✅ SINGLETON: double-check lock ensures one creation.
+                        REQUEST/SESSION: ContextVar-isolated — no shared state.
+                        DEPENDENT: no cache — concurrent calls each get a new instance.
+        Async safety:   ✅ No await points — safe to call from sync code.
+
+        Edge cases:
+            - binding.create() raises → no cache entry is stored (exception propagates).
+            - Two threads race on a cold singleton key → guard lock serialises
+              lock creation; per-key lock serialises instance creation.
         """
         key = self._get_cache_key(binding)
         cache = self._get_cache(binding)
 
+        # ── Fast path: already in cache (no lock needed) ─────────────────────
         if cache is not None and key in cache:
             return cache[key]
 
-        instance = binding.create(self)
+        # ── SINGLETON double-check locking ────────────────────────────────────
+        # Only apply per-key locking for the singleton cache.  REQUEST/SESSION
+        # caches are per-context (ContextVar) so concurrent tasks cannot share
+        # them; DEPENDENT has no cache at all.
+        if cache is self._singleton_cache:
+            # Lazy-create the per-key lock under the guard lock to prevent
+            # two threads from each creating a different lock object for the
+            # same key — only the first one must be used.
+            with self._singleton_lock_guard:
+                if key not in self._singleton_locks:
+                    self._singleton_locks[key] = threading.Lock()
+            per_key_lock = self._singleton_locks[key]
 
+            with per_key_lock:
+                # Second check inside the lock: another thread may have already
+                # created and cached the instance between our first check and
+                # acquiring this lock.
+                if key in cache:
+                    return cache[key]
+                instance = binding.create(self)
+                cache[key] = instance
+            return instance
+
+        # ── Non-singleton path (REQUEST, SESSION, DEPENDENT) ─────────────────
+        instance = binding.create(self)
         if cache is not None:
             cache[key] = instance
-
         return instance
 
     async def _instantiate_async(self, binding: AnyBinding) -> Any:
         """Instantiate *binding* asynchronously, respecting scope caching.
 
-        Mirrors :meth:`_instantiate_sync` but delegates to ``binding.acreate()``,
-        which handles both sync and async providers transparently.
+        Mirrors :meth:`_instantiate_sync` but delegates to ``binding.acreate()``.
+        For SINGLETON scope, uses per-key asyncio.Lock double-check locking —
+        the same pattern as the sync path but with asyncio primitives so the
+        event loop is never blocked.
+
+        asyncio.Lock objects are created lazily inside this method (never at
+        module level or ``__init__``) because they require a running event loop.
 
         Args:
             binding: The binding to instantiate.
 
         Returns:
             The (possibly cached) resolved instance.
+
+        Async safety:   ✅ SINGLETON: asyncio.Lock ensures one creation per key
+                        per event loop.  REQUEST/SESSION: ContextVar-isolated.
+                        DEPENDENT: no cache — each awaiter gets a fresh instance.
+
+        Edge cases:
+            - binding.acreate() raises → no cache entry is stored.
+            - Two concurrent tasks race on a cold singleton key → the asyncio.Lock
+              serialises them; only one runs acreate().
         """
         key = self._get_cache_key(binding)
         cache = self._get_cache(binding)
 
+        # ── Fast path ─────────────────────────────────────────────────────────
         if cache is not None and key in cache:
             return cache[key]
 
-        instance = await binding.acreate(self)
+        # ── SINGLETON double-check locking (async) ────────────────────────────
+        if cache is self._singleton_cache:
+            # Lazy-create asyncio.Lock under the threading guard lock.
+            # DESIGN: the guard lock is a threading.Lock here (not asyncio.Lock)
+            # because asyncio.Lock cannot be created outside an event loop and
+            # we only need it for a very brief dict-check + insert — no I/O.
+            # The window is tiny; the risk of blocking the loop is negligible.
+            with self._singleton_lock_guard:
+                if key not in self._async_singleton_locks:
+                    # Created lazily — requires a running loop ✅
+                    self._async_singleton_locks[key] = asyncio.Lock()
+            async_lock = self._async_singleton_locks[key]
 
+            async with async_lock:
+                if key in cache:
+                    return cache[key]
+                instance = await binding.acreate(self)
+                cache[key] = instance  # type: ignore[index]
+            return instance
+
+        # ── Non-singleton path ────────────────────────────────────────────────
+        instance = await binding.acreate(self)
         if cache is not None:
             cache[key] = instance
-
         return instance
 
     # ── Type-hint resolution ──────────────────────────────────────
@@ -1322,6 +1441,38 @@ class DIContainer:
         if get_origin(hint) is Annotated:
             args = get_args(hint)
             base_type = args[0]
+
+            # ── Detect Optional[T] / T | None inside the Inject/Live/Lazy wrapper ──
+            # Handles: Inject[Optional[T]], Inject[T | None],
+            #          Live[Optional[T]],   Live[T | None],
+            #          Lazy[Optional[T]],   Lazy[T | None].
+            #
+            # When the user writes Inject[T | None], the runtime expansion is
+            # Annotated[T | None, InjectMeta()].  base_type is then the union
+            # T | None, NOT a registered concrete type — so self.get(T | None)
+            # would always raise LookupError.  _unwrap_union unwraps it to T
+            # and signals that None should be returned when the binding is absent.
+            #
+            # DESIGN: only simplify for exactly ONE non-None candidate, i.e. a
+            # true Optional[T].  Multi-type unions (Inject[T1 | T2 | None]) are
+            # passed through unchanged — the caller can spell that as a plain
+            # T1 | T2 | None annotation outside of Inject/Live/Lazy, which the
+            # existing Union-branch below already handles correctly.
+            _base_union = _unwrap_union(base_type)
+            if (
+                _base_union is not None
+                and len(_base_union[0]) == 1
+                and _base_union[1]  # NoneType was present → truly optional
+            ):
+                # Simple Optional[T]: replace the union with its sole inner type
+                # and mark the whole annotation as optional.
+                effective_base_type: Any = _base_union[0][0]
+                effective_optional: bool = True
+            else:
+                # Not an Optional inside a wrapper — resolve as-is.
+                effective_base_type = base_type
+                effective_optional = False
+
             # Priority order: LiveMeta → LazyMeta → InstanceMeta → InjectMeta.
             # A hint can only carry one _providify marker at a time, but we
             # check in this order so the most specific proxy type wins.
@@ -1335,21 +1486,26 @@ class DIContainer:
             if live_meta:
                 # Return a LiveProxy — re-resolves on every .get() call.
                 # Correct for REQUEST/SESSION scoped deps held by longer-lived components.
+                # Merge optionality from the type annotation (T | None) with the
+                # explicit LiveMeta.optional field so both spell-forms work.
                 return LiveProxy(
                     self,
-                    base_type,
+                    effective_base_type,
                     qualifier=live_meta.qualifier,
                     priority=live_meta.priority,
+                    optional=effective_optional or live_meta.optional,
                 )
             elif lazy_meta:
                 # Return a proxy now — actual resolution is deferred to .get() call time.
                 # This breaks circular dependency cycles: both constructors return before
                 # either dependency is resolved, so the stack never sees a cycle.
+                # Merge optionality from the type annotation with LazyMeta.optional.
                 return LazyProxy(
                     self,
-                    base_type,
+                    effective_base_type,
                     qualifier=lazy_meta.qualifier,
                     priority=lazy_meta.priority,
+                    optional=effective_optional or lazy_meta.optional,
                 )
             elif instance_meta:
                 # Return an InstanceProxy — gives the owner full control: .get() for
@@ -1357,25 +1513,28 @@ class DIContainer:
                 # .resolvable() for an optional guard.  No resolution happens here.
                 # Qualifier/priority are NOT baked in at construction — the caller
                 # passes them at call time on get() / get_all() / resolvable().
-                return InstanceProxy(self, base_type)
+                return InstanceProxy(self, effective_base_type)
             elif inject_meta and inject_meta.all:
                 inner = (
-                    get_args(base_type)[0]
-                    if get_origin(base_type) is list
-                    else base_type
+                    get_args(effective_base_type)[0]
+                    if get_origin(effective_base_type) is list
+                    else effective_base_type
                 )
                 return self.get_all(inner, qualifier=inject_meta.qualifier)
             elif inject_meta:
+                # Merge optionality: type-annotation form (T | None) OR explicit
+                # InjectMeta(optional=True) — both should inject None when absent.
+                is_optional = inject_meta.optional or effective_optional
                 try:
                     return self.get(
-                        base_type,
+                        effective_base_type,
                         qualifier=inject_meta.qualifier,
                         priority=inject_meta.priority,
                     )
                 except LookupError:
                     # optional=True: swallow the error and inject None.
                     # optional=False (default): re-raise so the caller sees the real error.
-                    if inject_meta.optional:
+                    if is_optional:
                         return None
                     raise
 
@@ -1433,6 +1592,19 @@ class DIContainer:
         if get_origin(hint) is Annotated:
             args = get_args(hint)
             base_type = args[0]
+
+            # ── Detect Optional[T] / T | None inside the wrapper (async mirror) ──
+            # Identical logic to _resolve_hint_sync — see that method for the full
+            # design rationale.  Duplicated here rather than extracted to a shared
+            # helper so the sync and async paths remain independently readable.
+            _base_union = _unwrap_union(base_type)
+            if _base_union is not None and len(_base_union[0]) == 1 and _base_union[1]:
+                effective_base_type: Any = _base_union[0][0]
+                effective_optional: bool = True
+            else:
+                effective_base_type = base_type
+                effective_optional = False
+
             # Mirror of _resolve_hint_sync — same priority order: Live → Lazy → Instance → Inject.
             live_meta = next((a for a in args[1:] if isinstance(a, LiveMeta)), None)
             lazy_meta = next((a for a in args[1:] if isinstance(a, LazyMeta)), None)
@@ -1445,38 +1617,41 @@ class DIContainer:
                 # Proxy creation is always sync — the proxy's .aget() method is async.
                 return LiveProxy(
                     self,
-                    base_type,
+                    effective_base_type,
                     qualifier=live_meta.qualifier,
                     priority=live_meta.priority,
+                    optional=effective_optional or live_meta.optional,
                 )
             elif lazy_meta:
                 # Proxy creation is always sync — the proxy's .aget() method is async.
                 return LazyProxy(
                     self,
-                    base_type,
+                    effective_base_type,
                     qualifier=lazy_meta.qualifier,
                     priority=lazy_meta.priority,
+                    optional=effective_optional or lazy_meta.optional,
                 )
             elif instance_meta:
                 # Proxy creation is always sync — .aget() / .aget_all() are async.
                 # No qualifier/priority baked in — caller supplies them at call time.
-                return InstanceProxy(self, base_type)
+                return InstanceProxy(self, effective_base_type)
             elif inject_meta and inject_meta.all:
                 inner = (
-                    get_args(base_type)[0]
-                    if get_origin(base_type) is list
-                    else base_type
+                    get_args(effective_base_type)[0]
+                    if get_origin(effective_base_type) is list
+                    else effective_base_type
                 )
                 return await self.aget_all(inner, qualifier=inject_meta.qualifier)
             elif inject_meta:
+                is_optional = inject_meta.optional or effective_optional
                 try:
                     return await self.aget(
-                        base_type,
+                        effective_base_type,
                         qualifier=inject_meta.qualifier,
                         priority=inject_meta.priority,
                     )
                 except LookupError:
-                    if inject_meta.optional:
+                    if is_optional:
                         return None
                     raise
 
@@ -2076,6 +2251,109 @@ class DIContainer:
         self._singleton_cache.clear()
         self.scope_context.clear_caches()
 
+    # ── Scoped @PreDestroy callbacks ──────────────────────────────
+
+    def _run_pre_destroy_for_scope(self, cache: dict[Any, object]) -> None:
+        """Run sync @PreDestroy hooks for all cached instances in *cache*.
+
+        Called by :class:`~providify.scope.ScopeContext` just before a
+        request or session scope cache is popped.  Iterates ``_bindings``,
+        finds each :class:`~providify.binding.ClassBinding` whose
+        implementation class is a key in *cache*, and calls its
+        ``pre_destroy`` hook if present.
+
+        Async ``@PreDestroy`` hooks are skipped with a ``warnings.warn`` rather
+        than raising — the sync context manager cannot await them.  Use the
+        async context managers (``arequest()`` / ``asession()``) when async
+        teardown is needed.
+
+        Args:
+            cache: The scope cache dict that is about to be discarded.
+                   Keys are implementation classes (same as
+                   :meth:`_get_cache_key` produces for ClassBinding).
+
+        Returns:
+            None
+
+        Edge cases:
+            - Empty cache                    → no-op.
+            - Instance has no @PreDestroy    → silently skipped.
+            - Async @PreDestroy encountered  → warning emitted, hook skipped.
+            - Exception from a hook          → propagates after the cache is
+                                               discarded (handled by finally).
+
+        Thread safety:  ✅ Reads ``_bindings`` (no mutations during teardown).
+        Async safety:   ✅ No await points — safe to call from sync context.
+
+        Example:
+            # Called automatically by ScopeContext — do not call directly.
+        """
+        for binding in self._bindings:
+            if not isinstance(binding, ClassBinding):
+                continue
+            if binding.pre_destroy is None:
+                continue
+            key = binding.implementation
+            instance = cache.get(key)
+            if instance is None:
+                continue
+            if binding.pre_destroy.is_async:
+                # DESIGN: sync path cannot await — warn and skip rather than
+                # crash.  The async path (_arun_pre_destroy_for_scope) handles
+                # async hooks correctly; use arequest()/asession() when needed.
+                warnings.warn(
+                    f"@PreDestroy method '{binding.pre_destroy.fn_name}' on "
+                    f"'{binding.implementation.__name__}' is async — it will "
+                    f"NOT be called in the sync request/session context. "
+                    f"Use 'async with container.arequest():' or "
+                    f"'async with container.asession():' instead.",
+                    stacklevel=3,
+                )
+                continue
+            getattr(instance, binding.pre_destroy.fn_name)()
+
+    async def _arun_pre_destroy_for_scope(self, cache: dict[Any, object]) -> None:
+        """Run all @PreDestroy hooks (sync + async) for *cache* instances.
+
+        Async mirror of :meth:`_run_pre_destroy_for_scope`.  Called by
+        :class:`~providify.scope.ScopeContext` before an async request or
+        session scope cache is popped.  Unlike the sync version, this method
+        awaits async ``@PreDestroy`` hooks and calls sync ones normally.
+
+        Args:
+            cache: The scope cache dict that is about to be discarded.
+
+        Returns:
+            None
+
+        Edge cases:
+            - Empty cache                    → no-op.
+            - Instance has no @PreDestroy    → silently skipped.
+            - Sync @PreDestroy               → called normally (no await).
+            - Async @PreDestroy              → awaited ✅.
+            - Exception from a hook          → propagates.
+
+        Async safety:   ✅ Awaits async hooks; sync hooks called inline.
+        Thread safety:  ✅ Reads ``_bindings`` only; no mutations during teardown.
+
+        Example:
+            # Called automatically by ScopeContext — do not call directly.
+        """
+        for binding in self._bindings:
+            if not isinstance(binding, ClassBinding):
+                continue
+            if binding.pre_destroy is None:
+                continue
+            key = binding.implementation
+            instance = cache.get(key)
+            if instance is None:
+                continue
+            bound = getattr(instance, binding.pre_destroy.fn_name)
+            if binding.pre_destroy.is_async:
+                await bound()
+            else:
+                bound()
+
     # ── Scope-leak validation ─────────────────────────────────────
 
     def _collect_class_var_hints(self, cls: type) -> dict[str, Any]:
@@ -2230,6 +2508,120 @@ class DIContainer:
                         leaks.append(
                             ScopeLeak(
                                 binding=(binding.implementation, binding.scope),
+                                reference=(dep.interface, dep.scope),
+                            )
+                        )
+
+        if live_violations:
+            raise LiveInjectionRequiredError(violations=live_violations)
+
+        return leaks
+
+    def _check_provider_scope_violation(
+        self,
+        binding: ProviderBinding,
+    ) -> list[ScopeLeak]:
+        """Inspect a provider function's parameters for scope leaks.
+
+        Mirrors :meth:`_check_scope_violation` for :class:`ProviderBinding`.
+        A ``@Provider(singleton=True)`` whose parameters include a
+        ``REQUEST`` or ``SESSION`` scoped dependency without ``Live[T]``
+        wrapping will silently capture a stale instance — the same risk
+        that ``ClassBinding.validate()`` guards against in ``__init__``.
+
+        Args:
+            binding: The :class:`ProviderBinding` whose function parameters
+                     are inspected for scope-narrowing dependency references.
+
+        Returns:
+            A list of :class:`~providify.metadata.ScopeLeak` instances, one
+            per violating dependency.  Empty list means no leaks.
+
+        Raises:
+            LiveInjectionRequiredError: If any ``REQUEST`` or ``SESSION``
+                scoped dependency is injected without ``Live[T]`` wrapping.
+
+        Edge cases:
+            - Provider with no parameters            → empty list, no error
+            - Provider scope is DEPENDENT            → no leak risk, returns []
+            - ``get_type_hints`` raises              → returns [] (defensive)
+            - Provider parameter is ``Live[T]``      → safe, not flagged
+        """
+        # DEPENDENT providers create a fresh instance every call — they never
+        # hold a reference long enough to go stale.  Only SINGLETON and SESSION
+        # can capture a narrower-scoped dep for longer than its lifetime.
+        if binding.scope not in (Scope.SINGLETON, Scope.SESSION):
+            return []
+
+        leaks: list[ScopeLeak] = []
+        live_violations: list[LiveInjectionViolation] = []
+
+        try:
+            # include_extras=True — required to preserve Annotated wrappers so
+            # we can detect Live[T] / Lazy[T] / Inject[T] markers on each param.
+            # localns — from __future__ import annotations makes all annotations
+            # lazy strings; locally-defined types are absent from fn.__globals__.
+            # _build_localns() maps every registered class name → type, letting
+            # get_type_hints resolve parameter types that aren't in __globals__.
+            fn_hints = get_type_hints(
+                binding.fn, include_extras=True, localns=self._build_localns()
+            )
+        except Exception:
+            # Annotation evaluation can fail for locally-defined parameter types
+            # even after localns injection (e.g. complex forward references).
+            # Defensive posture: skip validation rather than crash.
+            return leaks
+
+        fn_hints.pop("return", None)
+
+        for param_name, hint in fn_hints.items():
+            # Extract the injection marker BEFORE stripping Annotated — we need
+            # to know whether the caller used Live[T] (safe) or bare type / Inject[T].
+            inject_marker: _providify | None = None
+            if get_origin(hint) is Annotated:
+                args = get_args(hint)
+                base_type = args[0]
+                inject_marker = next(
+                    (a for a in args[1:] if isinstance(a, _providify)), None
+                )
+            else:
+                base_type = hint
+
+            if not isinstance(base_type, type):
+                continue
+
+            dep_bindings = self._filter(base_type)
+            for dep in dep_bindings:
+                if not _is_scope_leak(parent_scope=binding.scope, dep_scope=dep.scope):
+                    continue
+
+                if dep.scope in (Scope.REQUEST, Scope.SESSION):
+                    # REQUEST and SESSION scoped deps must be wrapped in Live[T].
+                    # A singleton provider that receives a REQUEST-scoped param
+                    # will call container.get(T) once and hold that instance —
+                    # it becomes stale on the next request boundary.
+                    if not isinstance(inject_marker, (LiveMeta, InstanceMeta)):
+                        live_violations.append(
+                            LiveInjectionViolation(
+                                # ProviderBinding has no implementation class —
+                                # use the provider function's name as an identifier.
+                                binding=(
+                                    type(f"@Provider({binding.fn.__name__})", (), {}),
+                                    binding.scope,
+                                ),
+                                dep=(base_type, dep.scope),
+                                param_name=param_name,
+                            )
+                        )
+                else:
+                    # Non-scoped leak (SINGLETON holding a narrower-scoped dep).
+                    if not isinstance(inject_marker, InstanceMeta):
+                        leaks.append(
+                            ScopeLeak(
+                                binding=(
+                                    type(f"@Provider({binding.fn.__name__})", (), {}),
+                                    binding.scope,
+                                ),
                                 reference=(dep.interface, dep.scope),
                             )
                         )
@@ -2454,7 +2846,262 @@ class DIContainer:
             bindings=tuple(b.describe(self) for b in self._bindings),
         )
 
-    def __repr__(self) -> str:
-        return (
-            f"DIContainer(bindings={len(self._bindings)}, validated={self._validated})"
+    # ── Introspection (Feature 10) ────────────────────────────────
+
+    def get_binding(
+        self,
+        interface: type,
+        *,
+        qualifier: str | None = None,
+        priority: int | None = None,
+    ) -> AnyBinding:
+        """Return the highest-priority binding for *interface* without instantiating it.
+
+        A pure read — does NOT trigger ``validate_bindings()`` or create any
+        instances. Useful for test introspection, migration scripts, and
+        tooling that inspects the container registry.
+
+        Args:
+            interface:  The type to look up (concrete class or interface).
+            qualifier:  If given, only bindings registered with this qualifier
+                        are considered.
+            priority:   If given, only bindings with this exact priority value
+                        are considered.
+
+        Returns:
+            The highest-priority matching :class:`~providify.binding.AnyBinding`.
+
+        Raises:
+            LookupError: If no binding is registered for *interface* with
+                         the given qualifier / priority.
+
+        Edge cases:
+            - Called before ``get()``       → does NOT trigger validate_bindings().
+            - exact_only self-bindings      → included when *interface* is the
+                                              concrete class itself.
+            - No bindings at all            → raises LookupError.
+
+        Thread safety:  ✅ Read-only; no shared state mutated.
+        Async safety:   ✅ No await points.
+
+        Example:
+            binding = container.get_binding(UserRepository)
+            print(binding.scope)  # Scope.SINGLETON
+        """
+        return self._get_best_candidate(
+            interface, qualifier=qualifier, priority=priority
         )
+
+    def get_all_bindings(
+        self,
+        interface: type,
+        *,
+        qualifier: str | None = None,
+    ) -> list[AnyBinding]:
+        """Return all registered bindings for *interface* without instantiating them.
+
+        A pure read — does NOT trigger ``validate_bindings()`` or create any
+        instances. Returns an empty list (never raises LookupError) when no
+        bindings match.
+
+        Args:
+            interface: The type to look up.
+            qualifier: If given, only bindings with this qualifier are returned.
+
+        Returns:
+            A list of all matching bindings, in registration order.
+            Returns ``[]`` if none are registered.
+
+        Edge cases:
+            - No bindings match → returns [] (differs from get_all() which raises).
+            - Called before get() → does NOT trigger validate_bindings().
+
+        Thread safety:  ✅ Read-only; no shared state mutated.
+        Async safety:   ✅ No await points.
+
+        Example:
+            bindings = container.get_all_bindings(NotificationService)
+            for b in bindings:
+                print(b.scope, b.qualifier)
+        """
+        return self._filter(interface, qualifier=qualifier)
+
+    # ── Override (Feature 5) ──────────────────────────────────────
+
+    def override(self, interface: Any, implementation: type) -> None:
+        """Replace all bindings for *interface* with a new implementation.
+
+        Removes every :class:`~providify.binding.ClassBinding` where
+        ``binding.interface == interface``, evicts the previous implementations
+        from the singleton cache, then calls :meth:`bind` to register the
+        replacement.
+
+        Resets validation state so scope-leak checks run again on the next
+        ``get()`` / ``aget()`` call.
+
+        Intended for test overrides — swapping a real service with a fake
+        without rebuilding the container.
+
+        Args:
+            interface:      The interface type to override.
+            implementation: The replacement concrete class.
+
+        Returns:
+            None
+
+        Edge cases:
+            - Interface not registered → no-op (no error raised).  The new
+              binding is still registered via ``bind()``.
+            - Only :class:`~providify.binding.ClassBinding` entries are removed.
+              :class:`~providify.binding.ProviderBinding` entries for the same
+              interface are left in place.
+            - Singleton cache entries for the *previous* implementation are
+              evicted so the new impl gets a fresh start.
+
+        Thread safety:  ⚠️ Not safe for concurrent use — call before the app
+                        goes multi-threaded.
+        Async safety:   ✅ No await points.
+
+        Example:
+            container.bind(Notifier, RealNotifier)
+            container.override(Notifier, FakeNotifier)  # test swap
+            svc = container.get(Notifier)               # FakeNotifier
+        """
+        # Collect implementation classes for cache eviction before mutating
+        # _bindings — otherwise we'd evict entries we've already removed.
+        to_evict: list[Any] = [
+            b.implementation
+            for b in self._bindings
+            if isinstance(b, ClassBinding) and b.interface is interface
+        ]
+
+        # Remove all ClassBinding entries that map *interface* → anything.
+        # DESIGN: list comprehension (rebuild) rather than in-place removal so
+        # iteration order is preserved and there is no index-shift bug.
+        self._bindings = [
+            b
+            for b in self._bindings
+            if not (isinstance(b, ClassBinding) and b.interface is interface)
+        ]
+
+        # Evict previous singletons — stale instances must not survive the swap.
+        for key in to_evict:
+            self._singleton_cache.pop(key, None)
+            self._singleton_locks.pop(key, None)
+            self._async_singleton_locks.pop(key, None)
+
+        # Register the replacement via the public bind() API — which also
+        # resets _validated and _localns_cache.
+        self.bind(interface, implementation)
+
+    # ── Reset binding (Feature 12) ────────────────────────────────
+
+    def reset_binding(
+        self,
+        interface: Any,
+        *,
+        qualifier: str | None = None,
+    ) -> int:
+        """Remove all bindings for *interface* and evict cached instances.
+
+        Mirrors :meth:`override` but without registering a replacement.
+        After this call, :meth:`is_resolvable` returns ``False`` for
+        *interface* with the given qualifier.
+
+        Args:
+            interface:  The interface type to remove.
+            qualifier:  If given, only bindings with this exact qualifier are
+                        removed.  ``None`` removes ALL bindings for *interface*
+                        regardless of qualifier.
+
+        Returns:
+            The number of bindings removed (0 means not found — no error raised).
+
+        Edge cases:
+            - Interface not registered                → returns 0, no error.
+            - Singleton cache evicted for removed keys → subsequent get() creates
+                                                         a fresh instance (if
+                                                         re-bound before then).
+            - Both ClassBinding and ProviderBinding entries are removed.
+
+        Thread safety:  ⚠️ Not safe for concurrent use.
+        Async safety:   ✅ No await points.
+
+        Example:
+            container.register(MyService)
+            container.get(MyService)          # caches singleton
+            n = container.reset_binding(MyService)
+            assert n == 1
+            assert not container.is_resolvable(MyService)
+        """
+        to_remove = [
+            b
+            for b in self._bindings
+            if _interface_matches(b.interface, interface)
+            and (qualifier is None or b.qualifier == qualifier)
+        ]
+
+        if not to_remove:
+            return 0
+
+        # Collect cache keys before removal
+        to_evict: list[Any] = []
+        for b in to_remove:
+            if isinstance(b, ClassBinding):
+                to_evict.append(b.implementation)
+            else:
+                to_evict.append(b.fn)  # type: ignore[union-attr]
+
+        # Rebuild _bindings without the removed entries
+        remove_set = set(id(b) for b in to_remove)
+        self._bindings = [b for b in self._bindings if id(b) not in remove_set]
+
+        # Evict cached instances
+        for key in to_evict:
+            self._singleton_cache.pop(key, None)
+            self._singleton_locks.pop(key, None)
+            self._async_singleton_locks.pop(key, None)
+
+        # Reset validation so scope checks run again
+        self._validated = False
+        self._localns_cache = None
+
+        return len(to_remove)
+
+    # ── __repr__ (Feature 14) ─────────────────────────────────────
+
+    def __repr__(self) -> str:
+        """Return a human-readable summary with per-scope binding counts.
+
+        Shows counts only for scopes that have at least one binding so the
+        output stays compact.
+
+        Returns:
+            A string like:
+            ``DIContainer(singleton=3, request=2, dependent=6, validated=True)``
+
+        Example:
+            repr(container)
+            # → 'DIContainer(singleton=2, dependent=4, validated=False)'
+
+        Thread safety:  ✅ Read-only; iterates _bindings under GIL.
+        Async safety:   ✅ No await points.
+        """
+        # DESIGN: collections.Counter maps Scope → count in a single pass.
+        # Only scopes with count > 0 are shown — keeps output minimal.
+        counts: collections.Counter[str] = collections.Counter(
+            b.scope.name.lower() for b in self._bindings
+        )
+        scope_parts = ", ".join(
+            f"{name}={count}"
+            for name, count in [
+                ("singleton", counts.get("singleton", 0)),
+                ("request", counts.get("request", 0)),
+                ("session", counts.get("session", 0)),
+                ("dependent", counts.get("dependent", 0)),
+            ]
+            if count > 0
+        )
+        if scope_parts:
+            return f"DIContainer({scope_parts}, validated={self._validated})"
+        return f"DIContainer(validated={self._validated})"

@@ -286,10 +286,19 @@ class LazyMeta(_providify):
     Attributes:
         qualifier: Optional named qualifier forwarded to container.get().
         priority:  Optional priority forwarded to container.get().
+        optional:  When True the proxy's .get() / .aget() return None instead
+                   of raising LookupError when no binding is found.
+                   Set automatically when the type annotation is Lazy[T | None]
+                   or Lazy[Optional[T]]; can also be set explicitly via
+                   Annotated[T, LazyMeta(optional=True)].
     """
 
     qualifier: str | None = None
     priority: int | None = None
+    # DESIGN: optional=False by default — fail-fast is safer than silently
+    # injecting None. Callers must explicitly opt in, either by using
+    # Lazy[T | None] / Lazy[Optional[T]] or Annotated[T, LazyMeta(optional=True)].
+    optional: bool = False
 
 
 class LazyProxy(Generic[T]):
@@ -310,7 +319,8 @@ class LazyProxy(Generic[T]):
                     have the same race condition as the thread case above.
 
     Edge cases:
-        - T not registered → .get() raises LookupError (deferred to call time)
+        - T not registered, optional=False → .get() raises LookupError (deferred to call time)
+        - T not registered, optional=True  → .get() returns None and caches that result
         - T is async-only → .get() raises RuntimeError; use .aget() instead
         - Proxy re-used across request boundaries with DEPENDENT T → each
           .get() call resolves a fresh instance (no caching in the proxy)
@@ -326,6 +336,15 @@ class LazyProxy(Generic[T]):
 
             def do_work(self) -> None:
                 self._b.get().method()  # B resolved here (first access)
+
+        # Optional form — returns None if B is not registered:
+        @Component
+        class A:
+            def __init__(self, b: Lazy[B | None]) -> None:
+                self._b = b          # LazyProxy with optional=True
+
+            def do_work(self) -> None:
+                result = self._b.get()   # None if B not bound, B instance otherwise
     """
 
     def __init__(
@@ -334,6 +353,7 @@ class LazyProxy(Generic[T]):
         tp: type[T],
         qualifier: str | None = None,
         priority: int | None = None,
+        optional: bool = False,
     ) -> None:
         # Stored as Any at runtime — TYPE_CHECKING guard prevents circular import.
         # DIContainer is only used via self._container.get() / .aget() — both are
@@ -342,60 +362,80 @@ class LazyProxy(Generic[T]):
         self._tp = tp
         self._qualifier = qualifier
         self._priority = priority
+        # When True, LookupError on first resolution is swallowed and None is
+        # cached instead. Set automatically when the annotation is Lazy[T | None].
+        self._optional = optional
         # _instance is None until first resolution — not the same as a None binding.
-        # _resolved tracks whether resolution has occurred, since None is a valid result.
+        # _resolved tracks whether resolution has occurred, since None is a valid result
+        # (either from a None-returning binding or from optional injection of an absent dep).
         self._instance: T | None = None
         self._resolved: bool = False
 
-    def get(self) -> T:
+    def get(self) -> T | None:
         """Resolve and return the wrapped instance synchronously.
 
         On first call, delegates to container.get(T).
         Subsequent calls return the cached result without re-resolving.
 
         Returns:
-            The resolved instance of T.
+            The resolved instance of T, or None if optional=True and T has
+            no registered binding.
 
         Raises:
-            LookupError:   If T has no registered binding.
+            LookupError:   If T has no registered binding and optional=False.
             RuntimeError:  If T's provider is async — use .aget() instead.
         """
         if not self._resolved:
-            self._instance = self._container.get(
-                self._tp,
-                qualifier=self._qualifier,
-                priority=self._priority,
-            )
+            try:
+                self._instance = self._container.get(
+                    self._tp,
+                    qualifier=self._qualifier,
+                    priority=self._priority,
+                )
+            except LookupError:
+                # optional=True: cache None so subsequent .get() calls are cheap
+                # and do not re-hit the container unnecessarily.
+                # optional=False: re-raise so the caller sees the real error.
+                if not self._optional:
+                    raise
+                self._instance = None
             # Set after assignment — so a concurrent caller that reads
             # _resolved=True will also see the completed _instance.
             self._resolved = True
         return self._instance  # type: ignore[return-value]
 
-    async def aget(self) -> T:
+    async def aget(self) -> T | None:
         """Resolve and return the wrapped instance asynchronously.
 
         Async mirror of .get(). Handles both sync and async providers —
         the container decides whether to await.
 
         Returns:
-            The resolved instance of T.
+            The resolved instance of T, or None if optional=True and T has
+            no registered binding.
 
         Raises:
-            LookupError: If T has no registered binding.
+            LookupError: If T has no registered binding and optional=False.
         """
         if not self._resolved:
-            self._instance = await self._container.aget(
-                self._tp,
-                qualifier=self._qualifier,
-                priority=self._priority,
-            )
+            try:
+                self._instance = await self._container.aget(
+                    self._tp,
+                    qualifier=self._qualifier,
+                    priority=self._priority,
+                )
+            except LookupError:
+                if not self._optional:
+                    raise
+                self._instance = None
             self._resolved = True
         return self._instance  # type: ignore[return-value]
 
     def __repr__(self) -> str:
         if self._resolved:
             return f"LazyProxy[{self._tp.__name__}](resolved={self._instance!r})"
-        return f"LazyProxy[{self._tp.__name__}](unresolved)"
+        optional_part = ", optional" if self._optional else ""
+        return f"LazyProxy[{self._tp.__name__}](unresolved{optional_part})"
 
 
 class _LazyAlias:
@@ -496,10 +536,19 @@ class LiveMeta(_providify):
     Attributes:
         qualifier: Optional named qualifier forwarded to container.get().
         priority:  Optional priority forwarded to container.get().
+        optional:  When True the proxy's .get() / .aget() return None instead
+                   of raising LookupError when no binding is found.
+                   Set automatically when the annotation is Live[T | None]
+                   or Live[Optional[T]]; can also be set explicitly via
+                   Annotated[T, LiveMeta(optional=True)].
     """
 
     qualifier: str | None = None
     priority: int | None = None
+    # DESIGN: optional=False by default — fail-fast is safer than silently
+    # injecting None. Callers must explicitly opt in, either by using
+    # Live[T | None] / Live[Optional[T]] or Annotated[T, LiveMeta(optional=True)].
+    optional: bool = False
 
 
 class LiveProxy(Generic[T]):
@@ -522,7 +571,8 @@ class LiveProxy(Generic[T]):
                     ContextVar-isolated scope.
 
     Edge cases:
-        - T not registered              → .get() raises LookupError on every call
+        - T not registered, optional=False → .get() raises LookupError on every call
+        - T not registered, optional=True  → .get() returns None on every call
         - T is async-only               → .get() raises RuntimeError; use .aget()
         - T is SINGLETON                → same instance every time (fine, correct)
         - T is DEPENDENT                → new instance created on every .get() call
@@ -540,6 +590,16 @@ class LiveProxy(Generic[T]):
             def get_user_id(self) -> str:
                 # Re-resolves from the current request scope every call
                 return self._token.get().subject
+
+        # Optional form — returns None if JsonWebToken is not registered:
+        @Singleton
+        class AuthService:
+            def __init__(self, token: Live[JsonWebToken | None]) -> None:
+                self._token = token   # LiveProxy with optional=True
+
+            def get_user_id(self) -> str | None:
+                tok = self._token.get()   # None if not bound
+                return tok.subject if tok is not None else None
     """
 
     def __init__(
@@ -548,6 +608,7 @@ class LiveProxy(Generic[T]):
         tp: type[T],
         qualifier: str | None = None,
         priority: int | None = None,
+        optional: bool = False,
     ) -> None:
         # Stored as Any at runtime — TYPE_CHECKING guard prevents circular import.
         # Same pattern as LazyProxy — container API is stable and narrow.
@@ -555,8 +616,11 @@ class LiveProxy(Generic[T]):
         self._tp = tp
         self._qualifier = qualifier
         self._priority = priority
+        # When True, LookupError from .get() / .aget() is swallowed and None is
+        # returned instead. Set automatically when the annotation is Live[T | None].
+        self._optional = optional
 
-    def get(self) -> T:
+    def get(self) -> T | None:
         """Re-resolve and return the wrapped instance synchronously.
 
         Unlike LazyProxy.get(), this method NEVER caches — every call
@@ -564,45 +628,61 @@ class LiveProxy(Generic[T]):
         currently active scope (request, session, etc.).
 
         Returns:
-            A freshly resolved instance of T for the current scope.
+            A freshly resolved instance of T for the current scope, or None
+            if optional=True and T has no registered binding.
 
         Raises:
-            LookupError:   If T has no registered binding.
+            LookupError:   If T has no registered binding and optional=False.
             RuntimeError:  If T's provider is async — use .aget() instead.
             RuntimeError:  If T is REQUEST/SESSION-scoped and no scope
                            context is currently active.
         """
         # No _resolved guard — intentional.  Always delegate so that the
         # container's ScopeContext routing applies on every call.
-        return self._container.get(
-            self._tp,
-            qualifier=self._qualifier,
-            priority=self._priority,
-        )
+        try:
+            return self._container.get(
+                self._tp,
+                qualifier=self._qualifier,
+                priority=self._priority,
+            )
+        except LookupError:
+            # optional=True: return None every call — no caching since the
+            # binding might be added later (unlike LazyProxy which is one-shot).
+            # optional=False (default): re-raise so the caller sees the real error.
+            if self._optional:
+                return None
+            raise
 
-    async def aget(self) -> T:
+    async def aget(self) -> T | None:
         """Re-resolve and return the wrapped instance asynchronously.
 
         Async mirror of .get() — re-fetches on every call, no caching.
 
         Returns:
-            A freshly resolved instance of T for the current scope.
+            A freshly resolved instance of T for the current scope, or None
+            if optional=True and T has no registered binding.
 
         Raises:
-            LookupError:  If T has no registered binding.
+            LookupError:  If T has no registered binding and optional=False.
             RuntimeError: If T is REQUEST/SESSION-scoped and no scope
                           context is currently active.
         """
         # Same intentional no-cache design as .get() above.
-        return await self._container.aget(
-            self._tp,
-            qualifier=self._qualifier,
-            priority=self._priority,
-        )
+        try:
+            return await self._container.aget(
+                self._tp,
+                qualifier=self._qualifier,
+                priority=self._priority,
+            )
+        except LookupError:
+            if self._optional:
+                return None
+            raise
 
     def __repr__(self) -> str:
         qualifier_str = f", qualifier={self._qualifier!r}" if self._qualifier else ""
-        return f"LiveProxy[{self._tp.__name__}](live{qualifier_str})"
+        optional_str = ", optional" if self._optional else ""
+        return f"LiveProxy[{self._tp.__name__}](live{qualifier_str}{optional_str})"
 
 
 class _LiveAlias:

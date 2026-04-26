@@ -92,7 +92,7 @@ class PrimaryDB(Database): ...
 | Argument | Type | Meaning |
 |----------|------|---------|
 | `qualifier` | `str` | Named qualifier — used to distinguish multiple bindings of the same type |
-| `priority` | `int` | Lower number wins when multiple candidates match (default `0`) |
+| `priority` | `int` | Higher number wins when multiple candidates match (default `0`) |
 | `inherited` | `bool` | Subclasses inherit this metadata via MRO walk (default `False`) |
 
 ---
@@ -139,16 +139,25 @@ container.provide(factory_fn)              # register a @Provider function
 container.scan("myapp.services")           # auto-discover decorated classes in a module
 container.install(MyModule)                # install a @Configuration module (see below)
 
+# ── Mutation ──────────────────────────────────────────────────────
+container.override(Interface, MockImpl)    # replace all bindings for Interface in-place (for tests)
+container.reset_binding(Interface)         # remove all bindings for Interface; returns count removed
+
 # ── Sync resolution ───────────────────────────────────────────────
 svc  = container.get(Service)
 svc  = container.get(Service, qualifier="primary")
 svc  = container.get(Service, priority=1)
-svcs = container.get_all(Service)          # all matching bindings, sorted by priority
+svcs = container.get_all(Service)          # all matching bindings, sorted by priority ascending
 
 # ── Async resolution ──────────────────────────────────────────────
 svc  = await container.aget(Service)
 svc  = await container.aget(Service, qualifier="primary")
 svcs = await container.aget_all(Service)
+
+# ── Introspection (no instantiation) ──────────────────────────────
+binding  = container.get_binding(Service)             # best-match AnyBinding (raises LookupError if absent)
+bindings = container.get_all_bindings(Service)        # all AnyBinding objects; [] if none registered
+ok       = container.is_resolvable(Service)           # True if at least one binding matches
 
 # ── Global singleton ──────────────────────────────────────────────
 container = DIContainer.current()          # sync — thread-safe
@@ -452,13 +461,28 @@ async def run_async(self) -> Report:
     return await repo.fetch_all_async()
 ```
 
-`Lazy` also accepts `qualifier=` and `priority=` via `Annotated` + `LazyMeta`:
+`Lazy` also accepts `qualifier=`, `priority=`, and `optional=` via `Annotated` + `LazyMeta`:
 
 ```python
 from typing import Annotated
 from providify import LazyMeta
 
 repo: Annotated[Cache, LazyMeta(qualifier="redis", priority=1)]
+
+# optional=True — proxy.get() returns None if T is not bound (instead of raising)
+svc: Annotated[OptionalService, LazyMeta(optional=True)]
+```
+
+#### Optional lazy injection — `Lazy[T | None]`
+
+Use the pipe-union form as shorthand for `optional=True`:
+
+```python
+from providify import Lazy
+
+# Both are equivalent — proxy.get() returns None when T is not bound
+svc: Lazy[OptionalService | None]                                   # pipe-union form
+svc: Annotated[OptionalService, LazyMeta(optional=True)]            # explicit form
 ```
 
 > ⚠️ **`Lazy[T]` is not scope-safe for `@RequestScoped` or `@SessionScoped` deps.**
@@ -494,13 +518,29 @@ class AuthService:
     token: Live[JsonWebToken]   # set after construction, re-resolves per request
 ```
 
-`Live` also accepts `qualifier=` and `priority=` via `Annotated` + `LiveMeta`:
+`Live` also accepts `qualifier=`, `priority=`, and `optional=` via `Annotated` + `LiveMeta`:
 
 ```python
 from typing import Annotated
 from providify import LiveMeta
 
 token: Annotated[JsonWebToken, LiveMeta(qualifier="bearer")]
+
+# optional=True — proxy.get() returns None if T is not bound
+ctx: Annotated[OptionalContext, LiveMeta(optional=True)]
+```
+
+#### Optional live injection — `Live[T | None]`
+
+Use the pipe-union form as shorthand for `optional=True`. Every `.get()` / `.aget()`
+call returns `None` when T is not bound, instead of raising `LookupError`:
+
+```python
+from providify import Live
+
+# Both are equivalent
+ctx: Live[OptionalContext | None]                                    # pipe-union form
+ctx: Annotated[OptionalContext, LiveMeta(optional=True)]             # explicit form
 ```
 
 **`Lazy[T]` vs `Live[T]` at a glance:**
@@ -612,8 +652,12 @@ class SearchIndex:
 
 ### @PreDestroy
 
-Called during `shutdown()` / `ashutdown()` for every **cached singleton** instance.
-DEPENDENT instances are not owned by the container and are never destroyed this way.
+Called when a cached instance is about to be discarded. Fires in two situations:
+
+- **`shutdown()` / `ashutdown()`** — for every cached `@Singleton` instance.
+- **Scope exit** — when a `request()` / `session()` block exits, `@PreDestroy` is called on every `@RequestScoped` / `@SessionScoped` instance cached in that scope.
+
+`DEPENDENT` instances are not owned by the container and are never destroyed automatically.
 
 ```python
 from providify import PreDestroy
@@ -624,11 +668,22 @@ class ConnectionPool:
     def close(self) -> None:
         self._pool.close()
 
-    # Async — use ashutdown() to invoke
+    # Async — use ashutdown() / arequest() / asession() to invoke
     @PreDestroy
     async def async_close(self) -> None:
         await self._pool.aclose()
+
+@RequestScoped
+class RequestLogger:
+    @PreDestroy
+    def flush(self) -> None:
+        self._buffer.flush()   # called automatically when request() block exits
 ```
+
+> **Sync scope exit + async `@PreDestroy`**: if an async `@PreDestroy` hook is registered
+> on a scoped instance and the scope exits via the sync `request()` / `session()` context
+> manager, the async hook is **skipped** (cannot be awaited in a sync context). Use
+> `arequest()` / `asession()` when your scoped components have async teardown.
 
 ### Shutdown
 
@@ -816,7 +871,7 @@ class PrimaryDB(Database): ...
 class ReplicaDB(Database): ...
 ```
 
-`@Named` requires keyword argument `name=` — bare `@Named` raises `TypeError` immediately.
+`@Named` requires keyword argument `name=`. Both `@Named` (bare, no parens) and `@Named("smtp")` (positional string) raise `TypeError` with a message pointing to the correct form: `@Named(name="smtp")`.
 
 Both modifiers work on `@Provider` functions too:
 
@@ -840,7 +895,7 @@ class ReplicaDB(Database): ...
 # Resolve by name
 db = container.get(Database, qualifier="primary")
 
-# Resolve all, sorted by priority (lowest number first)
+# Resolve all, sorted by priority ascending (lowest value first, highest-priority binding last)
 all_dbs = container.get_all(Database)
 ```
 
@@ -899,6 +954,93 @@ await container.awarm_up(qualifier="db")
 `warm_up()` is all-or-nothing: if any matching singleton is backed by an async
 provider it raises **before** touching the cache, so the cache is never left
 partially warmed.  Use `awarm_up()` when you have async providers.
+
+---
+
+## Dependency visualization
+
+`container.describe()` returns a `DIContainerDescriptor` — a snapshot of the
+entire binding registry with recursive dependency trees, scope information, and
+scope-leak flags.  Use it to audit your wiring, generate documentation, or
+build health-check endpoints.
+
+> **Note:** `describe()` only resolves dependencies declared with `Inject[T]`,
+> `Live[T]`, or `Lazy[T]`.  Plain type annotations (`dep: MyClass`) are
+> invisible to the dependency graph layer.
+
+```python
+from providify.type import Inject
+
+class Notifier: pass
+
+@Singleton
+class AlertService:
+    def __init__(self, notifier: Inject[Notifier]) -> None:
+        self.notifier = notifier
+
+@Singleton
+class EmailNotifier(Notifier): pass
+
+container.bind(Notifier, EmailNotifier)
+container.register(AlertService)
+
+descriptor = container.describe()
+print(descriptor)
+# [SINGLETON]
+# ├── Notifier [SINGLETON] → EmailNotifier
+# ├── EmailNotifier [SINGLETON] → EmailNotifier
+# └── AlertService [SINGLETON] → AlertService
+#     └── Notifier [SINGLETON] → EmailNotifier
+```
+
+### Structured access
+
+```python
+# Bindings grouped by scope
+descriptor.singleton_bindings   # list[BindingDescriptor]
+descriptor.request_bindings
+descriptor.session_bindings
+descriptor.dependent_bindings
+
+# Scope-leak detection — True when a longer-lived component holds a
+# direct reference to a shorter-lived one (e.g. SINGLETON → DEPENDENT)
+for b in descriptor.singleton_bindings:
+    for dep in b.dependencies:
+        if dep.scope_leak:
+            print(f"⚠ Scope leak: {b.interface} → {dep.interface}")
+```
+
+### JSON export
+
+```python
+import json
+
+data = container.describe().to_dict()
+print(json.dumps(data, indent=2))
+# {
+#   "validated": false,
+#   "singleton_bindings": [
+#     {
+#       "interface": "AlertService",
+#       "implementation": "AlertService",
+#       "scope": "SINGLETON",
+#       "qualifier": null,
+#       "scope_leak": false,
+#       "priority": null,
+#       "dependencies": [
+#         {
+#           "interface": "Notifier",
+#           "implementation": "EmailNotifier",
+#           "scope": "SINGLETON",
+#           "scope_leak": false,
+#           ...
+#         }
+#       ]
+#     }
+#   ],
+#   ...
+# }
+```
 
 ---
 

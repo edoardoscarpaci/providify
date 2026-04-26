@@ -405,6 +405,13 @@ def _make_updater(
 
         if __cls is not None:
             if require_args:
+                if isinstance(__cls, str):
+                    # User wrote @Named("smtp") instead of @Named(name="smtp").
+                    # Give a targeted message so the fix is obvious.
+                    raise TypeError(
+                        f"@Named requires a keyword argument: "
+                        f"use @Named(name={__cls!r}) instead of @Named({__cls!r})."
+                    )
                 raise TypeError(
                     f"This decorator requires keyword arguments — "
                     f"use it with parens: @{updater.__name__}(...)"

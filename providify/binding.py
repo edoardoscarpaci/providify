@@ -439,18 +439,33 @@ class ProviderBinding(Binding):
         )
 
     def validate(self, container: DIContainer) -> None:
-        """No-op — provider bindings have no scope-leak semantics to check.
+        """Check this provider binding for scope leaks against the container.
 
-        Provider functions declare their own scope via ``singleton=True/False``
-        on :func:`~providify.decorator.scope.Provider`, so there are no
-        injected constructor dependencies to validate.
+        A ``@Provider(singleton=True)`` whose function parameters include a
+        ``REQUEST`` or ``SESSION`` scoped dependency without ``Live[T]``
+        wrapping will silently capture a stale instance across scope boundaries.
+        This method detects that pattern and raises before any resolution occurs.
 
         Args:
-            container: Unused. Present to satisfy the :class:`Binding` protocol.
+            container: The container whose binding registry is searched for
+                each parameter type declared in the provider function.
 
         Returns:
             None
+
+        Raises:
+            ScopeViolationDetectedError: If any parameter references a
+                narrower-scoped binding in a non-safe way.
+            LiveInjectionRequiredError: If any ``REQUEST`` or ``SESSION``
+                scoped parameter is injected without ``Live[T]`` wrapping.
+
+        Edge cases:
+            - ``DEPENDENT`` scoped providers → no-op (no stale-reference risk).
+            - Provider with no parameters   → no-op (nothing to check).
         """
+        scope_violations = container._check_provider_scope_violation(self)
+        if scope_violations:
+            raise ScopeViolationDetectedError(scope_violations=scope_violations)
 
     def create(self, container: DIContainer) -> Any:
         """Invoke the provider function synchronously with all dependencies injected.

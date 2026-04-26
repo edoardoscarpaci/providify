@@ -1,0 +1,1 @@
+- [Providify Architecture Snapshot](project_arch.md) — v0.1.7 gaps, known bugs, key design decisions as of 2026-04-26

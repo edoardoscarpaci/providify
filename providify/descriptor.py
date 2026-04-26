@@ -28,7 +28,7 @@ class BindingDescriptor:
         implementation: Fully-qualified name of the concrete type.
         scope:          Lifecycle scope of this binding.
         qualifier:      Optional named qualifier (Jakarta-style @Named).
-        priority:       Optional binding priority — lower value wins.
+        priority:       Optional binding priority — higher value wins when multiple candidates match.
         dependencies:   Recursively resolved dependency descriptors.
 
     Thread safety:  ✅ Frozen dataclass — immutable after construction.

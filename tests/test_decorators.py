@@ -111,6 +111,23 @@ class TestNamed:
             class BadClass:
                 pass
 
+    def test_named_with_positional_string_raises_helpful_type_error(self) -> None:
+        """@Named('smtp') must raise TypeError with a message pointing to name= form.
+
+        Without this guard the runtime raises "TypeError: 'str' object is not callable"
+        which gives no hint about the correct API.  The improved message should
+        mention @Named(name='smtp') explicitly.
+
+        Args:
+            None
+        """
+        with pytest.raises(TypeError, match=r"@Named requires a keyword argument"):
+
+            @Named("smtp")  # ← common mistake: positional string instead of name=
+            @Component
+            class BadClass:
+                pass
+
     def test_named_on_undecorated_class_raises(self) -> None:
         """@Named on a class with no scope decorator must raise NotDecoratedError."""
         with pytest.raises(NotDecoratedError):
@@ -242,7 +259,7 @@ class TestPriority:
         assert meta.priority == 99
 
     def test_priority_routes_get_all_ordering(self, container: DIContainer) -> None:
-        """get_all() returns bindings sorted by priority — lower wins."""
+        """get_all() returns bindings sorted by priority value ascending — higher value wins on get()."""
 
         class Handler:
             pass

@@ -206,12 +206,12 @@ class TestGet:
         assert isinstance(result, PushFallbackNotifier)
 
     def test_highest_priority_wins_without_filter(self, container: DIContainer) -> None:
-        """Without a priority filter, min(priority) wins — lower number = higher priority."""
+        """Without a priority filter, max(priority) wins — higher number = higher priority."""
         container.bind(Notifier, PushNotifier)  # priority=1
         container.bind(Notifier, PushFallbackNotifier)  # priority=2
 
         # Both have qualifier="push", so both are candidates.
-        # Priority 1 < 2 → PushNotifier wins.
+        # Priority 2 > 1 → PushFallbackNotifier wins.
         result = container.get(Notifier, qualifier="push")
 
         assert isinstance(result, PushFallbackNotifier)
@@ -239,13 +239,13 @@ class TestGetAll:
         assert SMSNotifier in types
 
     def test_results_sorted_by_priority_ascending(self, container: DIContainer) -> None:
-        """get_all() should return instances sorted by ascending priority (lowest first)."""
+        """get_all() returns instances sorted by priority value ascending (lowest value first, highest-priority last)."""
         container.bind(Notifier, PushNotifier)  # priority=1
         container.bind(Notifier, PushFallbackNotifier)  # priority=2
 
         results = container.get_all(Notifier, qualifier="push")
 
-        # Lowest priority number comes first
+        # Ascending by value: priority=1 first, priority=2 (highest-priority) last
         assert isinstance(results[0], PushNotifier)
         assert isinstance(results[1], PushFallbackNotifier)
 

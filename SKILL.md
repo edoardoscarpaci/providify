@@ -8,7 +8,7 @@
 
 **Providify** is a zero-dependency Python dependency injection (DI) container library inspired by Jakarta CDI and Spring Framework. It automates constructor injection via type hints, manages component lifecycles across multiple scopes, and supports both synchronous and asynchronous resolution patterns.
 
-- **Version:** 0.1.4a2
+- **Version:** 0.1.7 (dev — see pyproject.toml for current tag)
 - **Python:** 3.12+
 - **License:** Apache-2.0
 - **Dependencies:** None (stdlib only)
@@ -77,6 +77,14 @@ container.provide(provider_fn)                  # register a @Provider factory f
 container.scan("my.module", recursive=True)     # auto-discover decorated members
 container.install(MyConfigModule)               # install a @Configuration class (sync)
 await container.ainstall(MyConfigModule)        # install async
+
+# ── Mutation (useful in tests) ────────────────────────────────────
+container.override(Interface, MockImpl)         # replace all bindings for Interface in-place; evicts singleton cache
+container.reset_binding(Interface)              # remove all bindings for Interface; returns count removed
+
+# ── Introspection (no instantiation) ──────────────────────────────
+binding  = container.get_binding(Interface)     # returns best-match AnyBinding; raises LookupError if absent
+bindings = container.get_all_bindings(Interface) # returns list[AnyBinding]; [] if none registered
 ```
 
 ### Container as Context Manager
@@ -96,10 +104,10 @@ async with DIContainer() as container:
 ### Resolution
 
 ```python
-svc = container.get(Service)                            # single instance (sync)
+svc = container.get(Service)                            # single instance (sync) — highest priority wins
 svc = container.get(Service, qualifier="email")         # with qualifier
 svc = container.get(Service, priority=1)                # with priority override
-svcs = container.get_all(Service)                       # all matching, sorted by priority
+svcs = container.get_all(Service)                       # all matching, sorted by priority value ascending (highest-priority last)
 
 svc = await container.aget(Service)                     # single instance (async)
 svcs = await container.aget_all(Service)                # all matching (async)
@@ -273,7 +281,9 @@ class Database:
 - Only one `@PostConstruct` and one `@PreDestroy` per class (raises `TypeError` if multiple).
 - Supports both sync and async methods.
 - Hooks are detected via MRO walk and are inheritable.
-- `@PreDestroy` only fires for cached instances (singletons, request/session scoped). Not called for `DEPENDENT` instances.
+- `@PreDestroy` fires in two situations: (1) `shutdown()` / `ashutdown()` for every cached singleton, and (2) automatically when a `request()` / `session()` scope block exits for any `@RequestScoped` / `@SessionScoped` instance cached in that scope.
+- `DEPENDENT` instances are never tracked by the container — `@PreDestroy` is never called on them.
+- Async `@PreDestroy` hooks on scoped (REQUEST/SESSION) instances are silently skipped if the scope exits via the **sync** `request()` / `session()` context manager. Use `arequest()` / `asession()` when async teardown is needed.
 
 ### Configuration Modules (Spring-style)
 
@@ -371,6 +381,10 @@ Deferred proxy — resolves once on first `.get()` / `.aget()` call, then caches
 # ✅ Subscript — no options:
 lazy_svc: Lazy[HeavyService]
 
+# ✅ Optional — proxy.get() returns None when T is not bound:
+lazy_svc: Lazy[HeavyService | None]                              # pipe-union form
+lazy_svc: Annotated[HeavyService, LazyMeta(optional=True)]       # equivalent explicit form
+
 # ✅ With options — use Annotated + LazyMeta:
 from typing import Annotated
 from providify import LazyMeta
@@ -412,7 +426,7 @@ class AlertService:
     emailer: ClassVar[Instance[Emailer]]   # ✅ identical to plain Instance[Emailer]
 ```
 
-### `Live[T]`  *(new)*
+### `Live[T]`
 
 Live proxy — **re-resolves on every `.get()` / `.aget()` call**. Never caches.
 **Use this to safely inject narrow-scoped dependencies into wide-scoped components** (e.g., `@RequestScoped` into `@Singleton`). Without `Live[T]`, the validator raises `LiveInjectionRequiredError`.
@@ -429,6 +443,10 @@ class RequestProcessor:
 ```
 
 ```python
+# Optional — proxy.get() returns None when T is not bound:
+ctx: Live[OptionalContext | None]                                 # pipe-union form
+ctx: Annotated[OptionalContext, LiveMeta(optional=True)]          # equivalent explicit form
+
 # With qualifier:
 from typing import Annotated
 from providify import LiveMeta
@@ -447,8 +465,8 @@ ctx: Annotated[RequestContext, LiveMeta(qualifier="audit")]
 | Class | Fields |
 |---|---|
 | `InjectMeta` | `qualifier`, `priority`, `all`, `optional` |
-| `LazyMeta` | `qualifier`, `priority` |
-| `LiveMeta` | `qualifier`, `priority` |
+| `LazyMeta` | `qualifier`, `priority`, `optional` — `optional=True` makes `.get()` return `None` when T is unbound |
+| `LiveMeta` | `qualifier`, `priority`, `optional` — `optional=True` makes `.get()` return `None` when T is unbound |
 | `InstanceMeta` | *(no fields)* — signals container to inject an `InstanceProxy` instead of the type |
 
 ---
@@ -515,20 +533,27 @@ container.scan("myapp", recursive=True)   # all submodules recursively
 ## 10. Dependency Visualization
 
 ```python
-# Single binding tree
-descriptor = binding.describe(container)
+# Full container snapshot — returns a DIContainerDescriptor
+descriptor = container.describe()
 print(descriptor)
-# AlertService [SINGLETON]
-# └── EmailNotifier [DEPENDENT]
-#     └── SmtpClient [SINGLETON]
+# [SINGLETON]
+# └── AlertService [SINGLETON] → AlertService
+#     └── Notifier [SINGLETON] → EmailNotifier
 
-# Full container snapshot
-container_desc = container.describe()
+# Grouped by scope
+descriptor.singleton_bindings   # list[BindingDescriptor]
+descriptor.request_bindings
+descriptor.session_bindings
+descriptor.dependent_bindings
+
 import json
-print(json.dumps(container_desc.to_dict(), indent=2))
+print(json.dumps(descriptor.to_dict(), indent=2))
 ```
 
 `BindingDescriptor.scope_leak` — `True` if the binding directly injects a shorter-lived dependency.
+
+> **Important:** `describe()` only builds dependency trees for `Inject[T]` / `Live[T]` / `Lazy[T]`
+> annotated parameters. Plain type hints (`dep: MyClass`) are invisible to `_collect_dependencies`.
 
 ---
 
@@ -617,7 +642,9 @@ poetry run pytest
 - **`validate_bindings()` is called once** → after the first `get()` call, new bindings added via `bind()` are NOT re-validated automatically. Call `validate_bindings()` manually if you add bindings after the first resolution.
 - **`@Inheritable` is opt-in** → subclasses do not inherit scope decorators unless the parent is also decorated with `@Inheritable`.
 - **Inline decorator args vs stacked decorators** → `@Singleton(qualifier="x")` is equivalent to `@Singleton` + `@Named(name="x")`. Prefer the inline form.
-- **`@Named` requires `name=` keyword** → `@Named("smtp")` raises `TypeError`. Always use `@Named(name="smtp")`.
+- **`@Named` requires `name=` keyword** → both bare `@Named` and `@Named("smtp")` (positional string) raise `TypeError`. The error now points directly to the correct form: `@Named(name="smtp")`.
 - **`Inject[T, qualifier=...]` is invalid Python** → subscript only accepts one type arg. Use `Annotated[T, InjectMeta(qualifier=...)]` instead. Same rule applies to `Lazy[T]` and `Live[T]` — use `LazyMeta` / `LiveMeta` via `Annotated`.
 - **`Inject(T, qualifier=...)` call form** → works at runtime but type checkers (Pylance, mypy) cannot infer the return type. Use `Annotated[T, InjectMeta(...)]`.
 - **`ClassVar[Instance[T]]` / `ClassVar[Live[T]]` / `ClassVar[Lazy[T]]` / `ClassVar[Inject[T]]` are all valid** → the container calls `_unwrap_classvar()` at every injection boundary before dispatching. All four injection types work identically in the `ClassVar[...]` form. Scope-violation detection and dependency-graph construction also see the unwrapped hint.
+- **`@Provider` scope leaks are now validated** → `@Provider(singleton=True)` functions whose parameters include a `@RequestScoped` or `@SessionScoped` dep without `Live[T]` wrapping now raise `LiveInjectionRequiredError` during `validate_bindings()`, the same as `ClassBinding`. Wrap the parameter in `Live[T]` to fix it.
+- **`Lazy[T | None]` and `Live[T | None]`** → the pipe-union form is supported as shorthand for `optional=True`. `proxy.get()` returns `None` when T is not bound instead of raising `LookupError`. Equivalent to `Annotated[T, LazyMeta(optional=True)]` / `Annotated[T, LiveMeta(optional=True)]`.

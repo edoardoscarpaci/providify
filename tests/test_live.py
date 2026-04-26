@@ -31,12 +31,14 @@ Covered:
 
 from __future__ import annotations
 
+from typing import Annotated
+
 import pytest
 
 from providify.container import DIContainer
 from providify.decorator.scope import RequestScoped, SessionScoped, Singleton
 from providify.exceptions import LiveInjectionRequiredError
-from providify.type import Inject, Lazy, Live, LiveProxy
+from providify.type import Inject, Lazy, Live, LiveMeta, LiveProxy
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -606,3 +608,133 @@ class TestLiveValidation:
         assert "jwt" in error_text  # parameter name present
         assert "Live[" in error_text  # fix suggestion present
         assert "REQUEST" in error_text  # dep scope present
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Feature 2: Live[T | None] — optional unwrapping inside wrapper
+# ─────────────────────────────────────────────────────────────────
+
+
+class UnboundLiveService:
+    """NOT decorated — used to test optional Live resolution of unbound types."""
+
+    pass
+
+
+class TestLiveOptional:
+    """Tests for Live[T | None] and Annotated[T, LiveMeta(optional=True)]."""
+
+    def test_live_t_or_none_returns_none_when_not_bound_sync(
+        self, container: DIContainer
+    ) -> None:
+        """Live[T | None] proxy .get() returns None when T has no binding.
+
+        Args:
+            container: Fresh container with NO binding for UnboundLiveService.
+        """
+
+        @Singleton
+        class Consumer:
+            def __init__(self, svc: Live[UnboundLiveService | None]) -> None:  # type: ignore[valid-type]
+                self.svc = svc
+
+        container.register(Consumer)
+        # UnboundLiveService is NOT registered
+
+        consumer = container.get(Consumer)
+
+        assert isinstance(consumer.svc, LiveProxy)
+        result = consumer.svc.get()
+        assert result is None, "Live[T | None] must return None when T is not bound"
+
+    def test_live_t_or_none_returns_instance_when_bound_sync(
+        self, container: DIContainer
+    ) -> None:
+        """Live[T | None] proxy .get() returns the resolved instance when T is bound.
+
+        Args:
+            container: Container with RequestToken registered.
+        """
+
+        @Singleton
+        class Consumer:
+            def __init__(self, svc: Live[RequestToken | None]) -> None:  # type: ignore[valid-type]
+                self.svc = svc
+
+        container.register(RequestToken)
+        container.register(Consumer)
+
+        with container.scope_context.request():
+            consumer = container.get(Consumer)
+            result = consumer.svc.get()
+
+        assert isinstance(result, RequestToken)
+
+    def test_live_meta_optional_true_returns_none_when_not_bound(
+        self, container: DIContainer
+    ) -> None:
+        """Annotated[T, LiveMeta(optional=True)] must also return None when not bound.
+
+        Args:
+            container: Fresh container with no binding for UnboundLiveService.
+        """
+
+        @Singleton
+        class Consumer:
+            def __init__(
+                self, svc: Annotated[UnboundLiveService, LiveMeta(optional=True)]
+            ) -> None:
+                self.svc = svc
+
+        container.register(Consumer)
+
+        consumer = container.get(Consumer)
+        result = consumer.svc.get()
+
+        assert result is None, "LiveMeta(optional=True) must return None when not bound"
+
+    async def test_live_t_or_none_returns_none_async_path(
+        self, container: DIContainer
+    ) -> None:
+        """Live[T | None] proxy .aget() returns None when T has no binding (async path).
+
+        Args:
+            container: Container with no binding for UnboundLiveService.
+        """
+
+        @Singleton
+        class Consumer:
+            def __init__(self, svc: Live[UnboundLiveService | None]) -> None:  # type: ignore[valid-type]
+                self.svc = svc
+
+        container.register(Consumer)
+
+        consumer = await container.aget(Consumer)
+        result = await consumer.svc.aget()
+
+        assert (
+            result is None
+        ), "Live[T | None] .aget() must return None when T is not bound"
+
+    async def test_live_meta_optional_true_async_path(
+        self, container: DIContainer
+    ) -> None:
+        """Annotated[T, LiveMeta(optional=True)] .aget() returns None when not bound.
+
+        Args:
+            container: Container with no binding for UnboundLiveService.
+        """
+
+        @Singleton
+        class Consumer:
+            def __init__(
+                self, svc: Annotated[UnboundLiveService, LiveMeta(optional=True)]
+            ) -> None:
+                self.svc = svc
+
+        container.register(Consumer)
+
+        consumer = await container.aget(Consumer)
+        result = await consumer.svc.aget()
+
+        assert result is None

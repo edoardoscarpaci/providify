@@ -9,14 +9,18 @@ Covered:
     - LazyProxy.__repr__ reflects resolved/unresolved state
     - Lazy(T, qualifier=...) forwards qualifier to container.get()
     - LazyProxy.aget() async resolution path
+    - Lazy[T | None] returns None when T is not bound (optional unwrapping)
+    - Annotated[T, LazyMeta(optional=True)] also works
+    - Both sync and async paths for optional unwrapping
 """
 
 from __future__ import annotations
 
+from typing import Annotated
 
 from providify.container import DIContainer
 from providify.decorator.scope import Component, Singleton
-from providify.type import Lazy, LazyProxy
+from providify.type import Lazy, LazyMeta, LazyProxy
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -260,3 +264,139 @@ class TestLazyProxyAsync:
         resolved = await consumer.svc.aget()
 
         assert isinstance(resolved, ExpensiveService)
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Feature 2: Lazy[T | None] — optional unwrapping inside wrapper
+# ─────────────────────────────────────────────────────────────────
+
+
+class UnboundService:
+    """NOT decorated — used to test optional resolution of unbound types."""
+
+    pass
+
+
+class TestLazyOptional:
+    """Tests for Lazy[T | None] and Annotated[T, LazyMeta(optional=True)]."""
+
+    def test_lazy_t_or_none_returns_none_when_not_bound_sync(
+        self, container: DIContainer
+    ) -> None:
+        """Lazy[T | None] proxy .get() returns None when T has no binding.
+
+        The union annotation Lazy[T | None] expands at runtime to
+        Annotated[T | None, LazyMeta()].  The container should unwrap
+        the Optional[T] and treat the binding as optional.
+
+        Args:
+            container: Fresh container with NO binding for UnboundService.
+        """
+
+        @Component
+        class Consumer:
+            def __init__(self, svc: Lazy[UnboundService | None]) -> None:  # type: ignore[valid-type]
+                self.svc = svc
+
+        container.register(Consumer)
+        # UnboundService is NOT registered — proxy must return None on .get()
+
+        consumer = container.get(Consumer)
+
+        # Proxy itself should be a LazyProxy with optional=True
+        assert isinstance(consumer.svc, LazyProxy)
+        result = consumer.svc.get()
+        assert result is None, "Lazy[T | None] must return None when T is not bound"
+
+    def test_lazy_t_or_none_returns_instance_when_bound_sync(
+        self, container: DIContainer
+    ) -> None:
+        """Lazy[T | None] proxy .get() returns the resolved instance when T is bound.
+
+        Args:
+            container: Container with ExpensiveService registered.
+        """
+
+        @Component
+        class Consumer:
+            def __init__(self, svc: Lazy[ExpensiveService | None]) -> None:  # type: ignore[valid-type]
+                self.svc = svc
+
+        container.register(ExpensiveService)
+        container.register(Consumer)
+
+        consumer = container.get(Consumer)
+        result = consumer.svc.get()
+
+        assert isinstance(result, ExpensiveService)
+
+    def test_lazy_meta_optional_true_returns_none_when_not_bound(
+        self, container: DIContainer
+    ) -> None:
+        """Annotated[T, LazyMeta(optional=True)] must also return None when not bound.
+
+        Explicit Annotated form should behave identically to the Lazy[T | None] sugar.
+
+        Args:
+            container: Fresh container with no binding for UnboundService.
+        """
+
+        @Component
+        class Consumer:
+            def __init__(
+                self, svc: Annotated[UnboundService, LazyMeta(optional=True)]
+            ) -> None:
+                self.svc = svc
+
+        container.register(Consumer)
+
+        consumer = container.get(Consumer)
+        result = consumer.svc.get()
+
+        assert result is None, "LazyMeta(optional=True) must return None when not bound"
+
+    async def test_lazy_t_or_none_returns_none_async_path(
+        self, container: DIContainer
+    ) -> None:
+        """Lazy[T | None] proxy .aget() returns None when T has no binding (async path).
+
+        Args:
+            container: Container with no binding for UnboundService.
+        """
+
+        @Component
+        class Consumer:
+            def __init__(self, svc: Lazy[UnboundService | None]) -> None:  # type: ignore[valid-type]
+                self.svc = svc
+
+        container.register(Consumer)
+
+        consumer = await container.aget(Consumer)
+        result = await consumer.svc.aget()
+
+        assert (
+            result is None
+        ), "Lazy[T | None] .aget() must return None when T is not bound"
+
+    async def test_lazy_meta_optional_true_async_path(
+        self, container: DIContainer
+    ) -> None:
+        """Annotated[T, LazyMeta(optional=True)] .aget() returns None when not bound.
+
+        Args:
+            container: Container with no binding for UnboundService.
+        """
+
+        @Component
+        class Consumer:
+            def __init__(
+                self, svc: Annotated[UnboundService, LazyMeta(optional=True)]
+            ) -> None:
+                self.svc = svc
+
+        container.register(Consumer)
+
+        consumer = await container.aget(Consumer)
+        result = await consumer.svc.aget()
+
+        assert result is None

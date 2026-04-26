@@ -31,6 +31,7 @@ Covered:
 
 from __future__ import annotations
 
+import pytest
 
 from providify.container import DIContainer
 from providify.decorator.scope import (
@@ -445,3 +446,101 @@ class TestAsyncScopedProvider:
         assert call_count == 2  # s1 once, s2 once
         assert first is second  # same session ID → same instance
         assert first is not third  # different session ID → different instance
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Tests for ProviderBinding.validate() scope-leak detection
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestProviderScopeLeakDetection:
+    """ProviderBinding.validate() must catch scope leaks in provider parameters.
+
+    A @Provider(singleton=True) whose function parameters include a REQUEST
+    or SESSION scoped dependency without Live[T] wrapping will silently
+    capture a stale instance across scope boundaries — validate_bindings()
+    must surface this before any resolution occurs.
+    """
+
+    def test_singleton_provider_with_request_scoped_param_raises(
+        self, container: DIContainer
+    ) -> None:
+        """@Provider(singleton=True) accepting a @RequestScoped dep must raise.
+
+        The provider factory runs once at singleton construction time — any
+        REQUEST-scoped parameter is resolved to a single instance that becomes
+        stale on the next request.  validate_bindings() should catch this.
+
+        Args:
+            container: Fresh container.
+        """
+        from providify.exceptions import LiveInjectionRequiredError
+        from providify.decorator.scope import RequestScoped
+
+        @RequestScoped
+        class CurrentRequest:
+            pass
+
+        @Provider(singleton=True)
+        def make_service(req: CurrentRequest) -> JWTToken:  # type: ignore[return]
+            return JWTToken(subject="test")
+
+        container.register(CurrentRequest)
+        container.provide(make_service)
+
+        with pytest.raises(LiveInjectionRequiredError):
+            container.validate_bindings()
+
+    def test_dependent_provider_with_request_scoped_param_does_not_raise(
+        self, container: DIContainer
+    ) -> None:
+        """@Provider (DEPENDENT scope) accepting a @RequestScoped dep is safe.
+
+        DEPENDENT providers create a fresh instance on every resolution —
+        they never cache, so there is no stale-reference risk.
+
+        Args:
+            container: Fresh container.
+        """
+        from providify.decorator.scope import RequestScoped
+
+        @RequestScoped
+        class CurrentRequest:
+            pass
+
+        @Provider  # DEPENDENT — no singleton flag
+        def make_service(req: CurrentRequest) -> JWTToken:  # type: ignore[return]
+            return JWTToken(subject="test")
+
+        container.register(CurrentRequest)
+        container.provide(make_service)
+
+        # Should not raise — DEPENDENT provider has no stale-reference risk
+        container.validate_bindings()
+
+    def test_singleton_provider_with_live_wrapped_request_dep_does_not_raise(
+        self, container: DIContainer
+    ) -> None:
+        """@Provider(singleton=True) with Live[RequestScoped] dep is safe.
+
+        Live[T] re-resolves on every .get() call — the singleton stores the
+        proxy, not the instance, so no stale reference is ever captured.
+
+        Args:
+            container: Fresh container.
+        """
+        from providify.decorator.scope import RequestScoped
+
+        @RequestScoped
+        class CurrentRequest:
+            pass
+
+        @Provider(singleton=True)
+        def make_service(req: Live[CurrentRequest]) -> JWTToken:  # type: ignore[return]
+            return JWTToken(subject="test")
+
+        container.register(CurrentRequest)
+        container.provide(make_service)
+
+        # Live[T] wrapping makes this safe — no error expected
+        container.validate_bindings()
