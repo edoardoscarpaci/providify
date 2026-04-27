@@ -582,3 +582,182 @@ class TestDIContainerDescriptorRender:
         # Both implementations should appear somewhere in the rendered output
         assert "EmailNotifier" in result
         assert "SMSNotifier" in result
+
+
+# ─────────────────────────────────────────────────────────────────
+#  DIContainer.copy() tests
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestContainerCopy:
+    """Tests for DIContainer.copy() — clone container for test isolation."""
+
+    def test_copy_resolves_same_types(self, container: DIContainer) -> None:
+        """A copied container must resolve the same types as the original."""
+        container.bind(Notifier, EmailNotifier)
+
+        copy = container.copy()
+        original_svc = container.get(Notifier)
+        copy_svc = copy.get(Notifier)
+
+        assert isinstance(original_svc, EmailNotifier)
+        assert isinstance(copy_svc, EmailNotifier)
+
+    def test_copy_singleton_caches_are_independent(
+        self, container: DIContainer
+    ) -> None:
+        """Singletons in the copy are independent from the original's cache."""
+        from providify.decorator.scope import Singleton
+
+        @Singleton
+        class SharedService:
+            pass
+
+        container.register(SharedService)
+
+        original_svc = container.get(SharedService)
+        copy = container.copy()
+        copy_svc = copy.get(SharedService)
+
+        # Both are SharedService instances but NOT the same object —
+        # the copy starts with an empty singleton cache.
+        assert isinstance(original_svc, SharedService)
+        assert isinstance(copy_svc, SharedService)
+        assert original_svc is not copy_svc
+
+    def test_override_on_copy_does_not_affect_original(
+        self, container: DIContainer
+    ) -> None:
+        """override() on the copy must not mutate the original's binding list."""
+
+        @Component
+        class FakeNotifier(Notifier):
+            pass
+
+        container.bind(Notifier, EmailNotifier)
+        copy = container.copy()
+        copy.override(Notifier, FakeNotifier)
+
+        # Original still resolves EmailNotifier
+        original_binding = container.get_binding(Notifier)
+        assert original_binding.implementation is EmailNotifier  # type: ignore[union-attr]
+
+        # Copy resolves FakeNotifier
+        copy_binding = copy.get_binding(Notifier)
+        assert copy_binding.implementation is FakeNotifier  # type: ignore[union-attr]
+
+    def test_copy_of_empty_container_is_also_empty(
+        self, container: DIContainer
+    ) -> None:
+        """copy() of an empty container returns an empty, usable container."""
+        copy = container.copy()
+
+        assert copy.get_all_bindings(Notifier) == []
+        assert not copy.is_resolvable(Notifier)
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Module-level types for validate_all() scope-violation tests
+#
+#  DESIGN: test_container.py uses `from __future__ import annotations`,
+#  which makes all annotations lazy strings.  get_type_hints() resolves
+#  those strings against the module's global namespace.  Locally-defined
+#  classes (inside test methods) are NOT in the module globals, so
+#  get_type_hints() silently returns an empty dict for their constructors
+#  — meaning scope-violation detection never fires.
+#
+#  The solution: define the classes here at module level so they ARE in
+#  the module globals when get_type_hints() is called.
+# ─────────────────────────────────────────────────────────────────
+
+
+@Component
+class DepForValidateAll:
+    """DEPENDENT-scoped dep used to trigger a SINGLETON scope-leak in TestValidateAll."""
+
+
+@Singleton
+class LeakySingletonForValidateAll:
+    """SINGLETON injecting a DEPENDENT dep — a scope-leak violation."""
+
+    def __init__(self, d: DepForValidateAll) -> None:
+        self.d = d
+
+
+# ─────────────────────────────────────────────────────────────────
+#  DIContainer.validate_all() and .is_valid tests
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestValidateAll:
+    """Tests for DIContainer.validate_all() and the .is_valid property."""
+
+    def test_validate_all_returns_empty_list_for_valid_container(
+        self, container: DIContainer
+    ) -> None:
+        """validate_all() on a valid container must return []."""
+        container.bind(Notifier, EmailNotifier)
+
+        violations = container.validate_all()
+
+        assert violations == []
+
+    def test_validate_all_sets_is_valid_when_clean(
+        self, container: DIContainer
+    ) -> None:
+        """validate_all() must set is_valid=True when there are no violations."""
+        container.bind(Notifier, EmailNotifier)
+
+        assert container.is_valid is False  # not yet validated
+        container.validate_all()
+        assert container.is_valid is True
+
+    def test_is_valid_reset_after_new_binding(self, container: DIContainer) -> None:
+        """Adding a binding after validate_all() must reset is_valid to False."""
+        container.bind(Notifier, EmailNotifier)
+        container.validate_all()
+        assert container.is_valid is True
+
+        container.bind(Notifier, SMSNotifier)
+
+        assert container.is_valid is False
+
+    def test_validate_all_collects_all_violations(self, container: DIContainer) -> None:
+        """validate_all() must collect ALL violations, not stop at the first.
+
+        LeakySingletonForValidateAll (SINGLETON) → DepForValidateAll (DEPENDENT)
+        is a scope leak.  Both classes are defined at module level so get_type_hints()
+        can resolve their annotations correctly under from __future__ import annotations.
+        """
+        container.register(DepForValidateAll)
+        container.register(LeakySingletonForValidateAll)
+
+        violations = container.validate_all()
+
+        # SINGLETON → DEPENDENT is a scope leak → at least one violation message
+        assert len(violations) >= 1
+        # is_valid must remain False when violations exist
+        assert container.is_valid is False
+
+    def test_validate_all_does_not_raise(self, container: DIContainer) -> None:
+        """validate_all() must never raise — even for invalid containers.
+
+        Same scope-leak scenario as above — tests that the exception is caught
+        internally and converted to a violation string rather than propagating.
+        """
+        container.register(DepForValidateAll)
+        container.register(LeakySingletonForValidateAll)
+
+        # Must not raise — returns violations list instead
+        violations = container.validate_all()
+        assert isinstance(violations, list)
+        assert len(violations) >= 1
+
+    def test_validate_all_empty_container_returns_empty_list(
+        self, container: DIContainer
+    ) -> None:
+        """validate_all() on an empty container returns [] and sets is_valid=True."""
+        violations = container.validate_all()
+
+        assert violations == []
+        assert container.is_valid is True

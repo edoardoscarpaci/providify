@@ -400,3 +400,140 @@ class TestLazyOptional:
         result = await consumer.svc.aget()
 
         assert result is None
+
+
+# ─────────────────────────────────────────────────────────────────
+#  LazyProxy.reset() tests
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestLazyProxyReset:
+    """Tests for LazyProxy.reset() — clearing the cached instance."""
+
+    def test_reset_on_unresolved_proxy_is_noop(self, container: DIContainer) -> None:
+        """reset() on an already-unresolved proxy must not raise or change state."""
+
+        @Component
+        class SomeService:
+            pass
+
+        container.register(SomeService)
+        proxy = LazyProxy(container, SomeService)
+
+        assert proxy._resolved is False
+        proxy.reset()
+        assert proxy._resolved is False
+
+    def test_reset_clears_cached_instance(self, container: DIContainer) -> None:
+        """After reset(), _resolved is False and _instance is None."""
+
+        @Component
+        class Target:
+            pass
+
+        container.register(Target)
+        proxy = LazyProxy(container, Target)
+
+        proxy.get()
+        assert proxy._resolved is True
+        assert proxy._instance is not None
+
+        proxy.reset()
+
+        assert proxy._resolved is False
+        assert proxy._instance is None
+
+    def test_reset_causes_re_resolution_on_next_get(
+        self, container: DIContainer
+    ) -> None:
+        """After reset(), .get() calls the container again and returns a new instance."""
+        call_count = 0
+
+        @Component
+        class CountedService:
+            def __init__(self) -> None:
+                nonlocal call_count
+                call_count += 1
+
+        container.register(CountedService)
+        proxy = LazyProxy(container, CountedService)
+
+        proxy.get()
+        assert call_count == 1
+
+        proxy.reset()
+        proxy.get()
+
+        # Container called twice — once before reset, once after
+        assert call_count == 2
+
+    async def test_async_reset_causes_re_resolution(
+        self, container: DIContainer
+    ) -> None:
+        """After reset(), .aget() re-resolves from the container."""
+        call_count = 0
+
+        @Component
+        class AsyncTarget:
+            def __init__(self) -> None:
+                nonlocal call_count
+                call_count += 1
+
+        container.register(AsyncTarget)
+        proxy = LazyProxy(container, AsyncTarget)
+
+        await proxy.aget()
+        assert call_count == 1
+
+        proxy.reset()
+        await proxy.aget()
+
+        assert call_count == 2
+
+
+# ─────────────────────────────────────────────────────────────────
+#  LazyProxy thread-safety tests (double-check locking)
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestLazyProxyThreadSafety:
+    """Tests that concurrent .get() calls produce exactly one instance."""
+
+    def test_concurrent_get_creates_exactly_one_instance(
+        self, container: DIContainer
+    ) -> None:
+        """Multiple threads calling .get() simultaneously must only instantiate T once."""
+        import threading
+
+        call_count = 0
+        barrier = threading.Barrier(10)
+
+        @Component
+        class SingletonTarget:
+            def __init__(self) -> None:
+                nonlocal call_count
+                call_count += 1
+
+        container.register(SingletonTarget)
+        proxy = LazyProxy(container, SingletonTarget)
+
+        results: list[object] = []
+        lock = threading.Lock()
+
+        def worker() -> None:
+            barrier.wait()  # all threads start simultaneously
+            result = proxy.get()
+            with lock:
+                results.append(result)
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # All threads must have received the same instance (the proxy cached it)
+        assert len(results) == 10
+        assert all(r is results[0] for r in results)
+        # The container was called exactly once — double-check locking worked
+        assert call_count == 1

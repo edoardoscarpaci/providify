@@ -507,3 +507,99 @@ class TestClassVarScopeViolation:
 
         # Both violations must be captured — not just the first one encountered.
         assert len(exc_info.value.violations) == 2
+
+
+# ─────────────────────────────────────────────────────────────────
+#  invalidate_session() / ainvalidate_session() @PreDestroy tests
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestInvalidateSessionPreDestroy:
+    """Tests that invalidate_session() and ainvalidate_session() run @PreDestroy hooks."""
+
+    def test_invalidate_session_runs_sync_pre_destroy(
+        self, container: DIContainer
+    ) -> None:
+        """invalidate_session() must call @PreDestroy on session-scoped instances."""
+        destroyed: list[str] = []
+
+        from providify.decorator.lifecycle import PreDestroy
+
+        @SessionScoped
+        class SessionResource:
+            @PreDestroy
+            def teardown(self) -> None:
+                destroyed.append("destroyed")
+
+        container.register(SessionResource)
+
+        with container.session("test-session") as _:
+            container.get(SessionResource)
+
+        # After the session() context exits, @PreDestroy already fired.
+        # Reset so we can test invalidate_session() independently.
+        destroyed.clear()
+
+        # Re-enter the session to put a new instance in the cache
+        with container.session("test-session2"):
+            resource = container.get(SessionResource)
+            assert isinstance(resource, SessionResource)
+
+        # Reset again — context manager exit ran @PreDestroy
+        destroyed.clear()
+
+        # Now use invalidate_session() to destroy a fresh session
+        with container.session("user-logout"):
+            container.get(SessionResource)
+
+        # Above context manager already ran @PreDestroy.  Use invalidate_session()
+        # directly on a session that was created but not yet invalidated via context.
+        # Create a session cache without a context manager by manually registering:
+        container.scope_context._session_caches["manual-sid"] = {}
+        container.scope_context._session_id.set("manual-sid")
+        container.get(SessionResource)
+        container.scope_context._session_id.set(None)  # type: ignore[arg-type]
+
+        destroyed.clear()
+        container.invalidate_session("manual-sid")
+
+        assert "destroyed" in destroyed
+
+    def test_invalidate_session_noop_for_unknown_session(
+        self, container: DIContainer
+    ) -> None:
+        """invalidate_session() on an unknown session_id must not raise."""
+        # Should not raise even for completely unknown IDs
+        container.invalidate_session("nonexistent-session-id")
+
+    async def test_ainvalidate_session_runs_async_pre_destroy(
+        self, container: DIContainer
+    ) -> None:
+        """ainvalidate_session() must await async @PreDestroy on session-scoped instances."""
+        destroyed: list[str] = []
+
+        from providify.decorator.lifecycle import PreDestroy
+
+        @SessionScoped
+        class AsyncSessionResource:
+            @PreDestroy
+            async def teardown(self) -> None:
+                destroyed.append("async-destroyed")
+
+        container.register(AsyncSessionResource)
+
+        # Create session cache manually
+        container.scope_context._session_caches["async-sid"] = {}
+        container.scope_context._session_id.set("async-sid")
+        await container.aget(AsyncSessionResource)
+        container.scope_context._session_id.set(None)  # type: ignore[arg-type]
+
+        await container.ainvalidate_session("async-sid")
+
+        assert "async-destroyed" in destroyed
+
+    async def test_ainvalidate_session_noop_for_unknown_session(
+        self, container: DIContainer
+    ) -> None:
+        """ainvalidate_session() on an unknown session_id must not raise."""
+        await container.ainvalidate_session("nonexistent")

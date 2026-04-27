@@ -53,37 +53,53 @@ class ScopeContext:
         on_scope_exit_async: (
             Callable[[dict[Any, object]], Awaitable[None]] | None
         ) = None,
+        on_invalidate_session: Callable[[dict[Any, object]], None] | None = None,
+        on_invalidate_session_async: (
+            Callable[[dict[Any, object]], Awaitable[None]] | None
+        ) = None,
     ) -> None:
         """Initialise an empty scope context.
 
         Args:
-            on_scope_exit:       Optional sync callback invoked just before a
-                                 scope cache is popped.  Receives the cache dict
-                                 so the container can look up @PreDestroy instances.
-                                 Called in a ``finally`` block — runs even if the
-                                 with-block raised.
-                                 Any exception raised inside this callback is
-                                 propagated after the cache is cleared.
-            on_scope_exit_async: Optional async callback — awaited just before a
-                                 scope cache is popped in async context managers.
-                                 Both sync and async @PreDestroy hooks should be
-                                 driven by this callback.
+            on_scope_exit:                Optional sync callback invoked just before a
+                                          scope cache is popped.  Receives the cache dict
+                                          so the container can look up @PreDestroy instances.
+                                          Called in a ``finally`` block — runs even if the
+                                          with-block raised.
+                                          Any exception raised inside this callback is
+                                          propagated after the cache is cleared.
+            on_scope_exit_async:          Optional async callback — awaited just before a
+                                          scope cache is popped in async context managers.
+                                          Both sync and async @PreDestroy hooks should be
+                                          driven by this callback.
+            on_invalidate_session:        Optional sync callback invoked by
+                                          ``invalidate_session()`` before the session
+                                          cache is discarded.  Same contract as
+                                          ``on_scope_exit`` — receives the cache dict,
+                                          runs before the pop, skips async hooks.
+            on_invalidate_session_async:  Optional async callback — awaited by
+                                          ``ainvalidate_session()`` before discarding
+                                          the session cache.  Handles both sync and async
+                                          @PreDestroy hooks correctly.
 
         Returns:
             None
 
         Edge cases:
-            - Both callbacks may be None (default) — backward-compatible with
+            - All callbacks may be None (default) — backward-compatible with
               code that creates ScopeContext directly.
             - Sync path cannot await — if on_scope_exit receives a cache that
               contains instances with async @PreDestroy hooks, those hooks must
               be skipped (with a warning) inside the callback.  The async path
               (on_scope_exit_async) handles both sync and async hooks correctly.
+            - on_invalidate_session follows the same rules as on_scope_exit.
 
         Example:
             ScopeContext(
                 on_scope_exit=container._run_pre_destroy_for_scope,
                 on_scope_exit_async=container._arun_pre_destroy_for_scope,
+                on_invalidate_session=container._run_pre_destroy_for_scope,
+                on_invalidate_session_async=container._arun_pre_destroy_for_scope,
             )
         """
         # ContextVar — each task/thread gets its own value ✅
@@ -107,6 +123,19 @@ class ScopeContext:
         # DIContainer instances coexist (e.g. in tests via DIContainer.scoped()).
         self._on_scope_exit = on_scope_exit
         self._on_scope_exit_async = on_scope_exit_async
+
+        # DESIGN: separate invalidation callbacks instead of reusing on_scope_exit.
+        # invalidate_session() is a non-context-manager path — it has no finally
+        # block structure.  Two separate callbacks let the container wire the same
+        # underlying methods but keeps ScopeContext's control flow explicit.
+        #
+        # Tradeoffs:
+        #   ✅ ScopeContext.invalidate_session() now runs @PreDestroy symmetrically
+        #      with the context manager exits — no more resource leaks on logout.
+        #   ✅ Backward compatible — None (default) preserves old silent behaviour.
+        #   ❌ Two extra attributes per ScopeContext (small overhead).
+        self._on_invalidate_session = on_invalidate_session
+        self._on_invalidate_session_async = on_invalidate_session_async
 
     # ── Request scope — sync ──────────────────────────────────────
 
@@ -302,17 +331,74 @@ class ScopeContext:
             self._session_id.reset(token)
 
     def invalidate_session(self, session_id: str) -> None:
-        """Destroy a session cache — call on logout or session expiry.
+        """Destroy a session cache and run @PreDestroy hooks synchronously.
 
-        Note: Does NOT run @PreDestroy hooks.  Use asession()/session() context
-        managers to trigger lifecycle teardown.
+        Runs ``on_invalidate_session`` (if wired) with the session's cache dict
+        before discarding the cache — the same teardown semantics as the
+        ``session()`` context manager.
 
         Args:
-            session_id: The session ID to invalidate. No-op if unknown.
+            session_id: The session ID to invalidate.  No-op if unknown.
 
         Returns:
             None
+
+        Edge cases:
+            - Unknown session_id → no-op, no error raised.
+            - on_invalidate_session is None → cache is popped silently (backward
+              compatible with callers that create ScopeContext without the callback).
+            - Async @PreDestroy hooks on session-scoped instances will be skipped
+              with a warning inside the callback (sync path cannot await).
+              Use ainvalidate_session() to run both sync and async hooks.
+
+        Thread safety:  ✅ Cache read and pop are both protected by _lock.
         """
+        with self._lock:
+            cache = self._session_caches.get(session_id)
+
+        if cache is None:
+            # Unknown session — no-op
+            return
+
+        # Run @PreDestroy hooks before discarding the cache.
+        # Called outside the lock — hooks may call container.get().
+        if self._on_invalidate_session is not None:
+            self._on_invalidate_session(cache)
+
+        with self._lock:
+            self._session_caches.pop(session_id, None)
+
+    async def ainvalidate_session(self, session_id: str) -> None:
+        """Destroy a session cache and run both sync and async @PreDestroy hooks.
+
+        Async mirror of ``invalidate_session()``.  Uses ``on_invalidate_session_async``
+        (if wired) to await async hooks before discarding the cache.
+
+        Args:
+            session_id: The session ID to invalidate.  No-op if unknown.
+
+        Returns:
+            None
+
+        Edge cases:
+            - Unknown session_id → no-op, no error raised.
+            - on_invalidate_session_async is None → cache is popped silently.
+
+        Async safety:  ✅ Cache lookup and pop use _lock (threading.Lock, not
+                       asyncio.Lock) — safe to call from a coroutine since the
+                       lock is only held briefly around dict operations, not
+                       across await points.
+        """
+        with self._lock:
+            cache = self._session_caches.get(session_id)
+
+        if cache is None:
+            return
+
+        # Await async @PreDestroy hooks before discarding the cache.
+        if self._on_invalidate_session_async is not None:
+            await self._on_invalidate_session_async(cache)
+
         with self._lock:
             self._session_caches.pop(session_id, None)
 

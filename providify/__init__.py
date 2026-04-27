@@ -11,12 +11,27 @@ __all__ = [
     "SessionScoped",
     "Provider",
     "Named",
+    "Priority",
     "Inheritable",
     # Lifecycle decorators
     "PostConstruct",
     "PreDestroy",
     # Module
     "Configuration",
+    # Scope enum — exported so users never need to import from metadata
+    "Scope",
+    # Exception hierarchy — exported for except clauses without internal imports
+    "providifyError",
+    "BindingError",
+    "ClassBindingNotDecoratedError",
+    "ProviderBindingNotDecoratedError",
+    "CircularDependencyError",
+    "ScopeViolationDetectedError",
+    "LiveInjectionRequiredError",
+    # Binding and descriptor types — for type annotations and introspection
+    "AnyBinding",
+    "BindingDescriptor",
+    "DIContainerDescriptor",
     # Types
     "Inject",
     "InjectInstances",
@@ -43,10 +58,25 @@ from .decorator.scope import (
     SessionScoped,
     Provider,
     Named,
+    # Priority is a field-update decorator (same module as Named) — it was
+    # missing from the public surface despite being documented in the README.
+    Priority,
     Inheritable,
 )
 from .decorator.lifecycle import PostConstruct, PreDestroy
 from .decorator.module import Configuration
+from .metadata import Scope
+from .exceptions import (
+    providifyError,
+    BindingError,
+    ClassBindingNotDecoratedError,
+    ProviderBindingNotDecoratedError,
+    CircularDependencyError,
+    ScopeViolationDetectedError,
+    LiveInjectionRequiredError,
+)
+from .binding import AnyBinding
+from .descriptor import BindingDescriptor, DIContainerDescriptor
 from .type import (
     Inject,
     InjectInstances,

@@ -1,12 +1,12 @@
 ---
 name: providify-architecture-snapshot
-description: Architectural snapshot of providify v0.1.7 — layer map, key design decisions, and known gaps as of 2026-04-26.
+description: Architectural snapshot of providify v0.1.7 dev branch — layer map, key design decisions, public API gaps, and known missing features as of 2026-04-26.
 type: project
 ---
 
-Providify is a zero-dependency Python DI container (Python 3.12+, Apache-2.0). Version 0.1.7 as of 2026-04-26.
+Providify is a zero-dependency Python DI container (Python 3.12+, Apache-2.0). Version 0.1.7 (dev branch ahead of 0.2.0).
 
-**Why:** Pure codebase scan requested by user. No explicit feature priorities were given.
+**Why:** Pure codebase scan requested by user to identify production-readiness gaps.
 
 **How to apply:** Use this as baseline for future release planning sessions to avoid re-scanning.
 
@@ -15,33 +15,59 @@ Providify is a zero-dependency Python DI container (Python 3.12+, Apache-2.0). V
 - Single package: `providify/` — no sub-packages except `decorator/`
 - Two binding strategies: `ClassBinding` (constructor injection) and `ProviderBinding` (factory function)
 - Four scopes: DEPENDENT, SINGLETON, REQUEST, SESSION
-- Four injection types: `Inject[T]`, `Lazy[T]`, `Live[T]`, `Instance[T]`
+- Four injection types: `Inject[T]`, `Lazy[T]`, `Live[T]`, `Instance[T]` plus `InjectInstances[T]`
 - Class-level annotations supported via `get_type_hints()` + MRO walk
 - `ContextVar`-based scope isolation (safe for async)
 - Abstract `ContainerScanner` + `DefaultContainerScanner` (pluggable scan strategy)
+- `@Configuration` class support for Spring-style module grouping
+- `DIContainerDescriptor` + `BindingDescriptor` for dependency visualization
+- Per-key double-check locking (both threading.Lock and asyncio.Lock) for singleton instantiation
+- `set_scoped(tp, instance)` — inject pre-built value into active scope cache
+- `override(interface, impl)` and `reset_binding(interface)` for test support (IMPLEMENTED, no tests yet)
+- `get_binding()` and `get_all_bindings()` read-only introspection (IMPLEMENTED, no tests yet)
 
-## Known gaps as of 2026-04-26
+## What is IMPLEMENTED but in dev/unreleased (CHANGELOG [Unreleased] v0.2.0)
 
-1. **Priority semantics bug**: README/docstrings say "lower number wins" but `_get_best_candidate` uses `max()` so HIGHER number wins. The test assertion confirms higher wins, but the test docstring contradicts it. Either fix `max()` → `min()` or fix all docs. Priority: High.
+1. `container.override(interface, implementation)` — documented in README, implemented in container.py, NO TESTS
+2. `container.reset_binding(interface, *, qualifier=None) -> int` — documented in README, implemented, NO TESTS
+3. `container.get_binding(interface, ...) -> AnyBinding` — documented in README, implemented, NO TESTS
+4. `container.get_all_bindings(interface, ...) -> list[AnyBinding]` — documented in README, implemented, NO TESTS
+5. `ProviderBinding.validate()` now checks scope leaks — unreleased
+6. `Lazy[T | None]` / `Live[T | None]` optional forms — unreleased
+7. `ScopeContext` @PreDestroy on scope exit — unreleased
+8. Per-key singleton locks (double-check locking) — unreleased
+9. `DIContainer.__repr__` — unreleased
 
-2. **`@PreDestroy` not called for REQUEST/SESSION scoped bindings**: `shutdown()` only iterates `_singleton_cache`. Request/session scoped beans with `@PreDestroy` never get their hook called when the scope exits. Jakarta CDI calls `@PreDestroy` on scope exit.
+## Public API gaps
 
-3. **Uncommitted work in dev branch**: `Inject[T | None]`, `Lazy[T | None]`, `Live[T | None]` optional injection unwrapping is implemented in `container.py` and `type.py` but not yet committed to main. `LazyMeta.optional` field added.
+1. **`Priority`, `Scope`, `providifyError`, `ScopeViolationDetectedError`, `CircularDependencyError`, `BindingDescriptor`, `DIContainerDescriptor`, `AnyBinding`** are NOT exported from `providify/__init__.py` — users must import from internal modules.
 
-4. **No binding override/replace API**: Once a binding is registered, there's no `container.override(Interface, NewImpl)` for testing or conditional wiring. Tests rely on creating fresh containers.
+2. **`set_scoped()`** is documented in container.py docstring with a FastAPI JWT example but NOT in README.
 
-5. **Concurrent singleton instantiation race**: docstring explicitly notes "A singleton provider called concurrently may be invoked more than once — the last write wins." No double-check locking for singleton creation.
+3. **`Priority` decorator** is in README but NOT in `__init__.py.__all__`.
 
-6. **No `@EventListener` or event bus**: No event-driven inter-component communication pattern. No Jakarta-style `@Observes` equivalent.
+4. **`Scope` enum** is required by `@Provider(scope=Scope.REQUEST)` but not importable from `providify` directly.
 
-7. **No conditional binding** (`@ConditionalOnProperty`, `@Profile`): No environment-aware binding selection at scan time.
+5. **No test files for `override`, `reset_binding`, `get_binding`, `get_all_bindings`** — these are fully implemented but completely untested.
 
-8. **`ProviderBinding.validate()` is a no-op**: Provider functions are not scope-leak validated — a singleton provider returning a request-scoped object is silently accepted.
+## Known gaps as of 2026-04-26 (dev scan)
 
-9. **No `describe()` in README docs section**: The `describe()` / `DIContainerDescriptor` API is tested but not prominently documented in README (only in test table).
+1. **No test file `test_mutation.py`**: `override()`, `reset_binding()`, `get_binding()`, `get_all_bindings()` have zero test coverage despite being implemented and documented in CHANGELOG + README.
 
-10. **No type stubs (.pyi) files**: `py.typed` marker exists so mypy/pyright read inline annotations. No `.pyi` stub files are generated.
+2. **No ASGI/FastAPI integration helper**: `set_scoped()` is documented only in container.py. No `ProvidifyMiddleware` or lifespan helper class.
 
-11. **No integration with ASGI middleware**: No helper for wiring `container.arequest()` as FastAPI/Starlette middleware. Documented with example but no utility class.
+3. **No conditional binding** (`@ConditionalOnProperty`, `@Profile`): No environment-aware binding selection at scan/registration time.
 
-12. **`_get_best_candidate` uses `max()` but comment says lower wins**: The test `test_highest_priority_wins_without_filter` asserts `PushFallbackNotifier` (priority=2) wins. This confirms higher-number-wins semantics, but README says "Lower number wins". Needs resolution.
+4. **No event bus / @EventListener**: No inter-component event-driven communication.
+
+5. **`LazyProxy` thread-safety gap**: Two concurrent threads calling `.get()` on the same unresolved proxy may each call `container.get()` — last write wins. Documented but unfixed.
+
+6. **`session.invalidate_session()` does NOT run @PreDestroy**: The docstring explicitly notes "Does NOT run @PreDestroy hooks". Session invalidation on logout silently skips teardown.
+
+7. **`scan()` does NOT auto-discover `@Configuration` classes**: README correctly says "Not picked up by scan() — use container.install() instead" but `DefaultContainerScanner._scan_module` DOES call `_autoregister_configurator`. The behavior is actually implemented but the README doc is incorrect/misleading.
+
+8. **No `py.typed`-backed `.pyi` stubs**: `py.typed` exists but no `.pyi` stub files for generated type aliases (Inject, Lazy, Live, Instance behave differently under TYPE_CHECKING vs runtime).
+
+9. **No `test_mutation.py`** covering the new mutation/introspection API.
+
+10. **`@Named`, `@Priority`, `@Inheritable` not exported from `__init__`** — only `Named` and `Inheritable` are in `__all__`. `Priority` is missing. `Scope` enum missing. All exception types missing.

@@ -283,9 +283,16 @@ class DIContainer:
         #   ✅ Lifecycle hooks fire at the right moment (scope exit, not shutdown)
         #   ✅ Container logic stays in the container; ScopeContext stays generic
         #   ❌ Two extra bound-method references stored on every ScopeContext
+        # DESIGN: all four callbacks use the same underlying methods —
+        # invalidate_session / ainvalidate_session are semantically identical
+        # to scope exit (run @PreDestroy, discard cache).  Separate callbacks
+        # keep ScopeContext's control flow explicit rather than special-casing
+        # the invalidation path inside the shared on_scope_exit callback.
         self.scope_context: ScopeContext = ScopeContext(
             on_scope_exit=self._run_pre_destroy_for_scope,
             on_scope_exit_async=self._arun_pre_destroy_for_scope,
+            on_invalidate_session=self._run_pre_destroy_for_scope,
+            on_invalidate_session_async=self._arun_pre_destroy_for_scope,
         )
         self._scanner: ContainerScanner = DefaultContainerScanner(self)
         # Starts unvalidated — first resolution triggers validate_bindings()
@@ -2114,14 +2121,47 @@ class DIContainer:
         return self.scope_context.asession(session_id)
 
     def invalidate_session(self, session_id: str) -> None:
-        """Destroy a session cache — call on logout or session expiry.
+        """Destroy a session cache and run sync @PreDestroy hooks — call on logout or expiry.
+
+        Runs @PreDestroy for all session-scoped instances in the cache before
+        discarding it.  Async @PreDestroy hooks are skipped with a warning;
+        use :meth:`ainvalidate_session` from an async context to handle them.
 
         Shorthand for ``container.scope_context.invalidate_session(session_id)``.
 
         Args:
-            session_id: The session ID to invalidate. No-op if unknown.
+            session_id: The session ID to invalidate.  No-op if unknown.
+
+        Returns:
+            None
+
+        Edge cases:
+            - Unknown session_id → no-op, no error raised.
+            - Async @PreDestroy hooks on session-scoped instances are skipped;
+              call ainvalidate_session() from an async context instead.
         """
         self.scope_context.invalidate_session(session_id)
+
+    async def ainvalidate_session(self, session_id: str) -> None:
+        """Destroy a session cache and run both sync and async @PreDestroy hooks.
+
+        Async mirror of :meth:`invalidate_session` — awaits async @PreDestroy
+        hooks in addition to calling sync ones, before discarding the cache.
+
+        Args:
+            session_id: The session ID to invalidate.  No-op if unknown.
+
+        Returns:
+            None
+
+        Edge cases:
+            - Unknown session_id → no-op, no error raised.
+
+        Async safety:  ✅ Safe — delegates to ScopeContext.ainvalidate_session()
+                       which protects dict mutations with a threading.Lock (not
+                       held across await points).
+        """
+        await self.scope_context.ainvalidate_session(session_id)
 
     def set_scoped(self, tp: type, instance: object) -> None:
         """Register a pre-built instance into the currently active scope cache.
@@ -2654,6 +2694,84 @@ class DIContainer:
         for binding in self._bindings:
             binding.validate(self)
 
+    def validate_all(self) -> list[str]:
+        """Validate all bindings and return a list of violation messages.
+
+        Unlike :meth:`validate_bindings`, this method does NOT raise — it
+        collects every violation across all bindings in a single pass and
+        returns them as human-readable strings.  An empty list means the
+        container is fully valid.
+
+        This is the recommended pre-startup validation call: it surfaces ALL
+        scope misconfigurations in one shot rather than stopping at the first
+        one, making it easier to fix the whole graph in one go.
+
+        Sets ``_validated = True`` only when the returned list is empty,
+        so the next ``get()`` call skips re-validation for valid containers.
+
+        Returns:
+            A list of violation message strings (one per failing binding).
+            Empty list → all bindings are valid.
+
+        Thread safety:  ⚠️ Not safe for concurrent mutation — call before the
+                        app goes multi-threaded.
+        Async safety:   ✅ No await points.
+
+        Edge cases:
+            - No bindings registered → returns [] immediately.
+            - Partial validity → returns messages only for the failing bindings;
+              valid bindings are silently accepted.
+            - Calling validate_all() when _validated is already True still
+              re-runs validation (idempotent but slightly redundant).
+
+        Example:
+            violations = container.validate_all()
+            if violations:
+                for msg in violations:
+                    logger.error("DI violation: %s", msg)
+                raise RuntimeError("Container has scope violations — aborting startup")
+        """
+        violations: list[str] = []
+        for binding in self._bindings:
+            try:
+                binding.validate(self)
+            except Exception as e:
+                # Collect every violation message rather than stopping at the first.
+                # The exception message contains the actionable fix suggestion.
+                violations.append(str(e))
+        # Only mark validated when everything is clean — a container with
+        # violations must still re-validate after the caller fixes the bindings.
+        if not violations:
+            self._validated = True
+        return violations
+
+    @property
+    def is_valid(self) -> bool:
+        """Return True if :meth:`validate_bindings` has run successfully.
+
+        Reflects whether ``_validated`` is True — i.e. at least one successful
+        validation pass has completed since the last binding mutation.
+
+        Note: this is a snapshot — it becomes False whenever a new binding is
+        added (via ``bind()``, ``register()``, ``provide()``, ``override()``,
+        or ``reset_binding()``), forcing re-validation on the next ``get()`` call.
+
+        Returns:
+            True  — container has been validated and no bindings were added since.
+            False — container has never been validated, or a binding was added
+                    after the last validation pass.
+
+        Thread safety:  ✅ Reading a bool is atomic under the GIL.
+        Async safety:   ✅ No shared mutable state accessed.
+
+        Example:
+            container.validate_all()
+            assert container.is_valid is True
+            container.bind(NewService, NewServiceImpl)
+            assert container.is_valid is False  # mutation resets the flag
+        """
+        return self._validated
+
     # ── Dependency graph ──────────────────────────────────────────
 
     def _get_dependencies(
@@ -3067,6 +3185,81 @@ class DIContainer:
         self._localns_cache = None
 
         return len(to_remove)
+
+    # ── copy() ────────────────────────────────────────────────────
+
+    def copy(self) -> DIContainer:
+        """Return a new container with the same bindings but no shared cache state.
+
+        Creates a structurally identical container suitable for test overrides —
+        the caller can ``override()`` or ``reset_binding()`` on the copy without
+        affecting the original.  All binding objects are shared (shallow copy)
+        which is safe because ``AnyBinding`` attributes are immutable after
+        ``__init__``.
+
+        The copy starts unvalidated (``_validated = False``) so scope-leak
+        checks run afresh on its first ``get()`` call.  Singleton caches,
+        scope contexts, and lock dicts are NOT shared — each container manages
+        its own instance lifecycle independently.
+
+        Returns:
+            A new ``DIContainer`` with a shallow copy of ``_bindings`` and
+            fresh (empty) caches and locks.
+
+        Thread safety:  ⚠️ Not safe to call concurrently with mutations on
+                        the source container — ``list(self._bindings)`` iterates
+                        the list under no lock.  Call ``copy()`` during startup
+                        before the container goes multi-threaded.
+        Async safety:   ✅ No await points.
+
+        Edge cases:
+            - Empty container → copy is also empty, no error.
+            - Singletons already cached in the source container are NOT present
+              in the copy — the copy must re-instantiate them on first get().
+            - Scanner is not copied — the copy gets its own DefaultContainerScanner
+              that points at itself.  Auto-scan (``scan=`` constructor arg) does
+              NOT re-run on copy.
+
+        Example:
+            base = build_app_container()
+            test_c = base.copy()
+            test_c.override(Database, FakeDatabase)
+            svc = test_c.get(UserService)  # gets FakeDatabase
+            svc2 = base.get(UserService)   # still gets real Database ✅
+        """
+        # DESIGN: use __new__ to bypass __init__ entirely.
+        # __init__ scans modules and sets up the full wiring; we only want
+        # to clone the binding list.  __new__ gives us a blank instance that
+        # we populate manually — the same pattern used by pickle.__reduce__.
+        #
+        # Tradeoffs:
+        #   ✅ No module re-scan, no double-registration from the auto-scan path
+        #   ✅ All caches start empty — predictable state for test isolation
+        #   ❌ Fragile if __init__ adds new attributes in the future — this
+        #      method must be kept in sync.  Mitigation: the test suite covers
+        #      copy() behaviour, so attribute additions cause obvious test failures.
+        new = DIContainer.__new__(DIContainer)
+        # Shallow-copy the binding list — bindings are immutable value objects
+        new._bindings = list(self._bindings)
+        # Fresh caches — no state bleeds from source to copy
+        new._singleton_cache = {}
+        new._singleton_locks = {}
+        new._singleton_lock_guard = threading.Lock()
+        new._async_singleton_locks = {}
+        # Fresh scope context wired to the new container's own PreDestroy callbacks
+        new.scope_context = ScopeContext(
+            on_scope_exit=new._run_pre_destroy_for_scope,
+            on_scope_exit_async=new._arun_pre_destroy_for_scope,
+            on_invalidate_session=new._run_pre_destroy_for_scope,
+            on_invalidate_session_async=new._arun_pre_destroy_for_scope,
+        )
+        # Fresh scanner pointing at the new container
+        new._scanner = DefaultContainerScanner(new)
+        # Not validated — scope checks run on first get()
+        new._validated = False
+        # localns cache reset — built from _bindings, must reflect the copy's list
+        new._localns_cache = None
+        return new
 
     # ── __repr__ (Feature 14) ─────────────────────────────────────
 

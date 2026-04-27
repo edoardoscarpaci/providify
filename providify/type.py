@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -308,25 +309,22 @@ class LazyProxy(Generic[T]):
     but the underlying dependency is resolved only when first accessed.
     Subsequent calls return the same cached instance.
 
-    Thread safety:  ⚠️ Conditional — _resolved / _instance are not protected
-                    by a lock. Two threads calling .get() simultaneously on
-                    the same proxy may both call container.get() once each;
-                    the last write wins. For singleton T this is harmless;
-                    for DEPENDENT T it creates two separate instances.
-                    If strict once-only semantics are needed, guard externally.
-    Async safety:   ✅ Safe — .aget() is a coroutine; no shared async state.
-                    Two concurrent tasks calling .aget() on an unresolved proxy
-                    have the same race condition as the thread case above.
+    Thread safety:  ✅ Safe — double-check locking via _sync_lock ensures that
+                    concurrent .get() calls on an unresolved proxy produce
+                    exactly one instance. The same guard-lock pattern used by
+                    DIContainer._singleton_lock_guard is applied here.
+    Async safety:   ✅ Safe — .aget() uses a lazily created asyncio.Lock
+                    (created under _async_lock_guard) so concurrent tasks
+                    on an unresolved proxy also produce exactly one instance.
 
     Edge cases:
         - T not registered, optional=False → .get() raises LookupError (deferred to call time)
         - T not registered, optional=True  → .get() returns None and caches that result
         - T is async-only → .get() raises RuntimeError; use .aget() instead
-        - Proxy re-used across request boundaries with DEPENDENT T → each
-          .get() call resolves a fresh instance (no caching in the proxy)
-          ⚠️ but _resolved is set True after the first, so subsequent calls
-          return the *first* instance. Callers that want fresh instances
-          per-access should call container.get(T) directly, not use Lazy[T].
+        - Proxy re-used across request boundaries with DEPENDENT T → subsequent
+          calls return the *first* resolved instance.  Callers that want fresh
+          instances per-access should call container.get(T) directly, not Lazy[T].
+          Use .reset() to clear the cached instance and force re-resolution.
 
     Usage:
         @Component
@@ -371,11 +369,29 @@ class LazyProxy(Generic[T]):
         self._instance: T | None = None
         self._resolved: bool = False
 
+        # DESIGN: double-check locking — mirrors the exact pattern used by
+        # DIContainer._singleton_lock_guard + _singleton_locks.
+        #
+        # _sync_lock: per-proxy threading.Lock that serialises the first .get() call.
+        #   Created at __init__ time since threading.Lock() has no event-loop requirement.
+        # _async_lock / _async_lock_guard: asyncio.Lock cannot be created at __init__
+        #   time (requires a running event loop), so it is created lazily inside
+        #   aget() under _async_lock_guard (a threading.Lock for one-time creation).
+        #
+        # Tradeoffs:
+        #   ✅ Exactly one instance created per proxy even under heavy concurrency
+        #   ✅ Fast path (already resolved) never acquires any lock
+        #   ❌ Extra two attributes per proxy for async path (small memory overhead)
+        self._sync_lock: threading.Lock = threading.Lock()
+        self._async_lock: Any = None  # asyncio.Lock, created lazily in aget()
+        self._async_lock_guard: threading.Lock = threading.Lock()
+
     def get(self) -> T | None:
         """Resolve and return the wrapped instance synchronously.
 
-        On first call, delegates to container.get(T).
-        Subsequent calls return the cached result without re-resolving.
+        On first call, delegates to container.get(T) under a lock to prevent
+        concurrent threads from both resolving T and producing two instances.
+        Subsequent calls return the cached result without acquiring any lock.
 
         Returns:
             The resolved instance of T, or None if optional=True and T has
@@ -384,8 +400,26 @@ class LazyProxy(Generic[T]):
         Raises:
             LookupError:   If T has no registered binding and optional=False.
             RuntimeError:  If T's provider is async — use .aget() instead.
+
+        Thread safety:  ✅ Double-check locking — lock acquired only when
+                        _resolved is False; once resolved, all callers read
+                        the cached value without synchronisation overhead.
+
+        Edge cases:
+            - Concurrent callers on an unresolved proxy → exactly one resolves,
+              others wait and return the cached result.
+            - After .reset(), the next .get() re-resolves from the container.
         """
-        if not self._resolved:
+        # Fast path — no lock needed once resolved
+        if self._resolved:
+            return self._instance  # type: ignore[return-value]
+
+        with self._sync_lock:
+            # Double-check inside the lock — another thread may have resolved
+            # while we were waiting to acquire it.
+            if self._resolved:
+                return self._instance  # type: ignore[return-value]
+
             try:
                 self._instance = self._container.get(
                     self._tp,
@@ -402,6 +436,7 @@ class LazyProxy(Generic[T]):
             # Set after assignment — so a concurrent caller that reads
             # _resolved=True will also see the completed _instance.
             self._resolved = True
+
         return self._instance  # type: ignore[return-value]
 
     async def aget(self) -> T | None:
@@ -409,6 +444,8 @@ class LazyProxy(Generic[T]):
 
         Async mirror of .get(). Handles both sync and async providers —
         the container decides whether to await.
+        Uses a lazily created asyncio.Lock to ensure exactly one resolution
+        across concurrent tasks.
 
         Returns:
             The resolved instance of T, or None if optional=True and T has
@@ -416,8 +453,32 @@ class LazyProxy(Generic[T]):
 
         Raises:
             LookupError: If T has no registered binding and optional=False.
+
+        Async safety:  ✅ Lazily created asyncio.Lock serialises concurrent
+                       tasks on first resolution; fast path skips the lock.
+
+        Edge cases:
+            - After .reset(), the next .aget() re-resolves from the container.
         """
-        if not self._resolved:
+        # Fast path — no lock needed once resolved
+        if self._resolved:
+            return self._instance  # type: ignore[return-value]
+
+        # Lazily create the asyncio.Lock under a threading guard.
+        # asyncio.Lock() requires a running event loop; creating it at __init__
+        # would fail if the proxy is constructed outside an async context.
+        if self._async_lock is None:
+            with self._async_lock_guard:
+                if self._async_lock is None:
+                    import asyncio
+
+                    self._async_lock = asyncio.Lock()
+
+        async with self._async_lock:
+            # Double-check — another task may have resolved while we awaited.
+            if self._resolved:
+                return self._instance  # type: ignore[return-value]
+
             try:
                 self._instance = await self._container.aget(
                     self._tp,
@@ -429,7 +490,36 @@ class LazyProxy(Generic[T]):
                     raise
                 self._instance = None
             self._resolved = True
+
         return self._instance  # type: ignore[return-value]
+
+    def reset(self) -> None:
+        """Clear the cached instance so the next .get() or .aget() re-resolves from the container.
+
+        Useful when the proxy needs to track scope changes without the owning
+        object being discarded — e.g. a long-lived component that should pick up
+        a fresh DEPENDENT or REQUEST-scoped T after a scope boundary.
+
+        Note: this is a best-effort advisory operation. A thread or task that
+        already read the instance before reset() was called will continue using
+        the old instance on that call — the lock only protects the next resolution.
+
+        Returns:
+            None
+
+        Thread safety:  ✅ Acquires _sync_lock before clearing state, so a
+                        concurrent .get() cannot observe a partially reset proxy.
+
+        Edge cases:
+            - Called on an unresolved proxy → no-op (already unresolved).
+            - Called while another thread is mid-resolution → the reset wins
+              if it acquires the lock after resolution completes; otherwise
+              the in-flight resolution completes first and its result is then
+              discarded by the subsequent reset.
+        """
+        with self._sync_lock:
+            self._resolved = False
+            self._instance = None
 
     def __repr__(self) -> str:
         if self._resolved:
