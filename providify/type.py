@@ -80,7 +80,7 @@ class InjectMeta(_providify):
                    empty list already signals "nothing found".
     """
 
-    qualifier: str | None = None
+    qualifier: str | type | None = None
     priority: int | None = None
     all: bool = False
     # DESIGN: optional=False by default — fail-fast is safer than silently
@@ -144,7 +144,7 @@ class _InjectedAlias:
         self,
         tp: type[T],
         *,
-        qualifier: str | None = ...,
+        qualifier: str | type | None = ...,
         priority: int | None = ...,
         optional: bool = ...,
     ) -> type[T]: ...
@@ -153,7 +153,7 @@ class _InjectedAlias:
         self,
         tp: Any,
         *,
-        qualifier: str | None = ...,
+        qualifier: str | type | None = ...,
         priority: int | None = ...,
         optional: bool = ...,
     ) -> Any: ...
@@ -161,7 +161,7 @@ class _InjectedAlias:
         self,
         tp: Any,
         *,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
         # optional=True: return None instead of raising LookupError when the
         # binding is absent. Useful for truly optional collaborators (e.g. a
@@ -208,16 +208,16 @@ class _InjectedInstancesAlias:
 
     @overload
     def __call__(
-        self, tp: type[T], *, qualifier: str | None = ...
+        self, tp: type[T], *, qualifier: str | type | None = ...
     ) -> Type[list[T]]: ...
     @overload
-    def __call__(self, tp: Any, *, qualifier: str | None = ...) -> Any: ...
+    def __call__(self, tp: Any, *, qualifier: str | type | None = ...) -> Any: ...
 
     def __call__(  # Any on implementation
         self,
         tp: Any,
         *,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
     ) -> Any:
         return Annotated[list[tp], InjectMeta(all=True, qualifier=qualifier)]
 
@@ -294,7 +294,7 @@ class LazyMeta(_providify):
                    Annotated[T, LazyMeta(optional=True)].
     """
 
-    qualifier: str | None = None
+    qualifier: str | type | None = None
     priority: int | None = None
     # DESIGN: optional=False by default — fail-fast is safer than silently
     # injecting None. Callers must explicitly opt in, either by using
@@ -349,7 +349,7 @@ class LazyProxy(Generic[T]):
         self,
         container: DIContainer,
         tp: type[T],
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
         optional: bool = False,
     ) -> None:
@@ -562,7 +562,7 @@ class _LazyAlias:
         self,
         tp: Any,
         *,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> Any:
         # Call form — qualifier / priority forwarded to LazyMeta
@@ -633,7 +633,7 @@ class LiveMeta(_providify):
                    Annotated[T, LiveMeta(optional=True)].
     """
 
-    qualifier: str | None = None
+    qualifier: str | type | None = None
     priority: int | None = None
     # DESIGN: optional=False by default — fail-fast is safer than silently
     # injecting None. Callers must explicitly opt in, either by using
@@ -696,7 +696,7 @@ class LiveProxy(Generic[T]):
         self,
         container: DIContainer,
         tp: type[T],
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
         optional: bool = False,
     ) -> None:
@@ -809,7 +809,7 @@ class _LiveAlias:
         self,
         tp: Any,
         *,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> Any:
         # Call form — qualifier / priority forwarded to LiveMeta
@@ -956,7 +956,7 @@ class InstanceProxy(Generic[T]):
     def get(
         self,
         *,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> T:
         """Resolve and return the single best-priority matching instance synchronously.
@@ -999,7 +999,7 @@ class InstanceProxy(Generic[T]):
     async def aget(
         self,
         *,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> T:
         """Resolve and return the single best-priority matching instance asynchronously.
@@ -1030,7 +1030,7 @@ class InstanceProxy(Generic[T]):
     def get_all(
         self,
         *,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
     ) -> list[T]:
         """Resolve all matching instances synchronously, sorted by ascending priority.
 
@@ -1091,7 +1091,7 @@ class InstanceProxy(Generic[T]):
     def resolvable(
         self,
         *,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> bool:
         """Return True if at least one binding matches — safe to call ``.get()``.
@@ -1265,3 +1265,201 @@ def _get_providify_metadata(hint: Any) -> _providify | None:
         args = get_args(hint)
         return next((a for a in args[1:] if isinstance(a, _providify)), None)
     return None
+
+
+# ─────────────────────────────────────────────────────────────────
+#  NamedMeta — injection-point qualifier by name
+# ─────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class NamedMeta(_providify):
+    """Injection-point qualifier by name.
+
+    Equivalent to Annotated[T, InjectMeta(qualifier=name)].
+    Mirrors Jakarta CDI's @Named at injection sites.
+
+    Example:
+        db: Annotated[Database, NamedMeta("primary")]
+        # same as:
+        db: Annotated[Database, InjectMeta(qualifier="primary")]
+    """
+
+    name: str
+
+
+# ─────────────────────────────────────────────────────────────────
+#  DelegateMeta — marks the @Delegate injection point in @Decorator beans
+# ─────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class DelegateMeta(_providify):
+    """Marks an injection point as receiving the decorated (wrapped) bean.
+
+    Used inside @Decorator classes to receive the next implementation
+    in the decorator stack. The container injects the best non-decorator
+    binding for the same interface.
+
+    Example:
+        @Decorator
+        @Singleton
+        class LoggingMailer(Mailer):
+            def __init__(self, delegate: Annotated[Mailer, DelegateMeta()]) -> None:
+                self._delegate = delegate
+    """
+
+    pass
+
+
+class _DelegateAlias:
+    """Sugar over Annotated[T, DelegateMeta()]."""
+
+    def __getitem__(self, tp: Any) -> Any:
+        return Annotated[tp, DelegateMeta()]
+
+    def __call__(self, tp: Any) -> Any:
+        return Annotated[tp, DelegateMeta()]
+
+
+if TYPE_CHECKING:
+    type Delegate[T] = T
+else:
+    Delegate = _DelegateAlias()
+
+
+# ─────────────────────────────────────────────────────────────────
+#  EventMeta / EventProxy / Event — typed event bus
+# ─────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class EventMeta(_providify):
+    """Marker for Event[T] injection points.
+
+    When detected by the container's _resolve_hint_sync/_async, an
+    EventProxy is created and injected instead of resolving T.
+    """
+
+    pass
+
+
+class EventProxy(Generic[T]):
+    """Dispatch handle for events of type T.
+
+    Injected via Event[T] annotation. Holds a weak reference to the
+    container so that the proxy itself does not extend the container's
+    lifetime.
+
+    Example:
+        @Singleton
+        class OrderService:
+            def __init__(self, events: Event[OrderPlaced]) -> None:
+                self._events = events
+
+            def place(self, order: Order) -> None:
+                ...
+                self._events.fire(OrderPlaced(order))
+    """
+
+    def __init__(self, container: Any, tp: type) -> None:
+        self._container: Any = container
+        self._tp = tp
+
+    def fire(self, event: T) -> None:
+        """Dispatch *event* synchronously to all registered @Observes observers."""
+        self._container._dispatch_event_sync(event)
+
+    async def afire(self, event: T) -> None:
+        """Dispatch *event* asynchronously to all registered @Observes observers."""
+        await self._container._dispatch_event_async(event)
+
+    def __repr__(self) -> str:
+        return f"EventProxy[{getattr(self._tp, '__name__', str(self._tp))}]"
+
+
+class _EventAlias:
+    """Sugar over Annotated[T, EventMeta()]."""
+
+    def __getitem__(self, tp: Any) -> Any:
+        return Annotated[tp, EventMeta()]
+
+    def __call__(self, tp: Any) -> Any:
+        return Annotated[tp, EventMeta()]
+
+
+if TYPE_CHECKING:
+    type Event[T] = EventProxy[T]
+else:
+    Event = _EventAlias()
+
+
+# ─────────────────────────────────────────────────────────────────
+#  InjectionPoint — injection context metadata
+# ─────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class InjectionPoint:
+    """Provides injection context to a @Provider or constructor parameter.
+
+    Injected automatically when a parameter is typed InjectionPoint.
+    The container sets this before resolving each parameter so the
+    receiving component knows who is asking for what.
+
+    Attributes:
+        declaring_class: The class whose constructor is being resolved.
+                         None when the lookup context cannot be determined.
+        param_name:      The parameter name at the injection site.
+        qualifier:       The qualifier at the injection site (or None).
+        annotation:      The full raw type hint at the injection site.
+
+    Example:
+        @Provider
+        def make_logger(ip: InjectionPoint) -> logging.Logger:
+            name = ip.declaring_class.__name__ if ip.declaring_class else "unknown"
+            return logging.getLogger(name)
+    """
+
+    declaring_class: type | None
+    param_name: str
+    qualifier: str | type | None
+    annotation: Any
+
+
+# ─────────────────────────────────────────────────────────────────
+#  InvocationContext — passed to @AroundInvoke interceptor methods
+# ─────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class InvocationContext:
+    """Mirrors Jakarta CDI's InvocationContext.
+
+    Passed to @AroundInvoke methods on interceptors. Calling
+    ctx.proceed() invokes the next interceptor in the chain, or the
+    target method when no more interceptors remain.
+
+    Attributes:
+        target:     The intercepted object instance.
+        method:     The bound method being intercepted.
+        parameters: Positional arguments passed to the method.
+        kwargs:     Keyword arguments passed to the method.
+        _chain:     Internal interceptor chain (do not modify).
+        _chain_index: Internal cursor (do not modify).
+    """
+
+    target: object
+    method: Any  # Callable
+    parameters: tuple
+    kwargs: dict
+    _chain: list  # list of (interceptor_instance, method_name) pairs
+    _chain_index: int = 0
+
+    def proceed(self) -> Any:
+        """Invoke the next interceptor in the chain, or the target method."""
+        if self._chain_index < len(self._chain):
+            interceptor_instance, around_invoke_name = self._chain[self._chain_index]
+            self._chain_index += 1
+            return getattr(interceptor_instance, around_invoke_name)(self)
+        return self.method(*self.parameters, **self.kwargs)

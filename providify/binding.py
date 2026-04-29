@@ -191,7 +191,11 @@ class ClassBinding(Binding):
         self.pre_destroy = _find_pre_destroy(implementation)
 
     def __repr__(self) -> str:
-        qualifier_part = f", qualifier={self.qualifier!r}" if self.qualifier else ""
+        if self.qualifier:
+            q_display = getattr(self.qualifier, "__name__", repr(self.qualifier))
+            qualifier_part = f", qualifier={q_display}"
+        else:
+            qualifier_part = ""
         # _type_name handles both concrete types (__name__) and generic aliases (str())
         return (
             f"ClassBinding("
@@ -425,9 +429,15 @@ class ProviderBinding(Binding):
             self.scope = Scope.DEPENDENT
         self.qualifier = meta.qualifier
         self.priority = meta.priority
+        # Set by container.install() when a @Disposes method is found
+        self.disposer: Callable[..., Any] | None = None
 
     def __repr__(self) -> str:
-        qualifier_part = f", qualifier={self.qualifier!r}" if self.qualifier else ""
+        if self.qualifier:
+            q_display = getattr(self.qualifier, "__name__", repr(self.qualifier))
+            qualifier_part = f", qualifier={q_display}"
+        else:
+            qualifier_part = ""
         async_part = ", async" if self.is_async else ""
         # _type_name handles both concrete types (__name__) and generic aliases (str())
         return (

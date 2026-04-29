@@ -13,11 +13,16 @@ from ..metadata import (
     DIMetadata,
     ProviderMetadata,
     Scope,
+    StereotypeMetadata,
     _is_decorated,
     _get_own_metadata,
     _set_metadata,
     _get_provider_metadata,
     _set_provider_metadata,
+    _set_qualifier_marker,
+    _set_alternative_marker,
+    _set_decorator_marker,
+    _set_stereotype,
 )
 
 T = TypeVar("T")
@@ -48,17 +53,19 @@ def _make_decorator(scope: Scope) -> Any:
     def decorator(
         __cls: None = ...,
         *,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int = 0,
         inherited: bool = False,
+        track: bool = False,
     ) -> Callable[[type[T]], type[T]]: ...
 
     def decorator(
         __cls: Any = None,
         *,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int = 0,
         inherited: bool = False,
+        track: bool = False,
     ) -> Any:
         def stamp(c: type[T]) -> type[T]:
             existing = _get_own_metadata(c)
@@ -71,6 +78,7 @@ def _make_decorator(scope: Scope) -> Any:
                         qualifier=qualifier,
                         priority=priority,
                         inherited=inherited,
+                        track=track,
                     )
                     if existing is not None
                     else DIMetadata(  # fresh if first decorator
@@ -78,6 +86,7 @@ def _make_decorator(scope: Scope) -> Any:
                         qualifier=qualifier,
                         priority=priority,
                         inherited=inherited,
+                        track=track,
                     )
                 ),
             )
@@ -133,18 +142,20 @@ def Component(__cls: type[T]) -> type[T]: ...
 def Component(
     __cls: None = ...,
     *,
-    qualifier: str | None = None,
+    qualifier: str | type | None = None,
     priority: int = 0,
     inherited: bool = False,
+    track: bool = False,
 ) -> Callable[[type[T]], type[T]]: ...
 
 
 def Component(
     __cls: Any = None,
     *,
-    qualifier: str | None = None,
+    qualifier: str | type | None = None,
     priority: int = 0,
     inherited: bool = False,
+    track: bool = False,
 ) -> Any:
     """
     Marks a class as a DI component with DEPENDENT (prototype) scope.
@@ -160,6 +171,9 @@ def Component(
         priority:   Binding priority; higher wins when multiple bindings
                     match the same type.
         inherited:  If True, subclasses inherit this binding automatically.
+        track:      If True, instances are tracked for @PreDestroy on
+                    flush_dependents() — useful for DEPENDENT-scoped beans
+                    with teardown logic.
 
     Returns:
         The decorated class unchanged (type preserved for the type checker),
@@ -180,7 +194,7 @@ def Component(
     Async safety:   ✅ Safe — pure metadata write, no async state involved.
     """
     return _component_impl(
-        __cls, qualifier=qualifier, priority=priority, inherited=inherited
+        __cls, qualifier=qualifier, priority=priority, inherited=inherited, track=track
     )
 
 
@@ -195,18 +209,20 @@ def Singleton(__cls: type[T]) -> type[T]: ...
 def Singleton(
     __cls: None = ...,
     *,
-    qualifier: str | None = None,
+    qualifier: str | type | None = None,
     priority: int = 0,
     inherited: bool = False,
+    track: bool = False,
 ) -> Callable[[type[T]], type[T]]: ...
 
 
 def Singleton(
     __cls: Any = None,
     *,
-    qualifier: str | None = None,
+    qualifier: str | type | None = None,
     priority: int = 0,
     inherited: bool = False,
+    track: bool = False,
 ) -> Any:
     """
     Marks a class as a DI component with SINGLETON scope.
@@ -222,6 +238,7 @@ def Singleton(
         priority:   Binding priority; higher wins when multiple bindings
                     match the same type.
         inherited:  If True, subclasses inherit this binding automatically.
+        track:      Reserved for API consistency — no effect for SINGLETON.
 
     Returns:
         The decorated class unchanged (type preserved for the type checker),
@@ -242,7 +259,7 @@ def Singleton(
     Async safety:   ✅ Safe — pure metadata write, no async state involved.
     """
     return _singleton_impl(
-        __cls, qualifier=qualifier, priority=priority, inherited=inherited
+        __cls, qualifier=qualifier, priority=priority, inherited=inherited, track=track
     )
 
 
@@ -257,18 +274,20 @@ def RequestScoped(__cls: type[T]) -> type[T]: ...
 def RequestScoped(
     __cls: None = ...,
     *,
-    qualifier: str | None = None,
+    qualifier: str | type | None = None,
     priority: int = 0,
     inherited: bool = False,
+    track: bool = False,
 ) -> Callable[[type[T]], type[T]]: ...
 
 
 def RequestScoped(
     __cls: Any = None,
     *,
-    qualifier: str | None = None,
+    qualifier: str | type | None = None,
     priority: int = 0,
     inherited: bool = False,
+    track: bool = False,
 ) -> Any:
     """
     Marks a class as a DI component with REQUEST scope.
@@ -304,7 +323,7 @@ def RequestScoped(
     Async safety:   ✅ Safe — pure metadata write, no async state involved.
     """
     return _request_impl(
-        __cls, qualifier=qualifier, priority=priority, inherited=inherited
+        __cls, qualifier=qualifier, priority=priority, inherited=inherited, track=track
     )
 
 
@@ -319,18 +338,20 @@ def SessionScoped(__cls: type[T]) -> type[T]: ...
 def SessionScoped(
     __cls: None = ...,
     *,
-    qualifier: str | None = None,
+    qualifier: str | type | None = None,
     priority: int = 0,
     inherited: bool = False,
+    track: bool = False,
 ) -> Callable[[type[T]], type[T]]: ...
 
 
 def SessionScoped(
     __cls: Any = None,
     *,
-    qualifier: str | None = None,
+    qualifier: str | type | None = None,
     priority: int = 0,
     inherited: bool = False,
+    track: bool = False,
 ) -> Any:
     """
     Marks a class as a DI component with SESSION scope.
@@ -346,6 +367,7 @@ def SessionScoped(
         priority:   Binding priority; higher wins when multiple bindings
                     match the same type.
         inherited:  If True, subclasses inherit this binding automatically.
+        track:      Reserved for API consistency — no effect for SESSION.
 
     Returns:
         The decorated class unchanged (type preserved for the type checker),
@@ -366,7 +388,7 @@ def SessionScoped(
     Async safety:   ✅ Safe — pure metadata write, no async state involved.
     """
     return _session_impl(
-        __cls, qualifier=qualifier, priority=priority, inherited=inherited
+        __cls, qualifier=qualifier, priority=priority, inherited=inherited, track=track
     )
 
 
@@ -457,7 +479,7 @@ def Provider(__fn: Callable[..., R]) -> Callable[..., R]: ...
 def Provider(
     __fn: None = ...,
     *,
-    qualifier: str | None = None,
+    qualifier: str | type | None = None,
     priority: int = 0,
     singleton: bool = False,
     scope: Scope | None = None,
@@ -467,7 +489,7 @@ def Provider(
 def Provider(
     __fn: Any = None,
     *,
-    qualifier: str | None = None,
+    qualifier: str | type | None = None,
     priority: int = 0,
     singleton: bool = False,
     # scope — explicit Scope value, overrides singleton flag when set.
@@ -546,3 +568,175 @@ def Provider(
     if __fn is not None:
         return decorator(__fn)
     return decorator
+
+
+# ─────────────────────────────────────────────────────────────────
+#  @Qualifier — marks a class as a typed qualifier annotation
+# ─────────────────────────────────────────────────────────────────
+
+
+def Qualifier(cls: type) -> type:
+    """Mark a class as a CDI-style qualifier annotation.
+
+    Equivalent to Jakarta CDI's @Qualifier meta-annotation.
+    Once marked, the class can be used as a typed qualifier in scope
+    decorators and injection points instead of bare strings.
+
+    Example:
+        @Qualifier
+        class Primary: ...
+
+        @Singleton(qualifier=Primary)
+        class PrimaryRepo(Repo): ...
+
+        repo = container.get(Repo, qualifier=Primary)
+    """
+    _set_qualifier_marker(cls)
+    return cls
+
+
+# ─────────────────────────────────────────────────────────────────
+#  @Default — explicit default qualifier (Jakarta CDI @Default)
+# ─────────────────────────────────────────────────────────────────
+
+
+@Qualifier
+class Default:
+    """Explicit default qualifier — semantically equivalent to qualifier=None.
+
+    Equivalent to Jakarta CDI's @Default.
+    Applying @Default(qualifier=Default) is identical to no qualifier.
+    """
+
+    pass
+
+
+# ─────────────────────────────────────────────────────────────────
+#  @ApplicationScoped — alias for @Singleton (Jakarta CDI terminology)
+# ─────────────────────────────────────────────────────────────────
+
+ApplicationScoped = Singleton
+
+
+# ─────────────────────────────────────────────────────────────────
+#  @Alternative — deployment-time bean replacement
+# ─────────────────────────────────────────────────────────────────
+
+
+def Alternative(cls: type) -> type:
+    """Mark a class as a CDI alternative — disabled by default.
+
+    Alternative beans are excluded from resolution unless explicitly
+    activated on a container via ``container.enable_alternative(cls)``.
+    This enables clean test/environment substitution without affecting
+    production containers.
+
+    Example:
+        @Alternative
+        @Singleton
+        class MockMailer(Mailer): ...
+
+        container.enable_alternative(MockMailer)
+        container.get(Mailer)  # returns MockMailer
+    """
+    _set_alternative_marker(cls)
+    return cls
+
+
+# ─────────────────────────────────────────────────────────────────
+#  @Stereotype — composed annotation bundles (Jakarta CDI @Stereotype)
+# ─────────────────────────────────────────────────────────────────
+
+
+def Stereotype(
+    *,
+    scope: Scope = Scope.DEPENDENT,
+    qualifier: str | type | None = None,
+    priority: int = 0,
+    inherited: bool = False,
+) -> Callable[[type], type]:
+    """Create a reusable composed DI decorator (Jakarta CDI @Stereotype parity).
+
+    Stamps a class as a stereotype annotation. When applied as a decorator
+    to a target class, it provides default DIMetadata values. Explicit scope
+    decorators on the target always win over stereotype defaults.
+
+    Example:
+        @Stereotype(scope=Scope.SINGLETON, qualifier="service")
+        class ServiceLayer: ...
+
+        @ServiceLayer          # applies scope=SINGLETON, qualifier="service"
+        class MyService: ...
+
+        @Singleton             # explicit scope overrides stereotype
+        @ServiceLayer
+        class OverriddenService: ...
+    """
+    smeta = StereotypeMetadata(
+        scope=scope, qualifier=qualifier, priority=priority, inherited=inherited
+    )
+
+    def _apply(target: type) -> type:
+        """Apply stereotype metadata to *target*, respecting any explicit decorators."""
+        _set_stereotype(target, smeta)
+        existing = _get_own_metadata(target)
+        if existing is not None:
+            # An explicit DI decorator (e.g. @Singleton) already stamped metadata.
+            # Stereotype fills only gaps: qualifier if unset, priority if still 0,
+            # inherited OR'd in. The explicit scope always wins.
+            _set_metadata(
+                target,
+                DIMetadata(
+                    scope=existing.scope,
+                    qualifier=(
+                        existing.qualifier
+                        if existing.qualifier is not None
+                        else smeta.qualifier
+                    ),
+                    priority=(
+                        existing.priority if existing.priority != 0 else smeta.priority
+                    ),
+                    inherited=existing.inherited or smeta.inherited,
+                    track=existing.track,
+                ),
+            )
+        else:
+            _set_metadata(
+                target,
+                DIMetadata(
+                    scope=smeta.resolved_scope(),
+                    qualifier=smeta.qualifier,
+                    priority=smeta.priority,
+                    inherited=smeta.inherited,
+                ),
+            )
+        return target
+
+    return _apply
+
+
+# ─────────────────────────────────────────────────────────────────
+#  @Decorator — interface-level bean delegation
+# ─────────────────────────────────────────────────────────────────
+
+
+def Decorator(cls: type) -> type:
+    """Mark a class as a CDI-style bean decorator.
+
+    A @Decorator wraps another implementation of the same interface,
+    using @Delegate injection to receive the wrapped bean. Multiple
+    decorators stack by priority (highest priority wraps outermost).
+
+    Example:
+        @Decorator
+        @Singleton
+        class LoggingMailer(Mailer):
+            def __init__(self, delegate: Annotated[Mailer, DelegateMeta()]) -> None:
+                self._delegate = delegate
+
+            def send(self, msg: str) -> None:
+                print(f"[LOG] {msg}")
+                self._delegate.send(msg)
+    """
+    _set_decorator_marker(cls)
+    return cls

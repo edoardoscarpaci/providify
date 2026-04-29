@@ -1,1 +1,2 @@
 - [Providify Architecture Snapshot](project_arch.md) — v0.1.7 gaps, known bugs, key design decisions as of 2026-04-26
+- [Jakarta CDI Parity Scan](project_jakarta_parity_scan.md) — v0.3.0 gap analysis: what is present, partial, and absent as of 2026-04-29

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 # ─────────────────────────────────────────────────────────────────
 #  Resolution stack — tracks the current dependency chain per task/thread
@@ -62,3 +62,20 @@ def _format_cycle(stack: list[type], cls: type) -> str:
 # ─────────────────────────────────────────────────────────────────
 
 _UNRESOLVED: Final[object] = object()
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Current injection point — set during _collect_kwargs so that
+#  InjectionPoint can be injected into constructor parameters.
+#
+#  DESIGN: ContextVar so concurrent async tasks each see their own
+#  injection context — same reasoning as _resolution_stack.
+# ─────────────────────────────────────────────────────────────────
+
+if TYPE_CHECKING:
+    from .type import InjectionPoint
+
+_current_injection_point: ContextVar[InjectionPoint | None] = ContextVar(
+    "current_injection_point",
+    default=None,
+)

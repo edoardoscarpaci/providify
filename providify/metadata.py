@@ -71,6 +71,52 @@ _DI_METADATA_ATTR = "__di_metadata__"  # storage slot only — not a semantic ke
 _DI_PROVIDER_ATTR = "__di_provider__"  # storage slot only
 _DI_CONFIGURATION_ATTR = "__di_module__"
 
+# ── @Qualifier — typed qualifier annotation marker ────────────────
+_QUALIFIER_MARKER_ATTR = "__di_qualifier_marker__"
+
+# ── @Alternative — deployment-time bean replacement marker ───────
+_ALTERNATIVE_ATTR = "__di_alternative__"
+
+# ── @Decorator — bean decorator marker ───────────────────────────
+_DECORATOR_ATTR = "__di_decorator__"
+
+# ── @Stereotype — composed annotation bundle marker ──────────────
+_STEREOTYPE_ATTR = "__di_stereotype__"
+
+
+class QualifierMarker:
+    """Stamps a class as a CDI-style qualifier annotation (@Qualifier parity)."""
+
+    __slots__ = ()
+
+
+class AlternativeMarker:
+    """Stamps a class as a deployment-time alternative bean (@Alternative parity)."""
+
+    __slots__ = ()
+
+
+class DecoratorMarker:
+    """Stamps a class as a CDI-style bean decorator (@Decorator parity)."""
+
+    __slots__ = ()
+
+
+@dataclass(frozen=True)
+class StereotypeMetadata:
+    """Holds composed annotation metadata for a @Stereotype class."""
+
+    scope: Any = (
+        None  # Scope — None means DEPENDENT (resolved lazily to avoid forward ref)
+    )
+    qualifier: Any = None  # str | type | None
+    priority: int = 0
+    inherited: bool = False
+
+    def resolved_scope(self) -> "Scope":
+        """Return the effective scope, defaulting to DEPENDENT."""
+        return self.scope if self.scope is not None else Scope.DEPENDENT
+
 
 class DIMetadata:
     """
@@ -83,19 +129,21 @@ class DIMetadata:
         "__di_metadata__" in dict      ❌ string check — not needed
     """
 
-    __slots__ = ("scope", "qualifier", "priority", "inherited")
+    __slots__ = ("scope", "qualifier", "priority", "inherited", "track")
 
     def __init__(
         self,
         scope: Scope,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int = 0,
         inherited: bool = False,
+        track: bool = False,
     ) -> None:
         self.scope = scope
         self.qualifier = qualifier
         self.priority = priority
         self.inherited = inherited
+        self.track = track
 
     def merge(self, **updates: Any) -> DIMetadata:
         """Immutable merge — returns new instance with updated fields."""
@@ -104,12 +152,14 @@ class DIMetadata:
             qualifier=updates.get("qualifier", self.qualifier),
             priority=updates.get("priority", self.priority),
             inherited=updates.get("inherited", self.inherited),
+            track=updates.get("track", self.track),
         )
 
     def __repr__(self) -> str:
+        qualifier_display = getattr(self.qualifier, "__name__", repr(self.qualifier))
         return (
-            f"DIMetadata(scope={self.scope.name}, qualifier={self.qualifier!r}, "
-            f"priority={self.priority}, inherited={self.inherited})"
+            f"DIMetadata(scope={self.scope.name}, qualifier={qualifier_display}, "
+            f"priority={self.priority}, inherited={self.inherited}, track={self.track})"
         )
 
     # ── Pickle support — explicit for clarity ─────────────────────
@@ -123,7 +173,13 @@ class DIMetadata:
     @classmethod
     def default(cls) -> DIMetadata:
         """Factory method for default metadata values."""
-        return cls(scope=Scope.DEPENDENT, qualifier=None, priority=0, inherited=False)
+        return cls(
+            scope=Scope.DEPENDENT,
+            qualifier=None,
+            priority=0,
+            inherited=False,
+            track=False,
+        )
 
 
 class ProviderMetadata:
@@ -141,7 +197,7 @@ class ProviderMetadata:
 
     def __init__(
         self,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int = 0,
         singleton: bool = False,
         is_async: bool = False,
@@ -158,7 +214,7 @@ class ProviderMetadata:
 
     def merge(self, **updates: Any) -> ProviderMetadata:
         return ProviderMetadata(
-            qualifier=updates.get("qualifier", self.qualifier),
+            qualifier=updates.get("qualifier", self.qualifier),  # type: ignore[arg-type]
             priority=updates.get("priority", self.priority),
             singleton=updates.get("singleton", self.singleton),
             is_async=updates.get("is_async", self.is_async),
@@ -316,6 +372,67 @@ def _is_decorated(obj: Any) -> bool:
     if callable(obj):
         return _get_provider_metadata(obj) is not None
     return False
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Qualifier marker helpers
+# ─────────────────────────────────────────────────────────────────
+
+
+def _is_qualifier_annotation(cls: type) -> bool:
+    """Return True if *cls* was decorated with @Qualifier."""
+    return isinstance(cls.__dict__.get(_QUALIFIER_MARKER_ATTR), QualifierMarker)
+
+
+def _set_qualifier_marker(cls: type) -> None:
+    """Stamp *cls* as a custom qualifier annotation."""
+    setattr(cls, _QUALIFIER_MARKER_ATTR, QualifierMarker())
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Alternative marker helpers
+# ─────────────────────────────────────────────────────────────────
+
+
+def _is_alternative(cls: type) -> bool:
+    """Return True if *cls* was decorated with @Alternative."""
+    return isinstance(cls.__dict__.get(_ALTERNATIVE_ATTR), AlternativeMarker)
+
+
+def _set_alternative_marker(cls: type) -> None:
+    """Stamp *cls* as an alternative bean."""
+    setattr(cls, _ALTERNATIVE_ATTR, AlternativeMarker())
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Decorator bean marker helpers
+# ─────────────────────────────────────────────────────────────────
+
+
+def _is_decorator_bean(cls: type) -> bool:
+    """Return True if *cls* was decorated with @Decorator."""
+    return isinstance(cls.__dict__.get(_DECORATOR_ATTR), DecoratorMarker)
+
+
+def _set_decorator_marker(cls: type) -> None:
+    """Stamp *cls* as a bean decorator."""
+    setattr(cls, _DECORATOR_ATTR, DecoratorMarker())
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Stereotype marker helpers
+# ─────────────────────────────────────────────────────────────────
+
+
+def _get_stereotype(cls: type) -> StereotypeMetadata | None:
+    """Return the StereotypeMetadata if *cls* was decorated with @Stereotype."""
+    val = cls.__dict__.get(_STEREOTYPE_ATTR)
+    return val if isinstance(val, StereotypeMetadata) else None
+
+
+def _set_stereotype(cls: type, meta: StereotypeMetadata) -> None:
+    """Stamp a StereotypeMetadata onto *cls*."""
+    setattr(cls, _STEREOTYPE_ATTR, meta)
 
 
 def _is_scope_leak(parent_scope: Scope, dep_scope: Scope) -> bool:

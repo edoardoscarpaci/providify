@@ -7,15 +7,27 @@ __all__ = [
     # Scope decorators
     "Component",
     "Singleton",
+    "ApplicationScoped",
     "RequestScoped",
     "SessionScoped",
     "Provider",
     "Named",
     "Priority",
     "Inheritable",
+    # Jakarta CDI qualifier system
+    "Qualifier",
+    "Default",
+    "Alternative",
+    "Stereotype",
+    "StereotypeMetadata",
+    "Decorator",
     # Lifecycle decorators
     "PostConstruct",
     "PreDestroy",
+    "Disposes",
+    "DisposesMarker",
+    "Observes",
+    "ObservesMarker",
     # Module
     "Configuration",
     # Scope enum — exported so users never need to import from metadata
@@ -38,9 +50,12 @@ __all__ = [
     "Lazy",
     "Live",
     "Instance",
+    "Event",
+    "Delegate",
     "LiveProxy",
     "LazyProxy",
     "InstanceProxy",
+    "EventProxy",
     # Metadata — use with Annotated[T, XxxMeta(...)] for fully type-safe
     # annotations when qualifier / priority / optional options are needed.
     # e.g.  store: Annotated[Storage, InjectMeta(qualifier="cloud")]
@@ -49,11 +64,22 @@ __all__ = [
     "LazyMeta",
     "LiveMeta",
     "InstanceMeta",
+    "NamedMeta",
+    "DelegateMeta",
+    "EventMeta",
+    # Context / AOP types
+    "InjectionPoint",
+    "InvocationContext",
+    # Interceptor decorators
+    "Interceptor",
+    "InterceptorBinding",
+    "AroundInvoke",
 ]
 from .container import DIContainer, ScopeContext
 from .decorator.scope import (
     Component,
     Singleton,
+    ApplicationScoped,
     RequestScoped,
     SessionScoped,
     Provider,
@@ -62,10 +88,23 @@ from .decorator.scope import (
     # missing from the public surface despite being documented in the README.
     Priority,
     Inheritable,
+    # Jakarta CDI parity decorators
+    Qualifier,
+    Default,
+    Alternative,
+    Stereotype,
+    Decorator,
 )
-from .decorator.lifecycle import PostConstruct, PreDestroy
+from .decorator.lifecycle import (
+    PostConstruct,
+    PreDestroy,
+    Disposes,
+    DisposesMarker,
+    Observes,
+    ObservesMarker,
+)
 from .decorator.module import Configuration
-from .metadata import Scope
+from .metadata import Scope, StereotypeMetadata
 from .exceptions import (
     providifyError,
     BindingError,
@@ -83,14 +122,23 @@ from .type import (
     Lazy,
     Live,
     Instance,
+    Event,
+    Delegate,
     LiveProxy,
     LazyProxy,
     InstanceProxy,
+    EventProxy,
     InjectMeta,
     LazyMeta,
     LiveMeta,
     InstanceMeta,
+    NamedMeta,
+    DelegateMeta,
+    EventMeta,
+    InjectionPoint,
+    InvocationContext,
 )
+from .decorator.interceptor import Interceptor, InterceptorBinding, AroundInvoke
 
 import logging
 

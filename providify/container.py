@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import functools
 import inspect
 import logging
 import threading
@@ -20,8 +21,19 @@ from typing import (
     get_type_hints,
 )
 
+import weakref
+
 from .binding import AnyBinding, ClassBinding, ProviderBinding
-from .decorator.lifecycle import LifecycleMarker
+from .decorator.interceptor import (
+    _get_around_invoke_method,
+    _is_interceptor,
+    _is_interceptor_binding,
+)
+from .decorator.lifecycle import (
+    LifecycleMarker,
+    _get_disposes_marker,
+    _get_observes_marker,
+)
 from .descriptor import DIContainerDescriptor
 from .exceptions import CircularDependencyError, LiveInjectionRequiredError
 from .metadata import (
@@ -31,19 +43,32 @@ from .metadata import (
     _has_own_metadata,
     _has_configuration_module,
     _is_scope_leak,
+    _get_metadata,
     _get_provider_metadata,
 )
-from .resolution import _resolution_stack, _current_stack, _format_cycle, _UNRESOLVED
+from .resolution import (
+    _resolution_stack,
+    _current_stack,
+    _format_cycle,
+    _UNRESOLVED,
+    _current_injection_point,
+)
 from .scanner import ContainerScanner, DefaultContainerScanner
 from .scope import ScopeContext
 from .type import (
+    DelegateMeta,
+    EventMeta,
+    EventProxy,
     InjectMeta,
+    InjectionPoint,
     InstanceMeta,
     InstanceProxy,
+    InvocationContext,
     LazyMeta,
     LazyProxy,
     LiveMeta,
     LiveProxy,
+    NamedMeta,
     _has_providify_metadata,
     _providify,
     _unwrap_classvar,
@@ -159,6 +184,53 @@ class _ScopedContainer:
 
     async def __aexit__(self, *_: object) -> None:
         self._restore()
+
+
+# ─────────────────────────────────────────────────────────────────
+#  _InterceptorProxy — transparent AOP wrapper for @Interceptor
+# ─────────────────────────────────────────────────────────────────
+
+
+class _InterceptorProxy:
+    """Wraps a bean instance and intercepts method calls via the interceptor chain.
+
+    All attribute accesses are delegated to the underlying ``_target``. For
+    callable attributes the proxy wraps the call in an ``InvocationContext``
+    so each ``@AroundInvoke`` method in *chain* is invoked before the real
+    method body runs.
+
+    Note:
+        ``isinstance(proxy, TargetClass)`` returns ``False``. Use
+        ``type(proxy._target)`` when class identity is required.
+    """
+
+    __slots__ = ("_target", "_chain")
+
+    def __init__(self, target: object, chain: list[tuple[object, str]]) -> None:
+        object.__setattr__(self, "_target", target)
+        object.__setattr__(self, "_chain", chain)
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(object.__getattribute__(self, "_target"), name)
+        chain = object.__getattribute__(self, "_chain")
+        if not callable(attr):
+            return attr
+
+        def _intercepted(*args: Any, **kwargs: Any) -> Any:
+            ctx = InvocationContext(
+                target=object.__getattribute__(self, "_target"),
+                method=attr,
+                parameters=args,
+                kwargs=kwargs,
+                _chain=list(chain),
+            )
+            return ctx.proceed()
+
+        return _intercepted
+
+    def __repr__(self) -> str:
+        target = object.__getattribute__(self, "_target")
+        return f"_InterceptorProxy({target!r})"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -327,6 +399,16 @@ class DIContainer:
         # or in __init__ — they require an active event loop.
         self._async_singleton_locks: dict[Any, asyncio.Lock] = {}
 
+        # ── Jakarta CDI parity state ───────────────────────────────
+        # @Alternative — activated per-container; excluded by default from _filter()
+        self._enabled_alternatives: set[type] = set()
+        # @Interceptor — registered interceptor classes applied to all resolved instances
+        self._interceptor_classes: list[type] = []
+        # Event[T] / @Observes — maps event type → [(weakref, method_name)]
+        self._observers: dict[type, list] = {}
+        # @Component(track=True) — tracked DEPENDENT instances for flush_dependents()
+        self._tracked_dependents: list[object] = []
+
         # ── Auto-scan at construction time ────────────────────────
         # DESIGN: Eager scan (at __init__) rather than lazy scan (deferred to
         # first get()) was chosen because it makes errors surface at the point
@@ -455,6 +537,7 @@ class DIContainer:
             RuntimeError: If any @PreDestroy hook is async def — use
                 ``async with container:`` (which calls ashutdown()) instead.
         """
+        self.flush_dependents()
         self.shutdown()
 
     async def __aenter__(self) -> DIContainer:
@@ -477,6 +560,7 @@ class DIContainer:
         Returns:
             None  (does not suppress exceptions from the async-with block)
         """
+        await self.aflush_dependents()
         await self.ashutdown()
 
     # ── Registration ──────────────────────────────────────────────
@@ -590,7 +674,7 @@ class DIContainer:
 
     def warm_up(
         self,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> None:
         """Eagerly instantiate all singleton bindings in the container (sync version).
@@ -634,7 +718,7 @@ class DIContainer:
 
     async def awarm_up(
         self,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> None:
         """Eagerly instantiate all singleton bindings in the container (async version).
@@ -680,7 +764,7 @@ class DIContainer:
     def get(
         self,
         cls: type[T] | Any,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> T:
         """Resolve a single instance synchronously.
@@ -716,7 +800,7 @@ class DIContainer:
     def get_all(
         self,
         cls: type[T] | Any,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
     ) -> list[T]:
         """Resolve every binding that matches *cls*, synchronously.
 
@@ -761,7 +845,7 @@ class DIContainer:
     async def aget(
         self,
         cls: type[T] | Any,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> T:
         """Resolve a single instance asynchronously.
@@ -792,7 +876,7 @@ class DIContainer:
     async def aget_all(
         self,
         cls: type[T] | Any,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
     ) -> list[T]:
         """Resolve every binding that matches *cls*, asynchronously.
 
@@ -828,7 +912,7 @@ class DIContainer:
     def _filter(
         self,
         cls: type,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> list[AnyBinding]:
         """Return all bindings whose interface is a subclass of *cls*.
@@ -844,6 +928,14 @@ class DIContainer:
         Returns:
             A (possibly empty) list of matching bindings.
         """
+        from .decorator.scope import Default as _Default
+        from .metadata import _is_alternative
+        from .binding import ClassBinding as _ClassBinding
+
+        # @Default is semantically equivalent to no qualifier
+        if qualifier is _Default:
+            qualifier = None
+
         return [
             b
             for b in self._bindings
@@ -861,13 +953,18 @@ class DIContainer:
             and (not getattr(b, "exact_only", False) or b.interface is cls)
             and (qualifier is None or b.qualifier == qualifier)
             and (priority is None or b.priority == priority)
+            # @Alternative bindings are excluded unless explicitly enabled
+            and (
+                not (isinstance(b, _ClassBinding) and _is_alternative(b.implementation))
+                or b.implementation in self._enabled_alternatives
+            )
         ]
 
     def is_resolvable(
         self,
         cls: type,
         *,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> bool:
         """Return True if at least one registered binding matches *cls*.
@@ -910,9 +1007,302 @@ class DIContainer:
         # side effects — calling it here does not trigger validation or instantiation.
         return bool(self._filter(cls, qualifier=qualifier, priority=priority))
 
+    # ── @Alternative — deployment-time bean activation ────────────
+
+    def enable_alternative(self, cls: type) -> None:
+        """Activate an @Alternative-marked class for this container.
+
+        Once enabled, the alternative participates in _filter() results
+        and will be returned by get() / get_all() like any other binding.
+
+        Args:
+            cls: A class decorated with @Alternative.
+        """
+        self._enabled_alternatives.add(cls)
+        self._validated = False
+
+    def disable_alternative(self, cls: type) -> None:
+        """Deactivate a previously enabled @Alternative class.
+
+        After disabling, the alternative is excluded from resolution again.
+
+        Args:
+            cls: A class previously passed to enable_alternative().
+        """
+        self._enabled_alternatives.discard(cls)
+        self._validated = False
+
+    # ── Interceptor registration (F5) ────────────────────────────
+
+    def add_interceptor(self, cls: type) -> None:
+        """Register an ``@Interceptor``-decorated class to intercept matching beans.
+
+        Interceptors are applied in registration order. The interceptor class
+        must be decorated with ``@Interceptor`` and must have exactly one
+        ``@AroundInvoke`` method.
+
+        Args:
+            cls: An ``@Interceptor``-decorated class.
+        """
+        if not _is_interceptor(cls):
+            raise TypeError(f"{cls.__name__} must be decorated with @Interceptor.")
+        if cls not in self._interceptor_classes:
+            self._interceptor_classes.append(cls)
+
+    def _apply_interceptors(self, instance: object, cls: type) -> object:
+        """Wrap *instance* with an interceptor proxy if any interceptors apply.
+
+        Finds interceptors whose ``@InterceptorBinding`` annotations overlap with
+        those on *cls*, resolves interceptor instances, and returns an
+        ``_InterceptorProxy`` wrapping the original. If no interceptors apply,
+        returns *instance* unchanged.
+
+        Args:
+            instance: The fully constructed bean instance.
+            cls:      The bean's implementation class.
+
+        Returns:
+            The original instance, or an ``_InterceptorProxy`` wrapping it.
+        """
+        if not self._interceptor_classes:
+            return instance
+
+        # Collect interceptor binding annotation types on the target class
+        target_bindings: set[type] = set()
+        for name in dir(cls):
+            val = getattr(cls, name, None)
+            if isinstance(val, type) and _is_interceptor_binding(val):
+                target_bindings.add(val)
+
+        if not target_bindings:
+            return instance
+
+        # Find interceptors that share at least one binding annotation
+        chain: list[tuple[object, str]] = []
+        for interceptor_cls in self._interceptor_classes:
+            for name in dir(interceptor_cls):
+                val = getattr(interceptor_cls, name, None)
+                if isinstance(val, type) and val in target_bindings:
+                    around_invoke = _get_around_invoke_method(interceptor_cls)
+                    if around_invoke is not None:
+                        interceptor_instance = self._resolve_constructor(
+                            interceptor_cls
+                        )
+                        chain.append((interceptor_instance, around_invoke))
+                    break
+
+        if not chain:
+            return instance
+
+        return _InterceptorProxy(instance, chain)
+
+    # ── Event dispatch (F7) ──────────────────────────────────────
+
+    def _register_observers(self, instance: object, cls: type) -> None:
+        """Scan *cls* for ``@Observes`` methods and register *instance* as a subscriber.
+
+        Walks the MRO to find all ``@Observes``-decorated methods. Stores weak
+        references so observer registrations don't prevent garbage collection.
+
+        Args:
+            instance: The newly created bean instance.
+            cls:      The bean's implementation class.
+        """
+        for base in cls.__mro__:
+            for name, fn in vars(base).items():
+                if not callable(fn):
+                    continue
+                marker = _get_observes_marker(fn)
+                if marker is None:
+                    continue
+                event_type = marker.event_type
+                if event_type not in self._observers:
+                    self._observers[event_type] = []
+                self._observers[event_type].append(
+                    (weakref.ref(instance), name, marker.is_async)
+                )
+
+    def _dispatch_event_sync(self, event: object) -> None:
+        """Dispatch *event* synchronously to all registered ``@Observes`` observers.
+
+        Delivers to observers whose registered event type is a supertype of
+        ``type(event)``. Dead weak references are purged during dispatch.
+
+        Args:
+            event: The event object to dispatch.
+        """
+        event_type = type(event)
+
+        for registered_type, observers in self._observers.items():
+            if not issubclass(event_type, registered_type):
+                continue
+            live: list = []
+            for ref, method_name, is_async in observers:
+                inst = ref()
+                if inst is None:
+                    continue
+                live.append((ref, method_name, is_async))
+                if is_async:
+                    warnings.warn(
+                        f"@Observes method '{method_name}' is async — "
+                        f"use EventProxy.afire() for async dispatch.",
+                        stacklevel=2,
+                    )
+                    continue
+                getattr(inst, method_name)(event)
+            self._observers[registered_type] = live
+
+    async def _dispatch_event_async(self, event: object) -> None:
+        """Dispatch *event* asynchronously to all registered ``@Observes`` observers.
+
+        Awaits async observer methods; calls sync ones normally. Dead weak
+        references are purged during dispatch.
+
+        Args:
+            event: The event object to dispatch.
+        """
+        event_type = type(event)
+
+        for registered_type, observers in self._observers.items():
+            if not issubclass(event_type, registered_type):
+                continue
+            live: list = []
+            for ref, method_name, is_async in observers:
+                inst = ref()
+                if inst is None:
+                    continue
+                live.append((ref, method_name, is_async))
+                bound = getattr(inst, method_name)
+                if is_async:
+                    await bound(event)
+                else:
+                    bound(event)
+            self._observers[registered_type] = live
+
+    # ── DEPENDENT scope flush (F10) ──────────────────────────────
+
+    def flush_dependents(self) -> None:
+        """Call ``@PreDestroy`` on all tracked DEPENDENT-scoped instances and clear them.
+
+        Only instances created by classes decorated with ``@Component(track=True)``
+        (or any scoping decorator with ``track=True``) are tracked and flushed.
+
+        Raises:
+            RuntimeError: If any @PreDestroy is ``async def`` — use ``aflush_dependents()``.
+        """
+        for instance in self._tracked_dependents:
+            cls = type(instance)
+            binding = next(
+                (
+                    b
+                    for b in self._bindings
+                    if isinstance(b, ClassBinding) and b.implementation is cls
+                ),
+                None,
+            )
+            if binding is None or binding.pre_destroy is None:
+                continue
+            if binding.pre_destroy.is_async:
+                raise RuntimeError(
+                    f"@PreDestroy on '{cls.__name__}' is async — "
+                    f"use await container.aflush_dependents() instead."
+                )
+            getattr(instance, binding.pre_destroy.fn_name)()
+        self._tracked_dependents.clear()
+
+    async def aflush_dependents(self) -> None:
+        """Async variant of :meth:`flush_dependents`.
+
+        Awaits async ``@PreDestroy`` hooks; calls sync ones normally.
+        """
+        for instance in self._tracked_dependents:
+            cls = type(instance)
+            binding = next(
+                (
+                    b
+                    for b in self._bindings
+                    if isinstance(b, ClassBinding) and b.implementation is cls
+                ),
+                None,
+            )
+            if binding is None or binding.pre_destroy is None:
+                continue
+            bound = getattr(instance, binding.pre_destroy.fn_name)
+            if binding.pre_destroy.is_async:
+                await bound()
+            else:
+                bound()
+        self._tracked_dependents.clear()
+
+    # ── Scope utilities (F14) ────────────────────────────────────
+
+    def run_in_request(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Execute *fn* inside a request scope, returning its result.
+
+        Args:
+            fn:     A sync callable to execute.
+            *args:  Positional arguments forwarded to *fn*.
+            **kwargs: Keyword arguments forwarded to *fn*.
+
+        Returns:
+            The return value of *fn*.
+        """
+        with self.request():
+            return fn(*args, **kwargs)
+
+    async def arun_in_request(
+        self, fn: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        """Execute *fn* inside an async request scope, returning its result.
+
+        Args:
+            fn:     An async callable to execute.
+            *args:  Positional arguments forwarded to *fn*.
+            **kwargs: Keyword arguments forwarded to *fn*.
+
+        Returns:
+            The awaited return value of *fn*.
+        """
+        async with self.arequest():
+            return await fn(*args, **kwargs)
+
+    def run_in_session(
+        self, session_id: str, fn: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        """Execute *fn* inside a session scope identified by *session_id*.
+
+        Args:
+            session_id: The session identifier.
+            fn:         A sync callable to execute.
+            *args:      Positional arguments forwarded to *fn*.
+            **kwargs:   Keyword arguments forwarded to *fn*.
+
+        Returns:
+            The return value of *fn*.
+        """
+        with self.session(session_id):
+            return fn(*args, **kwargs)
+
+    async def arun_in_session(
+        self, session_id: str, fn: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        """Execute *fn* inside an async session scope identified by *session_id*.
+
+        Args:
+            session_id: The session identifier.
+            fn:         An async callable to execute.
+            *args:      Positional arguments forwarded to *fn*.
+            **kwargs:   Keyword arguments forwarded to *fn*.
+
+        Returns:
+            The awaited return value of *fn*.
+        """
+        async with self.asession(session_id):
+            return await fn(*args, **kwargs)
+
     def _filter_singleton(
         self,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> list[AnyBinding]:
         """Return all SINGLETON-scoped bindings, optionally filtered.
@@ -943,7 +1333,7 @@ class DIContainer:
     def _get_best_candidate(
         self,
         cls: type[T],
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> AnyBinding:
         """Return the highest-priority binding for the requested type.
@@ -1098,13 +1488,26 @@ class DIContainer:
                 if key in cache:
                     return cache[key]
                 instance = binding.create(self)
+                if isinstance(binding, ClassBinding):
+                    self._register_observers(instance, binding.implementation)
+                    instance = self._apply_interceptors(
+                        instance, binding.implementation
+                    )
                 cache[key] = instance
             return instance
 
         # ── Non-singleton path (REQUEST, SESSION, DEPENDENT) ─────────────────
         instance = binding.create(self)
+        if isinstance(binding, ClassBinding):
+            self._register_observers(instance, binding.implementation)
+            instance = self._apply_interceptors(instance, binding.implementation)
         if cache is not None:
             cache[key] = instance
+        elif isinstance(binding, ClassBinding):
+            # DEPENDENT scope: track if requested
+            meta = _get_metadata(binding.implementation)
+            if meta is not None and meta.track:
+                self._tracked_dependents.append(instance)
         return instance
 
     async def _instantiate_async(self, binding: AnyBinding) -> Any:
@@ -1157,13 +1560,25 @@ class DIContainer:
                 if key in cache:
                     return cache[key]
                 instance = await binding.acreate(self)
+                if isinstance(binding, ClassBinding):
+                    self._register_observers(instance, binding.implementation)
+                    instance = self._apply_interceptors(
+                        instance, binding.implementation
+                    )
                 cache[key] = instance  # type: ignore[index]
             return instance
 
         # ── Non-singleton path ────────────────────────────────────────────────
         instance = await binding.acreate(self)
+        if isinstance(binding, ClassBinding):
+            self._register_observers(instance, binding.implementation)
+            instance = self._apply_interceptors(instance, binding.implementation)
         if cache is not None:
             cache[key] = instance
+        elif isinstance(binding, ClassBinding):
+            meta = _get_metadata(binding.implementation)
+            if meta is not None and meta.track:
+                self._tracked_dependents.append(instance)
         return instance
 
     # ── Type-hint resolution ──────────────────────────────────────
@@ -1285,9 +1700,23 @@ class DIContainer:
         sig = inspect.signature(fn)
         resolved: dict[str, Any] = {}
 
+        # Declaring class for InjectionPoint — outermost class on the resolution stack.
+        declaring_class = _current_stack()[-1] if _current_stack() else None
+
         for param_name, hint in hints.items():
             param = sig.parameters.get(param_name)
-            resolved_value = self._resolve_hint_sync(hint, param_name, owner_name)
+            # Build InjectionPoint context so InjectionPoint-typed params resolve correctly.
+            ip = InjectionPoint(
+                declaring_class=declaring_class,
+                param_name=param_name,
+                qualifier=None,
+                annotation=hint,
+            )
+            ip_token = _current_injection_point.set(ip)
+            try:
+                resolved_value = self._resolve_hint_sync(hint, param_name, owner_name)
+            finally:
+                _current_injection_point.reset(ip_token)
 
             if resolved_value is _UNRESOLVED:
                 # No binding found — use default or fail
@@ -1332,11 +1761,23 @@ class DIContainer:
         sig = inspect.signature(fn)
         resolved: dict[str, Any] = {}
 
+        declaring_class = _current_stack()[-1] if _current_stack() else None
+
         for param_name, hint in hints.items():
             param = sig.parameters.get(param_name)
-            resolved_value = await self._resolve_hint_async(
-                hint, param_name, owner_name
+            ip = InjectionPoint(
+                declaring_class=declaring_class,
+                param_name=param_name,
+                qualifier=None,
+                annotation=hint,
             )
+            ip_token = _current_injection_point.set(ip)
+            try:
+                resolved_value = await self._resolve_hint_async(
+                    hint, param_name, owner_name
+                )
+            finally:
+                _current_injection_point.reset(ip_token)
 
             if resolved_value is _UNRESOLVED:
                 if param and param.default is inspect.Parameter.empty:
@@ -1352,7 +1793,7 @@ class DIContainer:
     def _collect_dependencies(
         self,
         fn: Callable[..., Any],
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> list[AnyBinding]:
         """Introspect a callable's type hints and resolve each to a registered binding.
@@ -1397,7 +1838,7 @@ class DIContainer:
     def _resolve_dependency(
         self,
         hint: Any,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> AnyBinding | None:
         """Attempt to resolve a single type hint to its best-matching binding.
@@ -1545,6 +1986,36 @@ class DIContainer:
                         return None
                     raise
 
+            # ── NamedMeta / DelegateMeta / EventMeta (still inside Annotated) ──
+            named_meta = next((a for a in args[1:] if isinstance(a, NamedMeta)), None)
+            delegate_meta = next(
+                (a for a in args[1:] if isinstance(a, DelegateMeta)), None
+            )
+            event_meta = next((a for a in args[1:] if isinstance(a, EventMeta)), None)
+
+            if named_meta:
+                try:
+                    return self.get(effective_base_type, qualifier=named_meta.name)
+                except LookupError:
+                    return _UNRESOLVED
+            elif delegate_meta:
+                # Resolve the delegate: the inner bean that the @Decorator wraps.
+                # Exclude the class currently being constructed to avoid self-injection.
+                current_cls = _current_stack()[-1] if _current_stack() else None
+                candidates = [
+                    b
+                    for b in self._filter(effective_base_type)
+                    if not (
+                        isinstance(b, ClassBinding) and b.implementation is current_cls
+                    )
+                ]
+                if not candidates:
+                    return _UNRESOLVED
+                best = max(candidates, key=lambda b: b.priority or 0)
+                return self._instantiate_sync(best)
+            elif event_meta:
+                return EventProxy(self, effective_base_type)
+
         # ── Union / Optional resolution ───────────────────────────
         # Handles: Optional[T], T | None, Union[T1, T2], Union[T1, T2, None]
         # Must come BEFORE the plain-type check below because Union types have
@@ -1576,6 +2047,11 @@ class DIContainer:
             # not `type` instances but do have a get_origin().  Plain annotations
             # like `repo: Repository[User]` land here when no Inject[] wrapper is used.
             return self.get(hint)
+
+        # ── InjectionPoint — plain type hint, not Annotated ────────────────────
+        if hint is InjectionPoint:
+            ip = _current_injection_point.get()
+            return ip if ip is not None else _UNRESOLVED
 
         return _UNRESOLVED  # signal: no binding found, caller decides
 
@@ -1662,6 +2138,36 @@ class DIContainer:
                         return None
                     raise
 
+            # ── NamedMeta / DelegateMeta / EventMeta (async mirror) ────────────
+            named_meta = next((a for a in args[1:] if isinstance(a, NamedMeta)), None)
+            delegate_meta = next(
+                (a for a in args[1:] if isinstance(a, DelegateMeta)), None
+            )
+            event_meta = next((a for a in args[1:] if isinstance(a, EventMeta)), None)
+
+            if named_meta:
+                try:
+                    return await self.aget(
+                        effective_base_type, qualifier=named_meta.name
+                    )
+                except LookupError:
+                    return _UNRESOLVED
+            elif delegate_meta:
+                current_cls = _current_stack()[-1] if _current_stack() else None
+                candidates = [
+                    b
+                    for b in self._filter(effective_base_type)
+                    if not (
+                        isinstance(b, ClassBinding) and b.implementation is current_cls
+                    )
+                ]
+                if not candidates:
+                    return _UNRESOLVED
+                best = max(candidates, key=lambda b: b.priority or 0)
+                return await self._instantiate_async(best)
+            elif event_meta:
+                return EventProxy(self, effective_base_type)
+
         # ── Union / Optional resolution (async mirror) ───────────────
         # Mirrors _resolve_hint_sync Union branch exactly — see that method
         # for the full design rationale.
@@ -1680,6 +2186,11 @@ class DIContainer:
         ) and self._is_resolvable(hint):
             # Mirror of _resolve_hint_sync — accept generic aliases here too
             return await self.aget(hint)
+
+        # ── InjectionPoint (async mirror) ───────────────────────────────────
+        if hint is InjectionPoint:
+            ip = _current_injection_point.get()
+            return ip if ip is not None else _UNRESOLVED
 
         return _UNRESOLVED
 
@@ -2238,15 +2749,22 @@ class DIContainer:
             RuntimeError: If any @PreDestroy hook is async def.
         """
         for binding in self._bindings:
+            if isinstance(binding, ProviderBinding):
+                if binding.disposer is not None and binding.scope == Scope.SINGLETON:
+                    key = self._get_cache_key(binding)
+                    instance = self._singleton_cache.get(key)
+                    if instance is not None:
+                        binding.disposer(instance)
+                continue
             if not isinstance(binding, ClassBinding):
-                continue  # providers have no lifecycle hooks
+                continue
             if binding.pre_destroy is None:
-                continue  # no @PreDestroy — skip
+                continue
 
             key = binding.implementation
             instance = self._singleton_cache.get(key)
             if instance is None:
-                continue  # never instantiated — skip
+                continue
 
             if binding.pre_destroy.is_async:
                 raise RuntimeError(
@@ -2268,6 +2786,16 @@ class DIContainer:
             await container.ashutdown()
         """
         for binding in self._bindings:
+            if isinstance(binding, ProviderBinding):
+                if binding.disposer is not None and binding.scope == Scope.SINGLETON:
+                    key = self._get_cache_key(binding)
+                    instance = self._singleton_cache.get(key)
+                    if instance is not None:
+                        if inspect.iscoroutinefunction(binding.disposer):
+                            await binding.disposer(instance)
+                        else:
+                            binding.disposer(instance)
+                continue
             if not isinstance(binding, ClassBinding):
                 continue
             if binding.pre_destroy is None:
@@ -2453,7 +2981,7 @@ class DIContainer:
     def _check_scope_violation(
         self,
         binding: ClassBinding,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> list[ScopeLeak]:
         """Inspect *binding*'s ``__init__`` parameters for scope leaks.
@@ -2925,6 +3453,8 @@ class DIContainer:
         ``@Provider``-decorated methods. ``vars()`` gives the raw unbound functions,
         which carry ``ProviderMetadata`` directly on their ``__dict__``.
 
+        Also wires ``@Disposes`` methods to their corresponding ``ProviderBinding``.
+
         Args:
             module_cls: The ``@Configuration`` class to inspect.
             instance:   The live module instance — getattr returns bound methods.
@@ -2933,13 +3463,47 @@ class DIContainer:
             None
         """
         for name, fn in vars(module_cls).items():
+            if name == "__init__":
+                continue
+            # Unwrap @property so that @Provider @property works naturally.
+            effective_fn = fn.fget if isinstance(fn, property) else fn
             if (
-                callable(fn)
-                and name != "__init__"
-                and _get_provider_metadata(fn) is not None
+                callable(effective_fn)
+                and _get_provider_metadata(effective_fn) is not None
             ):
-                # getattr returns a bound method — self is the live module instance.
-                self.provide(getattr(instance, name))
+                if isinstance(fn, property):
+                    # Wrap the property getter as a bound-method-like callable.
+                    # functools.wraps copies __module__, __globals__, __annotations__,
+                    # and __wrapped__ so that ProviderBinding can evaluate the
+                    # return-type annotation in the correct namespace.
+                    captured = fn
+                    bound_instance = instance
+
+                    @functools.wraps(effective_fn)
+                    def _prop_provider(prop=captured, obj=bound_instance) -> Any:
+                        return prop.fget(obj)
+
+                    # Copy provider metadata (stamped in __dict__ by @Provider)
+                    _prop_provider.__dict__.update(effective_fn.__dict__)
+                    self.provide(_prop_provider)
+                else:
+                    # getattr returns a bound method — self is the live module instance.
+                    self.provide(getattr(instance, name))
+
+        # Wire @Disposes teardown methods to their ProviderBinding
+        for name, fn in vars(module_cls).items():
+            if not callable(fn):
+                continue
+            disposes_marker = _get_disposes_marker(fn)
+            if disposes_marker is None:
+                continue
+            disposed_type = disposes_marker.disposed_type
+            for binding in self._bindings:
+                if isinstance(binding, ProviderBinding) and _interface_matches(
+                    binding.interface, disposed_type
+                ):
+                    binding.disposer = getattr(instance, name)
+                    break
 
     # ── Describe ──────────────────────────────────────────────────
 
@@ -2970,7 +3534,7 @@ class DIContainer:
         self,
         interface: type,
         *,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
         priority: int | None = None,
     ) -> AnyBinding:
         """Return the highest-priority binding for *interface* without instantiating it.
@@ -3014,7 +3578,7 @@ class DIContainer:
         self,
         interface: type,
         *,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
     ) -> list[AnyBinding]:
         """Return all registered bindings for *interface* without instantiating them.
 
@@ -3118,7 +3682,7 @@ class DIContainer:
         self,
         interface: Any,
         *,
-        qualifier: str | None = None,
+        qualifier: str | type | None = None,
     ) -> int:
         """Remove all bindings for *interface* and evict cached instances.
 
@@ -3259,6 +3823,11 @@ class DIContainer:
         new._validated = False
         # localns cache reset — built from _bindings, must reflect the copy's list
         new._localns_cache = None
+        # Copy runtime state introduced in v0.3.0
+        new._enabled_alternatives = set(self._enabled_alternatives)
+        new._interceptor_classes = list(self._interceptor_classes)
+        new._observers = {}  # observers are re-registered as instances are created
+        new._tracked_dependents = []
         return new
 
     # ── __repr__ (Feature 14) ─────────────────────────────────────

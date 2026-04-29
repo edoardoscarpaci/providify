@@ -91,9 +91,129 @@ class PrimaryDB(Database): ...
 
 | Argument | Type | Meaning |
 |----------|------|---------|
-| `qualifier` | `str` | Named qualifier — used to distinguish multiple bindings of the same type |
+| `qualifier` | `str \| type \| None` | Named or typed qualifier — used to distinguish multiple bindings of the same type |
 | `priority` | `int` | Higher number wins when multiple candidates match (default `0`) |
 | `inherited` | `bool` | Subclasses inherit this metadata via MRO walk (default `False`) |
+| `track` | `bool` | Track DEPENDENT instances for manual teardown via `flush_dependents()` (default `False`) |
+
+`ApplicationScoped` is an alias for `@Singleton` — provided for Jakarta CDI parity:
+
+```python
+from providify import ApplicationScoped
+
+@ApplicationScoped
+class UserCache: ...   # exactly equivalent to @Singleton
+```
+
+---
+
+## Typed qualifiers — @Qualifier and @Default
+
+### @Qualifier
+
+Define a **type** as a qualifier marker. The type itself (not a string) is used to filter bindings, giving you IDE completion, refactoring support, and no risk of typos.
+
+```python
+from providify import Component, Qualifier
+
+@Qualifier
+class Cloud: ...
+
+@Qualifier
+class OnPrem: ...
+
+@Component(qualifier=Cloud)
+class AwsNotifier(Notifier): ...
+
+@Component(qualifier=OnPrem)
+class SmtpNotifier(Notifier): ...
+
+# Resolve with the type, not a string
+cloud_svc = container.get(Notifier, qualifier=Cloud)
+onprem_svc = container.get(Notifier, qualifier=OnPrem)
+```
+
+Any class decorated with `@Qualifier` can be used in `qualifier=` on any scope decorator, `@Provider`, and `container.get()` / `container.aget()`.
+
+### @Default
+
+Mark a binding as the explicit default. `@Default`-qualified beans are returned on **unqualified** lookups — the same as no qualifier at all. This mirrors Jakarta CDI semantics and is useful for documentation clarity:
+
+```python
+from providify import Component, Default
+
+@Component(qualifier=Default)
+class EmailSender(Sender): ...   # returned by container.get(Sender) with no qualifier
+
+@Component(qualifier=Cloud)
+class AwsSender(Sender): ...     # only returned by container.get(Sender, qualifier=Cloud)
+```
+
+> **Semantics note**: In providify `qualifier=None` in `_filter()` means "no filter — return all qualifiers". `@Default` is normalised to `qualifier=None` before the filter runs, so `@Default`-marked beans are visible in unqualified lookups just like undecorated ones.
+
+---
+
+## @Alternative — deployment-time bean replacement
+
+`@Alternative` marks a bean that is **excluded from resolution by default**. Activate it explicitly per-container to replace the regular implementation — useful for mocks, staging overrides, and feature flags.
+
+```python
+from providify import Component, Alternative
+
+@Component
+class RealPaymentGateway(PaymentGateway): ...
+
+@Alternative
+@Component(priority=10)     # higher priority ensures it wins when enabled
+class MockPaymentGateway(PaymentGateway): ...
+```
+
+```python
+# Production container — MockPaymentGateway is invisible
+container.bind(PaymentGateway, RealPaymentGateway)
+
+# Test container — activate the mock
+container.bind(PaymentGateway, RealPaymentGateway)
+container.register(MockPaymentGateway)
+container.enable_alternative(MockPaymentGateway)
+
+gw = container.get(PaymentGateway)   # MockPaymentGateway ✅
+
+# Revert
+container.disable_alternative(MockPaymentGateway)
+gw = container.get(PaymentGateway)   # RealPaymentGateway ✅
+```
+
+> **Priority rule**: an `@Alternative` bean must have a **higher `priority`** than the non-alternative beans of the same type to win selection. At equal priority (both `0`) the first-registered binding wins. Set `priority > 0` on alternatives to guarantee they override.
+
+---
+
+## @Stereotype — reusable composed annotations
+
+`@Stereotype` bundles scope, qualifier, priority, and inherited into a single reusable decorator — the Python equivalent of Jakarta CDI `@Stereotype`.
+
+```python
+from providify import Stereotype, Singleton, Component
+from providify.metadata import Scope
+
+# Define the stereotype — reusable across the codebase
+DomainRepository = Stereotype(scope=Scope.SINGLETON, priority=1)
+ApplicationService = Stereotype(scope=Scope.SINGLETON, qualifier="app")
+
+# Apply it — identical to @Singleton(priority=1)
+@DomainRepository
+class UserRepository:
+    def find(self, id: int) -> User: ...
+
+@DomainRepository
+class OrderRepository:
+    def find(self, id: int) -> Order: ...
+
+# Explicit annotations always win over the stereotype defaults
+@Component(qualifier="test")    # scope and priority taken from stereotype; qualifier overridden
+@DomainRepository
+class TestRepository: ...
+```
 
 ---
 
@@ -142,10 +262,14 @@ container.install(MyModule)                # install a @Configuration module (se
 # ── Mutation ──────────────────────────────────────────────────────
 container.override(Interface, MockImpl)    # replace all bindings for Interface in-place (for tests)
 container.reset_binding(Interface)         # remove all bindings for Interface; returns count removed
+container.enable_alternative(MockImpl)     # activate an @Alternative bean for this container
+container.disable_alternative(MockImpl)    # deactivate an @Alternative bean
+container.add_interceptor(LoggingInterceptor)  # register an @Interceptor class
 
 # ── Sync resolution ───────────────────────────────────────────────
 svc  = container.get(Service)
-svc  = container.get(Service, qualifier="primary")
+svc  = container.get(Service, qualifier="primary")    # string qualifier
+svc  = container.get(Service, qualifier=Cloud)        # type qualifier (@Qualifier class)
 svc  = container.get(Service, priority=1)
 svcs = container.get_all(Service)          # all matching bindings, sorted by priority ascending
 
@@ -173,11 +297,21 @@ with DIContainer.scoped() as c:
 async with DIContainer.scoped() as c:
     await c.aget(Service)
 
+# ── Scope utilities ───────────────────────────────────────────────
+container.run_in_request(fn, *args, **kwargs)           # run fn inside a new request scope
+await container.arun_in_request(fn, *args, **kwargs)    # async version
+container.run_in_session("user-abc", fn, *args)         # run fn inside a named session scope
+await container.arun_in_session("user-abc", fn, *args)  # async version
+
+# ── DEPENDENT tracking ────────────────────────────────────────────
+container.flush_dependents()        # call @PreDestroy on all track=True DEPENDENT instances
+await container.aflush_dependents() # async version (context manager calls this automatically)
+
 # ── Instance lifecycle ────────────────────────────────────────────
-with container:                   # calls shutdown() on __exit__
+with container:                   # calls flush_dependents() + shutdown() on __exit__
     ...
 
-async with container:             # calls ashutdown() on __aexit__
+async with container:             # calls aflush_dependents() + ashutdown() on __aexit__
     ...
 ```
 
@@ -695,6 +829,64 @@ await container.ashutdown()  # async — awaits async @PreDestroy hooks
 Calling `shutdown()` when any cached singleton has an `async @PreDestroy` raises `RuntimeError` —
 use `ashutdown()` in that case.
 
+### @Disposes — provider teardown
+
+Define a teardown method for a `@Provider`-produced object inside a `@Configuration` module.
+`@Disposes` is the CDI equivalent of combining `@PreDestroy` with a factory-produced bean.
+
+```python
+from providify import Disposes, Provider, Configuration
+from providify.metadata import Scope
+
+class Connection:
+    def close(self) -> None: ...
+
+@Configuration
+class InfraModule:
+    @Provider(scope=Scope.SINGLETON)
+    def make_conn(self) -> Connection:
+        return Connection()
+
+    @Disposes(Connection)
+    def close_conn(self, conn: Connection) -> None:
+        conn.close()   # called by shutdown() — receives the cached instance
+
+container.install(InfraModule)
+conn = container.get(Connection)
+container.shutdown()   # close_conn(conn) is called here ✅
+```
+
+`@Disposes` is only triggered for **SINGLETON-scoped providers** that have a cached instance. DEPENDENT providers are not tracked and their disposers are never called.
+
+### DEPENDENT scope tracking — `track=True`
+
+DEPENDENT beans (`@Component`) are not owned by the container and normally receive no teardown. Opt in with `track=True` to have the container collect them and call their `@PreDestroy` hooks on demand:
+
+```python
+from providify import Component, PreDestroy
+
+@Component(track=True)
+class TempFile:
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    @PreDestroy
+    def cleanup(self) -> None:
+        os.remove(self.path)
+
+with container:
+    container.register(TempFile)
+    f = container.get(TempFile)
+    # __exit__ calls flush_dependents() automatically — cleanup() fires here ✅
+```
+
+Call manually when not using the context manager:
+
+```python
+container.flush_dependents()        # sync
+await container.aflush_dependents() # async
+```
+
 ---
 
 ## @Configuration modules
@@ -731,6 +923,29 @@ await container.ainstall(DatabaseModule)  # async — use when module deps need 
 ```
 
 All `@Provider` options (`qualifier=`, `priority=`, `singleton=`) work normally inside modules.
+
+### Field-level `@Provider` — `@property` pattern
+
+Combine `@property` with `@Provider` to declare a provider as a property on the module class. The return type annotation determines the registered interface — identical to a regular `@Provider` method but allows `self.config` syntax for accessing the produced value within the module:
+
+```python
+from providify import Provider, Configuration
+from providify.metadata import Scope as _Scope
+
+@Configuration
+class AppModule:
+    @property
+    @Provider
+    def config(self) -> AppConfig:
+        return AppConfig(dsn=os.environ["DATABASE_URL"])
+
+    @property
+    @Provider(scope=_Scope.SINGLETON)
+    def cache(self) -> Cache:
+        return Cache(url=os.environ["REDIS_URL"])
+```
+
+Both `@Provider` and `@Provider(scope=...)` work on properties. The inner `@Provider` must be the innermost decorator (closest to the function definition) and `@property` wraps it on the outside.
 
 ---
 
@@ -1069,6 +1284,235 @@ class B:
 
 ---
 
+## Interceptors — @Interceptor / @AroundInvoke
+
+Interceptors add cross-cutting behaviour (logging, transactions, metrics) to any bean without modifying its source code.
+
+### Define an interceptor binding
+
+`@InterceptorBinding` creates an annotation class that binds an interceptor to its targets:
+
+```python
+from providify import InterceptorBinding, Interceptor, AroundInvoke, InvocationContext
+
+@InterceptorBinding
+class Logged: ...       # use @Logged to mark targets
+
+@InterceptorBinding
+class Transactional: ...
+```
+
+### Implement the interceptor
+
+```python
+@Transactional
+@Interceptor
+class TxInterceptor:
+    @AroundInvoke
+    def around(self, ctx: InvocationContext) -> object:
+        print(f"BEGIN tx for {ctx.method.__name__}")
+        result = ctx.proceed()   # call the next interceptor or the real method
+        print("COMMIT tx")
+        return result
+```
+
+### Attach and activate
+
+```python
+@Transactional          # binds TxInterceptor to this bean
+@Singleton
+class OrderService:
+    def place_order(self, order: Order) -> None: ...
+
+container.register(OrderService)
+container.add_interceptor(TxInterceptor)
+
+svc = container.get(OrderService)
+svc.place_order(order)
+# Output:
+# BEGIN tx for place_order
+# COMMIT tx
+```
+
+### InvocationContext
+
+`ctx.proceed()` calls the next interceptor in the chain, or the real method if no more interceptors remain.
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `ctx.target` | `object` | The bean instance |
+| `ctx.method` | `Callable` | The method being intercepted |
+| `ctx.parameters` | `tuple` | Positional arguments |
+| `ctx.kwargs` | `dict` | Keyword arguments |
+| `ctx.proceed()` | `Any` | Continue the invocation chain |
+
+> **Note**: `isinstance(proxy, TargetClass)` returns `False` on the wrapped proxy. Use `type(proxy._target)` if you need the real class.
+
+---
+
+## @Decorator — interface delegation
+
+`@Decorator` stacks additional behaviour on top of an existing bean without replacing it. The decorator receives the original bean via `Delegate[T]` injection — identical to the Jakarta CDI `@Decorator` pattern.
+
+```python
+from providify import Decorator, Delegate, Component
+from typing import Annotated
+from providify.type import DelegateMeta
+
+class Notifier:
+    def send(self, msg: str) -> None: ...
+
+@Component
+class EmailNotifier(Notifier):
+    def send(self, msg: str) -> None:
+        print(f"email: {msg}")
+
+@Decorator
+@Component(priority=10)   # higher priority ensures this wraps EmailNotifier
+class LoggingNotifier(Notifier):
+    def __init__(self, delegate: Annotated[Notifier, DelegateMeta()]) -> None:
+        self._delegate = delegate   # receives EmailNotifier instance
+
+    def send(self, msg: str) -> None:
+        print(f"[LOG] sending: {msg}")
+        self._delegate.send(msg)   # delegate to inner bean
+
+container.bind(Notifier, EmailNotifier)
+container.register(LoggingNotifier)
+
+n = container.get(Notifier)
+n.send("hello")
+# [LOG] sending: hello
+# email: hello
+```
+
+Multiple decorators can be stacked — they are applied in ascending priority order (lowest first, outermost last).
+
+---
+
+## Event bus — Event[T] / @Observes
+
+Fire and observe typed events across beans without direct coupling.
+
+### Fire an event
+
+Inject `Event[T]` anywhere; call `.fire()` (or `await .afire()` for async):
+
+```python
+from providify import Component, Event
+from typing import Annotated
+from providify.type import EventMeta
+
+class UserRegistered:
+    def __init__(self, email: str) -> None:
+        self.email = email
+
+@Component
+class RegistrationService:
+    def __init__(self, user_event: Annotated[UserRegistered, EventMeta()]) -> None:
+        self._event = user_event   # EventProxy[UserRegistered]
+
+    def register(self, email: str) -> None:
+        # ... create user ...
+        self._event.fire(UserRegistered(email))     # sync
+        # await self._event.afire(UserRegistered(email))  # async
+```
+
+### Observe an event
+
+```python
+from providify import Singleton, Observes
+
+@Singleton
+class AuditLog:
+    @Observes(UserRegistered)
+    def on_user_registered(self, event: UserRegistered) -> None:
+        print(f"New user: {event.email}")
+
+    @Observes(UserRegistered)
+    async def async_on_registered(self, event: UserRegistered) -> None:
+        await self._db.insert(event.email)
+```
+
+Observers are registered automatically when the bean is first instantiated. They are held via **weak references** — if the observer bean is garbage-collected, it is silently removed from the dispatch list.
+
+> **Scope constraint**: observer beans should be SINGLETON, REQUEST, or SESSION scoped. DEPENDENT (`@Component`) observers may be GC'd before an event fires unless `track=True` is set.
+
+### EventProxy API
+
+| Method | Description |
+|--------|-------------|
+| `.fire(event)` | Dispatch synchronously to all registered observers |
+| `await .afire(event)` | Dispatch — awaits async observers, calls sync ones directly |
+
+Subtype events match supertype observers: if `AdminRegistered` extends `UserRegistered`, observers of `UserRegistered` will also receive `AdminRegistered` events.
+
+---
+
+## InjectionPoint — injection context metadata
+
+Inject an `InjectionPoint` to receive metadata about _where_ a dependency is being injected — useful for dynamic configuration like per-class loggers.
+
+```python
+from providify import Singleton, InjectionPoint, Provider
+from providify.decorator.module import Configuration
+import logging
+
+@Configuration
+class LoggingModule:
+    @Provider
+    def logger(self, ip: InjectionPoint) -> logging.Logger:
+        name = ip.declaring_class.__name__ if ip.declaring_class else "root"
+        return logging.getLogger(name)
+
+@Singleton
+class OrderService:
+    def __init__(self, log: logging.Logger) -> None:
+        # log is getLogger("OrderService") — set by the InjectionPoint
+        self._log = log
+```
+
+### InjectionPoint fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `declaring_class` | `type \| None` | The class being constructed at injection time (`None` for top-level calls) |
+| `param_name` | `str` | The parameter name at the injection site |
+| `qualifier` | `str \| type \| None` | The qualifier in effect at the injection site |
+| `annotation` | `Any` | The full type annotation of the parameter |
+
+---
+
+## NamedMeta — name-based qualifier at the injection site
+
+`NamedMeta` lets you specify a string qualifier directly in the type annotation — without having to pass it to `container.get()`. It is the injection-site dual of `@Named`:
+
+```python
+from typing import Annotated
+from providify import Component, Singleton
+from providify.type import NamedMeta
+
+@Component(qualifier="primary")
+class PrimaryDB(Database): ...
+
+@Component(qualifier="replica")
+class ReplicaDB(Database): ...
+
+@Singleton
+class ReportService:
+    def __init__(
+        self,
+        primary: Annotated[Database, NamedMeta("primary")],
+        replica: Annotated[Database, NamedMeta("replica")],
+    ) -> None:
+        self._primary = primary
+        self._replica = replica
+```
+
+`NamedMeta("x")` at the injection site is equivalent to `container.get(Database, qualifier="x")`.
+
+---
+
 ## Running tests
 
 ```bash
@@ -1099,6 +1543,20 @@ Tests are organised by feature — one file per subsystem:
 | `test_scanner.py` | `scan()`, recursive scan, ABC auto-binding, idempotency, `DIContainer(scan=...)` constructor |
 | `test_describe.py` | `BindingDescriptor`, `ClassBinding.describe()`, ASCII tree output |
 | `test_localns_cache.py` | `_build_localns()` caching and invalidation on `bind`/`register`/`provide` |
+| `test_qualifier.py` | `@Qualifier` marker, type qualifier in binding and `get()`, string qualifier backward compat |
+| `test_default.py` | `@Default` resolves same as no qualifier; `@Component(qualifier=Default)` visible on unqualified lookup |
+| `test_alternative.py` | `@Alternative` excluded by default; activated by `enable_alternative()`; reverted by `disable_alternative()` |
+| `test_stereotype.py` | `Stereotype(...)` applies scope/priority; explicit annotation wins over stereotype defaults |
+| `test_interceptor.py` | `@Interceptor` wraps method; `ctx.proceed()` calls original; chain ordering by registration |
+| `test_decorator_bean.py` | `@Decorator` wraps delegate; `DelegateMeta` receives inner implementation; multiple decorators stack |
+| `test_events.py` | `fire()` reaches `@Observes` observer; `afire()` awaits async observer; subtype event matching; dead-ref cleanup |
+| `test_injection_point.py` | `InjectionPoint` injected in constructor; `param_name` / `declaring_class` / `annotation` fields correct |
+| `test_disposes.py` | `@Disposes` called on singleton shutdown; not called when instance never instantiated |
+| `test_dependent_track.py` | `@PreDestroy` fires on `flush_dependents()`; context manager flushes on exit |
+| `test_named_meta.py` | `NamedMeta("x")` resolves same binding as `qualifier="x"` |
+| `test_field_provider.py` | `@property @Provider` registered at `install()` time; singleton property shares instance |
+| `test_application_scoped.py` | `@ApplicationScoped` is identical to `@Singleton` |
+| `test_run_in_scope.py` | `run_in_request` activates scope; `@RequestScoped` beans resolve; scope torn down after fn returns |
 
 ---
 
@@ -1221,6 +1679,6 @@ with container.request():
 | Decorator | Lifetime |
 |-----------|----------|
 | `@Component` | New instance on every `get()` |
-| `@Singleton` | One instance per container — shared for the container's lifetime |
+| `@Singleton` / `@ApplicationScoped` | One instance per container — shared for the container's lifetime |
 | `@RequestScoped` | One instance per `container.request()` block |
 | `@SessionScoped` | One instance per `container.session(id)` — survives across requests |

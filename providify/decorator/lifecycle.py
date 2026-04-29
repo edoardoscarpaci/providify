@@ -167,3 +167,116 @@ def PreDestroy(fn: F) -> F:
     """
     _set_lifecycle_marker(fn, PreDestroyMarker(fn))
     return fn  # ✅ return original function — no wrapping, no descriptor
+
+
+# ─────────────────────────────────────────────────────────────────
+#  @Disposes — provider teardown methods
+# ─────────────────────────────────────────────────────────────────
+
+_DISPOSES_ATTR = "__di_disposes__"
+_OBSERVES_ATTR = "__di_observes__"
+
+
+class DisposesMarker(LifecycleMarker):
+    """Marks a @Configuration method as the disposer for a provider-produced type."""
+
+    __slots__ = ("disposed_type",)
+
+    def __init__(self, fn: Callable[..., Any], disposed_type: type) -> None:
+        super().__init__(fn)
+        self.disposed_type = disposed_type
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = super().__getstate__()
+        state["disposed_type"] = self.disposed_type
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
+        object.__setattr__(self, "disposed_type", state["disposed_type"])
+
+
+class ObservesMarker(LifecycleMarker):
+    """Marks a method as an observer for a specific event type."""
+
+    __slots__ = ("event_type",)
+
+    def __init__(self, fn: Callable[..., Any], event_type: type) -> None:
+        super().__init__(fn)
+        self.event_type = event_type
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = super().__getstate__()
+        state["event_type"] = self.event_type
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
+        object.__setattr__(self, "event_type", state["event_type"])
+
+
+def _get_disposes_marker(fn: Callable[..., Any]) -> DisposesMarker | None:
+    d = getattr(fn, "__dict__", None)
+    if d is None:
+        return None
+    val = d.get(_DISPOSES_ATTR)
+    return val if isinstance(val, DisposesMarker) else None
+
+
+def _get_observes_marker(fn: Callable[..., Any]) -> ObservesMarker | None:
+    d = getattr(fn, "__dict__", None)
+    if d is None:
+        return None
+    val = d.get(_OBSERVES_ATTR)
+    return val if isinstance(val, ObservesMarker) else None
+
+
+def Disposes(disposed_type: type) -> Callable[[F], F]:
+    """
+    Marks a @Configuration method as the teardown handler for provider-produced instances.
+
+    Usage::
+
+        @Configuration
+        class MyModule:
+            @Provider
+            def produce_conn(self) -> Connection:
+                return Connection()
+
+            @Disposes(Connection)
+            def close_conn(self, conn: Connection) -> None:
+                conn.close()
+
+    Equivalent to Jakarta's @Disposes parameter annotation.
+    """
+
+    def decorator(fn: F) -> F:
+        fn.__dict__[_DISPOSES_ATTR] = DisposesMarker(fn, disposed_type)
+        return fn
+
+    return decorator
+
+
+def Observes(event_type: type) -> Callable[[F], F]:
+    """
+    Marks a method as an observer for events of the given type.
+
+    The method is called when an ``Event[T].fire(event)`` is invoked and
+    ``event`` is an instance of ``event_type`` (or a subclass).
+
+    Usage::
+
+        @Component
+        class AuditListener:
+            @Observes(UserCreatedEvent)
+            def on_user_created(self, event: UserCreatedEvent) -> None:
+                print(f"User created: {event.user_id}")
+
+    Equivalent to Jakarta's @Observes parameter annotation.
+    """
+
+    def decorator(fn: F) -> F:
+        fn.__dict__[_OBSERVES_ATTR] = ObservesMarker(fn, event_type)
+        return fn
+
+    return decorator

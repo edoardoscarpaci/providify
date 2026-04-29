@@ -49,7 +49,7 @@ class BindingDescriptor:
     interface: str
     implementation: str
     scope: Scope
-    qualifier: str | None = None
+    qualifier: str | type | None = None
     priority: int | None = None
     dependencies: tuple[BindingDescriptor, ...] = field(default_factory=tuple)
 
@@ -118,7 +118,12 @@ class BindingDescriptor:
             connector = "└── " if is_last else "├── "
 
         # ── Format the node label ─────────────────────────────────────────────
-        qualifier_str = f" ({self.qualifier})" if self.qualifier else ""
+        _q = (
+            getattr(self.qualifier, "__name__", str(self.qualifier))
+            if self.qualifier
+            else None
+        )
+        qualifier_str = f" ({_q})" if _q else ""
         priority_str = f"Priority({self.priority})" if self.priority else ""
         leak_flag = (
             "  ⚠️  SCOPE LEAK"
@@ -168,7 +173,11 @@ class BindingDescriptor:
             "interface": self.interface,
             "implementation": self.implementation,
             "scope": self.scope.name,
-            "qualifier": self.qualifier,
+            "qualifier": (
+                getattr(self.qualifier, "__qualname__", str(self.qualifier))
+                if self.qualifier
+                else None
+            ),
             "scope_leak": self.scope_leak,
             "priority": self.priority,
             "dependencies": [d.to_dict() for d in self.dependencies],
