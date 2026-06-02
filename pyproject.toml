@@ -1,12 +1,13 @@
-[tool.poetry]
+[project]
 name = "providify"
-version = "1.0.0a0"
+version = "1.0.0"
 description = "A Python dependency injection container inspired by Jakarta CDI and Spring. Supports sync and async resolution, multiple scopes, lifecycle hooks, and configuration modules."
-authors = ["edoardo.scarpaci <edoardo.scarpaci@gmail.com>"]
-license = "Apache-2.0"
+authors = [
+    {name = "edoardo.scarpaci", email = "edoardo.scarpaci@gmail.com"},
+]
+license = {text = "Apache-2.0"}
 readme = "README.md"
-repository = "https://github.com/edoardoscarpaci/providify"
-packages = [{ include = "providify" }]
+requires-python = ">=3.12"
 keywords = [
     "dependency injection",
     "di",
@@ -30,9 +31,35 @@ classifiers = [
     "Typing :: Typed",
 ]
 
-[tool.poetry.dependencies]
-python = ">=3.12"
+[project.urls]
+Repository = "https://github.com/edoardoscarpaci/providify"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.9.0",
+]
 
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["providify"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

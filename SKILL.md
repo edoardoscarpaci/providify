@@ -285,28 +285,36 @@ class Database:
 - `DEPENDENT` instances are never tracked by the container — `@PreDestroy` is never called on them.
 - Async `@PreDestroy` hooks on scoped (REQUEST/SESSION) instances are silently skipped if the scope exits via the **sync** `request()` / `session()` context manager. Use `arequest()` / `asession()` when async teardown is needed.
 
-### Configuration Modules (Spring-style)
+### Configuration Modules (grouping namespace for `@Provider` / `@Produces`)
+
+`@Provider` is providify's Jakarta CDI `@Produces`. Annotate classes you own with
+`@Component` / `@Singleton`; use `@Provider` only for types you can't annotate, and
+group related ones in a `@Configuration` class. It is **not** a Spring-style config
+bean reached for by default. See `PROVIDERS.md`. Provider parameters are injected —
+no `__init__` boilerplate needed:
 
 ```python
-from providify import Configuration, Provider, Inject
+from providify import Configuration, Provider
 
 @Configuration
 class InfraConfig:
-    def __init__(self, settings: Inject[Settings]) -> None:
-        self._settings = settings
-
     @Provider(singleton=True)
-    def database(self) -> Database:
-        return Database(self._settings.db_url)
+    def database(self, settings: Settings) -> Database:   # settings injected
+        return Database(settings.db_url)
 
     @Provider
-    def mailer(self) -> Mailer:
-        return SmtpMailer(self._settings.smtp_host)
+    def mailer(self, settings: Settings) -> Mailer:
+        return SmtpMailer(settings.smtp_host)
 
-# Install the config module:
+# scan() auto-installs @Configuration classes (deduped by identity):
+container.scan("myapp.infra")
+# …or install explicitly:
 container.install(InfraConfig)
-await container.ainstall(InfraConfig)
+await container.ainstall(InfraConfig)   # async-only constructor deps
 ```
+
+> Optional: inject a shared object once via `__init__(self, settings: Settings)` and
+> reach it through `self` when many providers need the same one.
 
 ---
 
@@ -525,6 +533,7 @@ container.scan("myapp", recursive=True)   # all submodules recursively
 **What the scanner does:**
 - Inspects all module members for DI metadata
 - Auto-binds to ABCs when a class implements abstract base classes
+- **Auto-installs `@Configuration` classes** (calls `install()` for each, deduped by class identity) — no separate `install()` call needed after scanning
 - Skips private members (prefixed `_`) and re-exports (imported from elsewhere)
 - Idempotent — safe to call multiple times on the same module
 

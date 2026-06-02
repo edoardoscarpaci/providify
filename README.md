@@ -219,7 +219,15 @@ class TestRepository: ...
 
 ## @Provider
 
-Register a factory function instead of a class. The return type determines the resolved interface.
+`@Provider` is providify's name for Jakarta CDI's **`@Produces`** — a typed factory
+function. The return type determines the resolved interface, and the function's own
+parameters are injected from the container.
+
+> **When to use it:** reach for `@Provider` only for types you *can't* annotate —
+> third-party/stdlib classes, interfaces chosen at runtime, or values needing
+> imperative construction. For classes you own, put `@Component` / `@Singleton`
+> directly on the class instead. See [PROVIDERS.md](PROVIDERS.md) for the full
+> decision rule.
 
 ```python
 from providify import Provider
@@ -891,9 +899,17 @@ await container.aflush_dependents() # async
 
 ## @Configuration modules
 
-Group related `@Provider` methods in a single class.
-**Spring-style**: the module's own `__init__` parameters are injected by the container at `install()` time,
-so providers can share config or other injected collaborators via `self`.
+A `@Configuration` class is an **optional namespace for grouping related `@Provider`
+methods** — the providify equivalent of a CDI bean that hosts several `@Produces`
+methods. It is *not* a Spring-style "config bean" you reach for by default.
+
+> **When to use it:** annotate the classes you own with `@Component` / `@Singleton`
+> directly — that is the default. Use `@Provider` (and group them in
+> `@Configuration`) only for types you can't annotate. See [PROVIDERS.md](PROVIDERS.md)
+> for the full decision rule and the Jakarta CDI mapping.
+
+Each `@Provider` method's parameters are injected from the container — no `__init__`
+boilerplate required:
 
 ```python
 from providify import Configuration
@@ -906,23 +922,41 @@ class AppConfig:
 
 @Configuration
 class DatabaseModule:
+    @Provider(singleton=True)
+    def connection_pool(self, config: AppConfig) -> ConnectionPool:
+        return ConnectionPool(config.db_url, size=config.pool_size)
+
+    @Provider
+    def user_repo(self, pool: ConnectionPool) -> UserRepository:
+        # `pool` is injected from the container → respects the singleton above.
+        return UserRepository(pool)
+
+container.register(AppConfig)
+container.scan("myapp.infra")             # auto-installs the @Configuration, or…
+container.install(DatabaseModule)         # …install it explicitly (sync)
+await container.ainstall(DatabaseModule)  # async — use when module deps need aget()
+```
+
+> ⚠️ Don't call a sibling producer directly (`self.connection_pool()`) — that bypasses
+> the container and re-runs the factory, defeating `singleton=` caching. Declare the
+> dependency as a parameter instead, as `user_repo` does above.
+
+All `@Provider` options (`qualifier=`, `priority=`, `singleton=`) work normally inside modules.
+
+**Optional — shared config via `__init__`:** if many providers need the *same* injected
+object, you can inject it once through the module's constructor (Spring-style) and reach
+it via `self`. The constructor's deps are resolved eagerly at install/scan time:
+
+```python
+@Configuration
+class DatabaseModule:
     def __init__(self, config: AppConfig) -> None:
-        self._config = config   # injected at install() time
+        self._config = config   # injected at install() / scan() time
 
     @Provider(singleton=True)
     def connection_pool(self) -> ConnectionPool:
         return ConnectionPool(self._config.db_url, size=self._config.pool_size)
-
-    @Provider
-    def user_repo(self) -> UserRepository:
-        return UserRepository(self._connection_pool())
-
-container.register(AppConfig)
-container.install(DatabaseModule)         # sync
-await container.ainstall(DatabaseModule)  # async — use when module deps need aget()
 ```
-
-All `@Provider` options (`qualifier=`, `priority=`, `singleton=`) work normally inside modules.
 
 ### Field-level `@Provider` — `@property` pattern
 
@@ -1007,7 +1041,7 @@ manually afterward to register additional modules.
 |-------------------------|---------------------------|
 | `@Component` / `@Singleton` / `@RequestScoped` / `@SessionScoped` | The class, bound to every abstract base class it implements; self-bound if it has none |
 | `@Provider` function | The function, equivalent to calling `container.provide(fn)` |
-| `@Configuration` class | **Not** picked up by `scan()` — use `container.install()` instead |
+| `@Configuration` class | Auto-installed via `container.install()` — deduplicated by class identity, so scanning twice is safe. (Calling `install()` yourself remains valid for the no-scan path.) |
 
 ### Abstract base class auto-binding
 
