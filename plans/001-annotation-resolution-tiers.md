@@ -538,29 +538,29 @@ Grep afterwards: `get_type_hints(` must appear in `providify/` only inside
 
 ### 7A — primitive + tests
 
-21. [ ] `tests/_annotations_no_future.py` — new helper module **without**
+21. [x] `tests/_annotations_no_future.py` — new helper module **without**
     `from __future__ import annotations`, exporting a class and a provider whose annotations are
     therefore real objects, plus `class AnnotatedBase` declaring `dep: Inject[Thing]` for the
     cross-module MRO test. Needed by Steps 25 and 33.
-22. [ ] `tests/test_per_param_annotations.py` — new file (same shape/docstring discipline as
+22. [x] `tests/test_per_param_annotations.py` — new file (same shape/docstring discipline as
     `tests/test_forward_ref_provider.py`), class `TestEvalAnnotationPrimitive`, failing first:
     `_eval_annotation` returns the identical object as `get_type_hints(...)[name]` for each of
     `"Inject[Foo]"`, `"Annotated[Foo, InjectMeta(qualifier='x')]"`, `"Foo | None"`,
     `"Optional[Foo]"`, `"Live[Foo | None]"` (asserting `optional is True` on the marker),
     `"list[Foo]"`, `"InjectInstances[Foo]"`, `"ClassVar[Inject[Foo]]"`, `"Repository[User]"`
     (PEP-695 alias), `"'Foo'"` (nested quoted ref), and a non-str annotation object (pass-through).
-23. [ ] `providify/_annotations.py` — new module. Implement `_eval_annotation`,
+23. [x] `providify/_annotations.py` — new module. Implement `_eval_annotation`,
     `_raw_annotations(target)` (`inspect.get_annotations(..., eval_str=False)` + `inspect.unwrap`),
     and `_annotation_namespaces(target, localns)` (the globalns table in 7.1, incl.
     `__type_params__` seeding). Full docstrings incl. `Edge cases`.
-24. [ ] `tests/test_per_param_annotations.py::TestNamespaceSelection` —
+24. [x] `tests/test_per_param_annotations.py::TestNamespaceSelection` —
     `cls.__init__` slot wrapper (class with no explicit `__init__`) → no crash, empty result;
     `functools.wraps`-decorated provider → annotations read from the unwrapped function;
     generic `class Repository[T]` method annotated `T` → resolves via `__type_params__`.
 
 ### 7B — the resolvers
 
-25. [ ] `tests/test_per_param_annotations.py::TestPerParamIsolation` — the headline behaviour,
+25. [x] `tests/test_per_param_annotations.py::TestPerParamIsolation` — the headline behaviour,
     all no-monkeypatch, all using function-local (hence unresolvable) types:
     - `test_unresolvable_defaulted_param_does_not_break_sibling_sync` — provider with
       `(dep: Inject[Tracer], junk: LocalOnly | None = None)` → `dep` **is** injected.
@@ -573,7 +573,7 @@ Grep afterwards: `get_type_hints(` must appear in `providify/` only inside
       `good` is set on the instance, `junk` is not, no exception. Sync + async.
     - `test_no_future_annotations_module_still_works` — same via `tests/_annotations_no_future.py`
       (real annotation objects, step-1 branch).
-26. [ ] `tests/test_per_param_annotations.py::TestInjectionPointFailuresRaise`:
+26. [x] `tests/test_per_param_annotations.py::TestInjectionPointFailuresRaise`:
     - `test_marked_injection_point_with_default_raises` — `store: Inject[LocalOnly] = None` →
       `AnnotationResolutionError`; message contains `store` **and** `LocalOnly`. (This is the case
       the `has_default` tie-break alone would wrongly skip — it proves the AST sniff is load-bearing.)
@@ -588,36 +588,36 @@ Grep afterwards: `get_type_hints(` must appear in `providify/` only inside
       `dep: ClassVar[Inject[LocalOnly]]` → raises at construction.
     - `test_renamed_alias_import_is_still_detected` — `from providify import Inject as I`;
       `dep: I[LocalOnly]` with a default → raises via the textual last resort.
-27. [ ] `tests/test_per_param_annotations.py::TestNonInjectionPointsAreSilent`:
+27. [x] `tests/test_per_param_annotations.py::TestNonInjectionPointsAreSilent`:
     - `test_unresolvable_defaulted_param_emits_no_warning` — `caplog` at WARNING for
       `providify.container` and `providify._annotations` is **empty**. ("Nothing left to configure"
       — no warning, not just no exception.)
     - `test_type_checking_only_import_on_defaulted_param_works` — the canonical downstream shape.
     - `test_plain_unresolvable_class_var_is_skipped_silently`.
-28. [ ] `providify/_annotations.py` — implement `_sniff_injection_marker(raw, globalns, localns)`
+28. [x] `providify/_annotations.py` — implement `_sniff_injection_marker(raw, globalns, localns)`
     returning `Literal["inject", "not-inject", "unknown"]` per 7.2 (AST head walk; for `Annotated`,
     evaluate only the metadata args; identity-check alias singletons from `providify.type`;
     textual last resort behind an explicit `allow_textual: bool` argument so the parameter path can
     disable it). Docstring must state that this runs **only** after a `NameError`.
-29. [ ] `providify/_annotations.py` — implement
+29. [x] `providify/_annotations.py` — implement
     `resolve_params(target, owner_name, globalns, localns) -> dict[str, Any]`: iterate
     `inspect.signature(inspect.unwrap(target)).parameters`, skip `self`/`cls`, skip
     `*args`/`**kwargs` (`VAR_POSITIONAL`/`VAR_KEYWORD` — they are never injection points), skip
     unannotated params, run `resolve_one` per parameter, pass `has_default =
     param.default is not inspect.Parameter.empty`. Never contains `"return"`.
-30. [ ] `providify/_annotations.py` — implement
+30. [x] `providify/_annotations.py` — implement
     `resolve_class_annotations(cls, localns) -> dict[str, Any]`: walk `reversed(cls.__mro__)`
     skipping `object`, `_raw_annotations(klass)` per class, globalns from **each defining class's**
     module, later (more derived) classes override earlier ones — mirroring `get_type_hints`' order.
     Ambiguity → skip; `allow_textual=True`.
-31. [ ] `providify/container.py` — add `_resolve_params(target, owner_name)` and
+31. [x] `providify/container.py` — add `_resolve_params(target, owner_name)` and
     `_resolve_class_annotations(cls)` thin methods: consult `self._hints_cache`, delegate to
     `providify._annotations`, store, return `dict(...)` copy. Full docstrings incl. the
     thread-safety rationale from 7.4.
 
 ### 7C — cache
 
-32. [ ] `tests/test_per_param_annotations.py::TestHintsCache`:
+32. [x] `tests/test_per_param_annotations.py::TestHintsCache`:
     - `test_second_resolution_is_cached` — count `_eval_annotation` calls via monkeypatch; second
       `container.get(X)` performs zero further evals.
     - `test_binding_mutation_invalidates_cache` — resolve a class whose param type is not yet bound
@@ -628,7 +628,7 @@ Grep afterwards: `get_type_hints(` must appear in `providify/` only inside
     - `test_returned_dict_is_a_copy` — mutate the returned dict, resolve again, result unchanged.
     - `test_concurrent_resolution_is_consistent` — 8 threads × `container.get(X)`; all succeed and
       return equivalent hints (`ThreadPoolExecutor`, assert no exception).
-33. [ ] `providify/container.py:376` — add `self._hints_cache: dict[Any, dict[str, Any]] = {}`.
+33. [x] `providify/container.py:376` — add `self._hints_cache: dict[Any, dict[str, Any]] = {}`.
     Add `_invalidate_type_caches()` and replace the six `_localns_cache = None` sites
     (`container.py:587`, `:626`, `:642`, `:3805`, `:3881`, `scanner.py:211`) with a call to it.
     `container.py:3881` is `copy`/`child`-container construction — verify the clone gets its own
@@ -636,29 +636,29 @@ Grep afterwards: `get_type_hints(` must appear in `providify/` only inside
 
 ### 7D — migration & removal
 
-34. [ ] `tests/test_per_param_annotations.py::TestParityWithGetTypeHints` — table-driven parity
+34. [x] `tests/test_per_param_annotations.py::TestParityWithGetTypeHints` — table-driven parity
     guard: for ~12 fully-resolvable module-level shapes (bare type, `Inject[T]`, `Annotated` with
     qualifier/priority/optional, `T | None`, `list[T]`, `InjectInstances[T]`, `Lazy[T]`, `Live[T]`,
     `Instance[T]`, `Repository[User]`, quoted `"T"`, inherited class var), assert
     `container._resolve_params(fn, "x") == {k: v for k, v in get_type_hints(fn, include_extras=True, localns=container._build_localns()).items() if k != "return"}`.
     This is the "Phase 7 changes no resolvable outcome" contract from *Non-goals*.
-35. [ ] `providify/container.py` — switch every call site in the 7.5 table. Delete the now-dead
+35. [x] `providify/container.py` — switch every call site in the 7.5 table. Delete the now-dead
     `hints.pop("return", None)` lines (`:1757`, `:1816`, `:1883`, `:3078`, `:3199`) and the
     `if not hints: return` guards that assumed whole-signature failure.
-36. [ ] `providify/container.py` — **delete `_resolve_hints_or_warn`** and fold
+36. [x] `providify/container.py` — **delete `_resolve_hints_or_warn`** and fold
     `_resolve_hints_or_raise` into the two resolvers. Extend `AnnotationResolutionError.__init__`
     with `param_name: str | None = None` and include it in the message when present. Verify with
     `grep -n "get_type_hints(" providify/` → only `providify/_annotations.py`.
-37. [ ] `tests/test_annotation_resolution.py` — rewrite the release-A tolerance tests that this
+37. [x] `tests/test_annotation_resolution.py` — rewrite the release-A tolerance tests that this
     phase invalidates: `TestClassVarInjectionHintFailure::test_unresolvable_name_is_tolerated_and_logged_sync`
     / `_async` become *raise* tests for a marked class var and *silent-skip* tests for an unmarked
     one. Keep the `AttributeError`-propagates tests as-is (still true).
-38. [ ] `tests/test_forward_ref_provider.py:371` `test_unresolvable_name_is_tolerated_but_logged` —
+38. [x] `tests/test_forward_ref_provider.py:371` `test_unresolvable_name_is_tolerated_but_logged` —
     the blanket `get_type_hints` monkeypatch is meaningless once resolution is per-parameter.
     Replace with the per-param equivalent: a defaulted, genuinely unresolvable parameter resolves
     silently; a marked one raises. Keep the rest of the file untouched — it is the regression suite
     this whole plan descends from.
-39. [ ] `CHANGELOG.md` — new release-B section:
+39. [x] `CHANGELOG.md` — new release-B section:
     **Changed**: annotations are now resolved per parameter / per class attribute; an unresolvable
     annotation on a parameter that is not an injection point (a `TYPE_CHECKING`-only import, a
     defaulted local type) no longer affects anything — this removes most of the
@@ -668,7 +668,7 @@ Grep afterwards: `get_type_hints(` must appear in `providify/` only inside
     (which silently injected nothing) and the misleading
     `TypeError: missing N required positional arguments`.
     **Removed**: internal `NameError` tolerance (`_resolve_hints_or_warn`).
-40. [ ] Docs — update `docs/agents/injection-cheatsheet.md` and `docs/agents/anti-patterns.md`:
+40. [x] Docs — update `docs/agents/injection-cheatsheet.md` and `docs/agents/anti-patterns.md`:
     the rule is now "annotate injection points with types that exist at runtime; a defaulted,
     non-injected parameter may reference anything". Remove any guidance that recommends working
     around whole-signature hint loss.

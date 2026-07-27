@@ -5,11 +5,14 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import (
     TYPE_CHECKING,
+    Annotated,
     Any,
     TypeAlias,
+    get_args,
     get_origin,
 )
 
+from ._annotations import _annotation_namespaces, _eval_annotation, _raw_annotations
 from .decorator.lifecycle import _find_post_construct, _find_pre_destroy
 from .descriptor import BindingDescriptor
 from .exceptions import (
@@ -330,64 +333,85 @@ class ClassBinding(Binding):
 #  Return-annotation resolution helper
 # ─────────────────────────────────────────────────────────────────
 
-# A quoted forward reference nests exactly one extra level per pair of quotes.
-# Two rounds cover every realistic form ("Foo" and '"Foo"'); the bound exists
-# purely so a pathological annotation cannot loop forever.
-_MAX_FORWARD_REF_DEPTH = 3
 
+def _resolve_return_annotation(annotation: Any, fn: Callable[..., Any]) -> Any:
+    """Evaluate a provider's return annotation **in isolation** and validate it.
 
-def _resolve_return_annotation(annotation: str, fn: Callable[..., Any]) -> Any:
-    """Evaluate a string return annotation against *fn*'s module globals.
+    A provider binding needs exactly one thing from *fn*'s annotations: the
+    return type, which becomes the binding's interface. Resolving it through
+    the per-annotation primitive (rather than a whole-signature
+    ``get_type_hints(fn)``) means a parameter whose type is unresolvable at
+    registration time — a ``TYPE_CHECKING``-only import, a function-local
+    class — cannot affect it. Parameter types are resolved later and lazily,
+    by the container's ``_resolve_params``, against ``_build_localns()``.
 
     Args:
-        annotation: The raw string annotation taken from ``fn.__annotations__``.
-        fn:         The provider function — its ``__globals__`` is the namespace
-                    the annotation is evaluated in.
+        annotation: The raw, unevaluated return annotation from
+                    ``inspect.get_annotations(fn, eval_str=False)``. A ``str``
+                    under PEP-563 (``from __future__ import annotations``),
+                    a real object otherwise.
+        fn:         The provider function. Supplies the globals namespace the
+                    annotation is evaluated against, via
+                    ``_annotation_namespaces`` (which also seeds any PEP-695
+                    ``__type_params__``).
 
     Returns:
-        The resolved type (or parameterised generic alias) the annotation names.
+        The resolved type, or a parameterised generic alias such as
+        ``Repository[User]``. ``Annotated[X, ...]`` is unwrapped to ``X``.
 
     Raises:
-        TypeError: If the annotation cannot be resolved to a type, naming both
-            the provider and the offending annotation.
+        TypeError: If the annotation cannot be evaluated (naming the provider,
+            the annotation, and the fix), or if it evaluates to something that
+            is not a type.
 
     Edge cases:
-        - Quoted forward reference (``-> "Foo"``): under PEP-563 the annotation
-          stringifies to the *literal* ``"'Foo'"``, so a single ``eval`` yields
-          the ``str`` ``'Foo'`` rather than the class. We therefore re-evaluate
-          while the result is still a string.
-        - Unresolvable name (e.g. a class defined inside a function, or one
-          imported only under ``TYPE_CHECKING``) → ``TypeError``.
+        - Quoted forward reference (``-> "Foo"``) and nested refs inside a
+          generic (``-> Repository["User"]``) → handled by ``get_type_hints``
+          inside ``_eval_annotation``; no manual re-evaluation loop needed.
+        - Non-``str`` annotation (module without PEP-563) → passed through
+          unchanged by ``_eval_annotation``, then validated identically.
+        - Unresolvable name (function-local or ``TYPE_CHECKING``-only class)
+          → ``TypeError``.
+        - ``-> Annotated[Foo, ...]`` → unwrapped to ``Foo``, matching the
+          ``include_extras=False`` behaviour callers relied on before.
     """
-    # WHY: a binding interface must be a type. Registering the unresolved
-    # ``str`` instead — which the previous ``eval``-once code silently did —
+    # WHY: a binding interface must be a type. Registering an unresolved
+    # ``str`` instead — which the original ``eval``-once code silently did —
     # corrupts every container path that reads ``interface.__name__`` and
     # surfaces as an unrelated failure at resolution time (see
     # tests/test_forward_ref_provider.py). Fail here, where we can name the
     # provider and the annotation.
-    globalns: dict[str, Any] = getattr(fn, "__globals__", {})
-    value: Any = annotation
+    #
+    # DESIGN: no container is available at registration time, so localns is
+    # empty — only *fn*'s own module globals are in scope. That is exactly
+    # the namespace the previous implementation used; the interface type must
+    # be importable at module level regardless, since bindings outlive the
+    # frame that declared them.
+    globalns, localns = _annotation_namespaces(fn, {})
 
-    for _ in range(_MAX_FORWARD_REF_DEPTH):
-        try:
-            # eval is safe here: the input is an annotation written in the
-            # provider's own source file, never external data.
-            value = eval(value, globalns)  # type: ignore[arg-type]
-        except Exception as exc:
-            raise TypeError(
-                f"Provider '{fn.__name__}' declares an unresolvable return type "
-                f"annotation {annotation!r}. Make the type importable at module "
-                f"level (a TYPE_CHECKING-only or function-local class cannot be "
-                f"resolved at runtime)."
-            ) from exc
+    # `get_type_hints` normalises a bare `None` annotation to `NoneType`; the
+    # holder trick in `_eval_annotation` only sees strings, so replicate that
+    # one conversion here for modules that do not use PEP-563.
+    if annotation is None:
+        return type(None)
 
-        if not isinstance(value, str):
-            break
-    else:
+    try:
+        value = _eval_annotation(annotation, globalns, localns)
+    except Exception as exc:
         raise TypeError(
-            f"Provider '{fn.__name__}' declares a return type annotation "
-            f"{annotation!r} that is nested too deeply to resolve."
-        )
+            f"Provider '{fn.__name__}' declares an unresolvable return type "
+            f"annotation {annotation!r}. Make the type importable at module "
+            f"level (a TYPE_CHECKING-only or function-local class cannot be "
+            f"resolved at runtime)."
+        ) from exc
+
+    # `_eval_annotation` always passes include_extras=True (the container's
+    # parameter paths depend on the markers surviving). A return annotation
+    # has no use for them — the qualifier comes from @Provider(qualifier=...),
+    # never from the return type — so strip the wrapper to keep the interface
+    # identical to what the whole-signature call used to produce.
+    if get_origin(value) is Annotated:
+        value = get_args(value)[0]
 
     # Concrete types and parameterised generic aliases (Repository[User], whose
     # get_origin is the generic class) are both legal interfaces; anything else
@@ -451,42 +475,34 @@ class ProviderBinding(Binding):
                 (e.g. a quoted forward reference to a function-local or
                 ``TYPE_CHECKING``-only class).
         """
-        from typing import get_type_hints
-
         meta: ProviderMetadata | None = _get_provider_metadata(fn)
         if meta is None:
             raise ProviderBindingNotDecoratedError(fn)
 
-        try:
-            # Happy path: all annotations are resolvable from fn.__globals__.
-            # Works when every annotated type is defined at module level.
-            hints = get_type_hints(fn)
-            interface = hints.get("return")
-        except Exception:
-            # PEP-563 (from __future__ import annotations) makes ALL annotations
-            # lazy strings. get_type_hints() evaluates them against fn.__globals__,
-            # but locally-defined PARAMETER types (defined inside test functions,
-            # lambdas, etc.) are absent from __globals__, causing NameError for
-            # the entire call — even when the return type itself IS resolvable.
-            #
-            # Fallback: evaluate just the return annotation directly. Parameter
-            # types are resolved later in _collect_kwargs_sync() via _build_localns(),
-            # so we only need the return type here.
-            ret = fn.__annotations__.get("return")
-            if isinstance(ret, type):
-                # Already a type object — PEP-563 not active in the caller's module.
-                interface = ret
-            elif isinstance(ret, str):
-                # String annotation — evaluate against fn's own globals only.
-                # Raises with a clear message when the name is unresolvable.
-                interface = _resolve_return_annotation(ret, fn)
-            else:
-                interface = ret  # None or unexpected — TypeError raised below
-
-        if interface is None:
+        # DESIGN: read the RAW return annotation and evaluate only it.
+        #
+        # ✅ A parameter whose type is unresolvable at registration time (a
+        #    TYPE_CHECKING-only import, a class defined inside a test function)
+        #    can no longer prevent the provider from being registered — the
+        #    whole-signature get_type_hints(fn) it replaces was all-or-nothing,
+        #    which is exactly why this method needed a try/except fallback.
+        # ✅ One resolution path instead of two, so the happy path and the
+        #    fallback can no longer disagree about what the interface is.
+        # ❌ Parameter annotations are no longer validated at registration;
+        #    they surface at resolution instead. That is deliberate and matches
+        #    the container: parameters resolve against _build_localns(), which
+        #    does not exist yet here, so registration-time validation of them
+        #    was never trustworthy anyway.
+        raw_annotations = _raw_annotations(fn)
+        # Membership test, not `.get(...) is None`: `def p() -> None` in a module
+        # WITHOUT PEP-563 yields the literal object `None` as its annotation, which
+        # is a *declared* return type (get_type_hints normalises it to NoneType) and
+        # must not be confused with "no return annotation at all".
+        if "return" not in raw_annotations:
             raise TypeError(
                 f"Provider '{fn.__name__}' must declare a return type hint."
             )
+        interface = _resolve_return_annotation(raw_annotations["return"], fn)
 
         self.interface = interface
         self.fn = fn

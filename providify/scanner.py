@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import logging
 import importlib
 import inspect
+import logging
 import pkgutil
 from abc import ABC, abstractmethod
 from types import ModuleType
@@ -10,9 +10,9 @@ from typing import TYPE_CHECKING, Any, Generic, get_origin
 
 from .binding import ClassBinding, ProviderBinding
 from .metadata import (
+    _has_configuration_module,
     _has_own_metadata,
     _has_provider_metadata,
-    _has_configuration_module,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -206,9 +206,13 @@ class DefaultContainerScanner(ContainerScanner):
             # No abstract base — self-bind so the class can be resolved directly
             bindings.append(ClassBinding(cls, cls))
 
-        # Invalidate the localns cache — bindings were appended directly without
-        # going through bind()/register() which would have reset it themselves.
-        self._container._localns_cache = None
+        # Invalidate the type-hint caches — bindings were appended directly
+        # without going through bind()/register(), which would have reset
+        # them themselves. Goes through the container's own invalidation
+        # method (rather than poking `_localns_cache` directly) so this site
+        # automatically picks up any future cache the method is extended to
+        # clear — see `DIContainer._invalidate_type_caches`.
+        self._container._invalidate_type_caches()
         self._container._validated = False
 
     def _autoregister_provider(self, fn: Any) -> None:

@@ -34,16 +34,45 @@ going to be used FOR:
 These tests pin the CURRENT (pre-fix) behaviour where the plan calls for one,
 and describe the TARGET behaviour (currently absent, hence red) everywhere
 else. Each test's docstring says which side of that line it is on.
+
+Plan 001 Phase 7 (per-parameter resolution) update: the Tier 1 / Tier 2
+distinction this module documents above no longer exists as a MECHANISM —
+`_inject_class_vars_sync/async` and the validators
+(`_collect_class_var_hints` / `_check_scope_violation` /
+`_check_provider_scope_violation`) all now delegate to the SAME resolver
+(`DIContainer._resolve_params` / `_resolve_class_annotations`), which always
+raises `AnnotationResolutionError` for a resolution failure that IS (or
+plausibly is) an injection point, and silently skips one that ISN'T —
+regardless of which caller asked. The POLICY difference documented above
+(Tier 1 tolerates `NameError`, Tier 2 never does) is superseded: Phase 7
+tolerates far less, more precisely (per-parameter, not per-signature), and
+raises the SAME exception type everywhere. Consequently:
+  - `_boom_for` no longer intercepts `providify.container.get_type_hints`
+    (nothing in `container.py` calls it any more — every evaluation happens
+    inside `providify._annotations._eval_annotation`, one annotation at a
+    time, via a disposable holder class that never receives the ORIGINAL
+    target object). It now matches on the target's own RAW (unevaluated)
+    annotation strings instead — see its docstring.
+  - The two `test_unexpected_hint_error_propagates_*` tests now expect
+    `AnnotationResolutionError` (chained via `__cause__`) rather than a raw,
+    unwrapped `AttributeError` — uniform wrapping is the point of merging
+    Tier 1 and Tier 2 into one resolver.
+  - `test_unresolvable_name_is_tolerated_and_logged_*` are replaced (Step 37)
+    with a raise variant (marked class var) and a silent-skip variant
+    (unmarked class var) — the "tolerated and logged" middle ground Phase 7
+    removes entirely.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 
 import pytest
 
 from providify.container import DIContainer
 from providify.decorator.scope import Component, Provider, Singleton
+from providify.exceptions import AnnotationResolutionError
 from providify.type import Inject
 
 # ─────────────────────────────────────────────────────────────────
@@ -77,46 +106,72 @@ class Impl:
 
 
 def _boom_for(monkeypatch: pytest.MonkeyPatch, target: object, exc: Exception) -> None:
-    """Make ``get_type_hints`` raise *exc* for *target* only, real behaviour otherwise.
+    """Make annotation evaluation raise *exc* for *target*'s own annotations only.
 
-    Selectivity is required: a blanket boom fires in ``_collect_kwargs_sync``
-    (which receives ``cls.__init__``) before the class-var path (which
-    receives the class object itself) is ever reached. Targeting the exact
-    object under test isolates the tier under test from every other
-    ``get_type_hints`` call the container makes along the way.
+    Plan 001 Phase 7 (per-parameter resolution) replaced the whole-signature
+    ``get_type_hints(target, ...)`` call this helper used to intercept with a
+    per-annotation evaluator (``providify._annotations._eval_annotation``)
+    that never receives *target* itself — each annotation is evaluated in
+    isolation against a disposable holder class (plan §7.1). Selectivity
+    instead matches on *target*'s own RAW (unevaluated) annotation strings:
+    only an ``_eval_annotation`` call whose ``raw`` argument is one of
+    *target*'s own annotations is boomed; every other evaluation — including
+    another binding's, which may be resolved during the SAME ``get()`` /
+    ``validate_bindings()`` call — proceeds through the real function
+    unaffected.
+
+    Patches THREE name bindings, not one:
+      - ``providify._annotations._eval_annotation`` — looked up by
+        ``resolve_params``/``resolve_class_annotations``/``_resolve_one``,
+        which live in (and call the bare name from) that module.
+      - ``providify.container._eval_annotation`` — that module does ``from
+        ._annotations import _eval_annotation`` and therefore holds its OWN
+        copy of the reference (e.g. inside ``_get_provider_return_type``) —
+        rebinding the origin module's attribute alone would not affect an
+        already-imported copy elsewhere.
+      - ``providify._annotations.eval`` (the builtin, shadowed at module
+        scope) — the bootstrap classifier (``_sniff_head``) does its OWN,
+        independent ``eval(name, ...)`` call to resolve a marker HEAD name
+        when ``_eval_annotation`` has already failed with a ``NameError``.
+        If the boomed name is otherwise genuinely resolvable (e.g. a
+        module-level class, as `Dep` is here), that SECOND call would
+        succeed unboomed and reclassify the annotation as "not an injection
+        point" — silently skipping it instead of raising. Shadowing ``eval``
+        too makes the simulated failure consistent everywhere the name is
+        (re-)evaluated, matching what an ACTUALLY unresolvable name does in
+        production (where both calls are the same failure, not two
+        independent ones).
     """
+    import builtins
+
+    import providify._annotations as annotations_module
     import providify.container as container_module
 
-    real = container_module.get_type_hints
+    raw_annotations = set(inspect.get_annotations(target, eval_str=False).values())
+    real_eval_annotation = annotations_module._eval_annotation
+    real_eval = builtins.eval
 
-    def fake(t: object, *args: object, **kwargs: object) -> dict[str, object]:
-        if t is target:
+    def fake_eval_annotation(raw: object, globalns: object, localns: object) -> object:
+        if raw in raw_annotations:
             raise exc
-        return real(t, *args, **kwargs)
+        return real_eval_annotation(raw, globalns, localns)
 
-    monkeypatch.setattr(container_module, "get_type_hints", fake)
+    def fake_eval(source: object, *args: object, **kwargs: object) -> object:
+        if source in raw_annotations:
+            raise exc
+        return real_eval(source, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(annotations_module, "_eval_annotation", fake_eval_annotation)
+    monkeypatch.setattr(container_module, "_eval_annotation", fake_eval_annotation)
+    monkeypatch.setattr(annotations_module, "eval", fake_eval, raising=False)
 
 
-def _pre_validate(container: DIContainer) -> None:
-    """Run ``validate_bindings()`` to completion (unboomed) and mark it done.
-
-    WHY this exists — do not delete as "redundant": ``get()``/``aget()`` call
-    ``validate_bindings()`` themselves on their first invocation
-    (``container.py:799-801``), which walks EVERY registered binding, not
-    just the one under test. If a test installs a ``_boom_for`` patch and
-    THEN calls ``container.get(Target)`` on a fresh (never-validated)
-    container, that implicit validation runs Tier 2 (the now-strict
-    ``_check_scope_violation`` / ``_collect_class_var_hints``) against the
-    SAME boomed target *before* the Tier-1/Tier-3 code the test actually
-    wants to exercise ever runs — so the boom is intercepted by the wrong
-    tier and the test observes Tier 2's behaviour instead of Tier 1's.
-    Running validation to completion here, before the boom is installed,
-    isolates the tier under test. ``validate_bindings()`` itself does not
-    set ``_validated`` (only ``get()``/``aget()``/``get_all()``/``aget_all()``
-    do, after calling it) so it must be set explicitly afterwards.
-    """
-    container.validate_bindings()
-    container._validated = True
+# NOTE: release A's `_pre_validate` helper (which ran `validate_bindings()`
+# to completion, unboomed, before installing a boom — isolating "Tier 1" from
+# "Tier 2") is deleted. Phase 7 merges both into ONE resolver sharing ONE
+# cache (`_hints_cache`) per target, so there is no longer a tier to isolate
+# from — pre-validating first would simply cache the (unboomed) result
+# before the boom is installed, making the boom a no-op either way.
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -136,22 +191,27 @@ class TestClassVarInjectionHintFailure:
     ) -> None:
         """A non-NameError failure must not be swallowed into a silent no-op.
 
-        Today: `_inject_class_vars_sync` catches bare ``Exception`` and sets
-        ``hints = {}`` — the AttributeError below is currently swallowed and
-        the instance is returned with ``var`` unset. Target: it propagates.
+        Phase 7: `_resolve_class_annotations` wraps ANY non-``NameError``
+        failure in `AnnotationResolutionError` (never a bare, unwrapped
+        exception) — the original cause is still inspectable via
+        ``__cause__``, so it is provably "not swallowed" without asserting
+        on the exact exception TYPE release A propagated raw.
+
+        No `_pre_validate` here (unlike release A): Phase 7 shares ONE cache
+        (`_hints_cache`) between the injection and validation call sites for
+        the SAME class — pre-validating first would cache Consumer's
+        (unboomed) class-var hints before the boom is installed below, and
+        the boom would then never fire.
         """
         container.register(Consumer)
         container.bind(Dep, Dep)
-        _pre_validate(container)  # isolate Tier 1 — see _pre_validate docstring
 
-        _boom_for(
-            monkeypatch,
-            Consumer,
-            AttributeError("'str' object has no attribute '__name__'"),
-        )
+        boom = AttributeError("'str' object has no attribute '__name__'")
+        _boom_for(monkeypatch, Consumer, boom)
 
-        with pytest.raises(AttributeError, match="__name__"):
+        with pytest.raises(AnnotationResolutionError) as exc_info:
             container.get(Consumer)
+        assert exc_info.value.__cause__ is boom
 
     async def test_unexpected_hint_error_propagates_async(
         self, container: DIContainer, monkeypatch: pytest.MonkeyPatch
@@ -159,33 +219,26 @@ class TestClassVarInjectionHintFailure:
         """Async mirror of the propagation guarantee."""
         container.register(Consumer)
         container.bind(Dep, Dep)
-        _pre_validate(container)  # isolate Tier 1 — see _pre_validate docstring
 
-        _boom_for(
-            monkeypatch,
-            Consumer,
-            AttributeError("'str' object has no attribute '__name__'"),
-        )
+        boom = AttributeError("'str' object has no attribute '__name__'")
+        _boom_for(monkeypatch, Consumer, boom)
 
-        with pytest.raises(AttributeError, match="__name__"):
+        with pytest.raises(AnnotationResolutionError) as exc_info:
             await container.aget(Consumer)
+        assert exc_info.value.__cause__ is boom
 
-    def test_unresolvable_name_is_tolerated_and_logged_sync(
-        self,
-        container: DIContainer,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
+    def test_unresolvable_marked_class_var_raises_sync(
+        self, container: DIContainer, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The legitimate case (unresolvable local annotation) stays non-fatal.
+        """Phase 7 replacement (Step 37) for the old "tolerated and logged" test.
 
-        Target: construction succeeds, a WARNING names the class, and the
-        class var is left unset (documents the tolerated gap that Phase 7
-        closes by resolving per-attribute instead of all-or-nothing —
-        rewritten in Step 37).
+        `var: Inject[Dep]` carries a providify marker — an unresolvable name
+        on it is unambiguously an injection point, so it now RAISES rather
+        than being tolerated-and-logged. The tolerated middle ground release
+        A occupied (silently unset class var, warning only) is gone.
         """
         container.register(Consumer)
         container.bind(Dep, Dep)
-        _pre_validate(container)  # isolate Tier 1 — see _pre_validate docstring
 
         _boom_for(
             monkeypatch,
@@ -193,23 +246,16 @@ class TestClassVarInjectionHintFailure:
             NameError("name 'LocallyDefined' is not defined"),
         )
 
-        with caplog.at_level(logging.WARNING, logger="providify.container"):
-            instance = container.get(Consumer)
+        with pytest.raises(AnnotationResolutionError) as exc_info:
+            container.get(Consumer)
+        assert "var" in str(exc_info.value)
 
-        assert isinstance(instance, Consumer)
-        assert hasattr(instance, "dep") is False
-        assert any("Consumer" in record.message for record in caplog.records)
-
-    async def test_unresolvable_name_is_tolerated_and_logged_async(
-        self,
-        container: DIContainer,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
+    async def test_unresolvable_marked_class_var_raises_async(
+        self, container: DIContainer, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Async mirror of the tolerated-and-logged case."""
+        """Async mirror of the marked-class-var-raises case."""
         container.register(Consumer)
         container.bind(Dep, Dep)
-        _pre_validate(container)  # isolate Tier 1 — see _pre_validate docstring
 
         _boom_for(
             monkeypatch,
@@ -217,12 +263,56 @@ class TestClassVarInjectionHintFailure:
             NameError("name 'LocallyDefined' is not defined"),
         )
 
-        with caplog.at_level(logging.WARNING, logger="providify.container"):
-            instance = await container.aget(Consumer)
+        with pytest.raises(AnnotationResolutionError) as exc_info:
+            await container.aget(Consumer)
+        assert "var" in str(exc_info.value)
 
-        assert isinstance(instance, Consumer)
-        assert hasattr(instance, "dep") is False
-        assert any("Consumer" in record.message for record in caplog.records)
+    def test_unresolvable_unmarked_class_var_skips_silently_sync(
+        self, container: DIContainer, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The other half of Step 37: an UNMARKED, unresolvable class var is a non-event.
+
+        No monkeypatch needed — `junk` genuinely cannot resolve (function-
+        local type, absent from every namespace). Nothing to configure, so
+        nothing warns and nothing raises.
+        """
+
+        class LocallyDefined:
+            """Function-local — genuinely unresolvable, and NOT a providify marker."""
+
+        @Component
+        class PlainConsumer:
+            junk: LocallyDefined
+
+        container.register(PlainConsumer)
+
+        with caplog.at_level(logging.WARNING, logger="providify.container"):
+            instance = container.get(PlainConsumer)
+
+        assert isinstance(instance, PlainConsumer)
+        assert hasattr(instance, "junk") is False
+        assert caplog.records == []
+
+    async def test_unresolvable_unmarked_class_var_skips_silently_async(
+        self, container: DIContainer, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Async mirror of the unmarked-class-var-skips-silently case."""
+
+        class LocallyDefined:
+            """Function-local — genuinely unresolvable, and NOT a providify marker."""
+
+        @Component
+        class PlainConsumer:
+            junk: LocallyDefined
+
+        container.register(PlainConsumer)
+
+        with caplog.at_level(logging.WARNING, logger="providify.container"):
+            instance = await container.aget(PlainConsumer)
+
+        assert isinstance(instance, PlainConsumer)
+        assert hasattr(instance, "junk") is False
+        assert caplog.records == []
 
     def test_class_var_injection_still_works_sync(self, container: DIContainer) -> None:
         """Positive control, no monkeypatch — the ordinary case must keep working."""
@@ -266,10 +356,19 @@ class TestValidatorNeverSilentlyPasses:
         Today: `_check_scope_violation` catches bare ``Exception`` and
         returns ``[]`` — the binding validates as if it had no dependencies
         at all. Target: raises `AnnotationResolutionError` naming ``Impl``.
+
+        Deliberately NOT bound: the bootstrap classifier's ambiguous-name
+        branch (plan §7.2 step 4c) re-attempts resolving the bare name
+        itself while sniffing — if ``Dep`` were bound, that second,
+        UNBOOMED attempt would succeed (it only patches
+        ``_eval_annotation``, not a second independent ``eval`` used for
+        classification) and the annotation would be classified "not an
+        injection point" and silently skipped instead of raising. Leaving
+        it unbound makes the simulated failure genuine everywhere it is
+        (re-)attempted, matching what an ACTUALLY unresolvable name does.
         """
         from providify import AnnotationResolutionError
 
-        container.bind(Dep, Dep)
         container.register(Impl)
 
         _boom_for(
@@ -306,10 +405,12 @@ class TestValidatorNeverSilentlyPasses:
     def test_provider_hint_failure_fails_validation(
         self, container: DIContainer, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A singleton ``@Provider`` whose params can't be read must not validate clean."""
-        from providify import AnnotationResolutionError
+        """A singleton ``@Provider`` whose params can't be read must not validate clean.
 
-        container.bind(Dep, Dep)
+        ``Dep`` deliberately NOT bound — see
+        ``test_class_init_hint_failure_fails_validation`` for why.
+        """
+        from providify import AnnotationResolutionError
 
         @Provider(singleton=True)
         def make_impl(dep: Dep) -> Impl:
@@ -355,8 +456,11 @@ class TestValidatorNeverSilentlyPasses:
     def test_validate_all_reports_annotation_failure_as_violation(
         self, container: DIContainer, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """`validate_all()` must surface the failure as a violation string, never swallow it."""
-        container.bind(Dep, Dep)
+        """`validate_all()` must surface the failure as a violation string, never swallow it.
+
+        ``Dep`` deliberately NOT bound — see
+        ``test_class_init_hint_failure_fails_validation`` for why.
+        """
         container.register(Impl)
 
         _boom_for(
@@ -454,8 +558,11 @@ class TestOptionalEnrichmentWarns:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """`_collect_dependencies` must log a WARNING when it swallows a hint failure."""
-        container.bind(Dep, Dep)
+        """`_collect_dependencies` must log a WARNING when it swallows a hint failure.
+
+        ``Dep`` deliberately NOT bound — see
+        ``test_class_init_hint_failure_fails_validation`` for why.
+        """
 
         def make_impl(dep: Dep) -> Impl:
             return Impl(dep)

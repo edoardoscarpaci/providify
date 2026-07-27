@@ -126,6 +126,36 @@ form, which is equivalent and preferred.
 
 ---
 
+## 11. Annotating an injection point with a type that doesn't exist at runtime
+
+```python
+if TYPE_CHECKING:
+    from .internal import Tracer
+
+@Singleton
+class Worker:
+    def __init__(self, dep: Inject[Tracer]) -> None: ...   # ❌ Tracer unresolvable
+```
+
+**Why wrong:** annotations are resolved per parameter, but a parameter carrying an
+`Inject[T]` / `Lazy[T]` / `Live[T]` / `Instance[T]` / `InjectInstances[T]` marker (or
+a `ClassVar` wrapping one) IS an injection point — the container must be able to
+evaluate its type at runtime to know what to construct.
+**Fix:** import the annotated type at runtime instead of guarding it behind
+`TYPE_CHECKING`, or move a function-local type to module level.
+**Symptom:** `AnnotationResolutionError` naming the exact parameter, at construction
+or the first `get()`/`aget()`/`validate_bindings()` call.
+
+**Not an anti-pattern any more:** a *defaulted, non-injected* parameter (no
+providify marker) may reference anything, including a `TYPE_CHECKING`-only import —
+the container resolves each annotation independently, so an unresolvable one on a
+parameter nobody injects never affects any other parameter on the same signature.
+There is no need to import a type at runtime, or restructure a signature, just to
+protect an unrelated sibling parameter — that whole-signature hint loss no longer
+happens.
+
+---
+
 ## Quick self-check before finishing
 
 - [ ] Every class I own is decorated, not wrapped in a needless `@Provider`.
@@ -135,3 +165,6 @@ form, which is equivalent and preferred.
 - [ ] Narrow-into-wide scope injections use `Live[T]` / `Instance[T]`.
 - [ ] Async graphs resolved with `aget()`; proxies use matching `.get`/`.aget`.
 - [ ] Container used as a context manager so teardown runs.
+- [ ] Every actual injection point (`Inject[T]`/`Lazy[T]`/`Live[T]`/`Instance[T]`/
+      `InjectInstances[T]`, or a `ClassVar` wrapping one) annotates a type that
+      exists at runtime — not a `TYPE_CHECKING`-only import.

@@ -154,19 +154,38 @@ class AnnotationResolutionError(ValidationError):
     crash that bypasses the normal "collect every violation" flow, and never
     as a false "you're fine".
 
+    Phase 7 (per-parameter resolution) narrows the failure to a single
+    parameter or class attribute rather than an entire signature — ``param_name``
+    carries that extra precision when known, so the message can say exactly
+    *which* injection point could not be resolved instead of naming only the
+    owning class/function.
+
     Attributes:
         owner_name: Human-readable name of the binding/class/function whose
             annotations could not be resolved (e.g. ``"Impl.__init__"`` or
             ``"@Provider(make_impl)"``).
         cause: The original exception raised by ``get_type_hints()`` (e.g.
             ``NameError``, ``AttributeError``) — chained via ``__cause__``.
+        param_name: The specific parameter or class attribute that could not
+            be resolved, when resolution is per-parameter (``None`` when the
+            failure is whole-signature, e.g. release A's validators).
     """
 
-    def __init__(self, owner_name: str, cause: Exception) -> None:
+    def __init__(
+        self,
+        owner_name: str,
+        cause: Exception,
+        param_name: str | None = None,
+    ) -> None:
         self.owner_name = owner_name
         self.cause = cause
+        self.param_name = param_name
+        # WHY a conditional clause instead of always interpolating param_name:
+        # release A call sites (whole-signature validators) never pass it, and
+        # "for parameter 'None'" in every message would be actively misleading.
+        located_at = f" parameter '{param_name}'" if param_name is not None else ""
         super().__init__(
-            f"Cannot resolve type hints for '{owner_name}' "
+            f"Cannot resolve type hints for '{owner_name}'{located_at} "
             f"({type(cause).__name__}: {cause}). Scope-leak validation cannot "
             f"run for it, so the container refuses to start rather than "
             f"report a clean bill of health it cannot prove.\n"

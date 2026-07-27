@@ -184,4 +184,12 @@ class Database:
 | `ProviderBindingNotDecoratedError` | `provide()` on an undecorated function |
 | `TypeError` from `@Named` | use `@Named(name="x")`, not bare/positional |
 | `TypeError` naming a `@Provider` and its return annotation | the return type (even quoted, e.g. `-> "Foo"`) can't be resolved to a real type — `Foo` is `TYPE_CHECKING`-only or defined inside a function; import it at module level instead |
-| `AnnotationResolutionError` | scope-leak validation couldn't read a binding's `__init__`/provider/class-var annotations (`get_type_hints()` raised, e.g. `NameError`) — the container refuses to report a clean bill of health it can't prove. Import the annotated type at runtime instead of under `TYPE_CHECKING`, or move locally-defined types to module level |
+| `AnnotationResolutionError` | an annotation on an actual injection point (`Inject[T]`, `Lazy[T]`, `Live[T]`, `Instance[T]`, `InjectInstances[T]`, or a `ClassVar` wrapping one of those) couldn't be evaluated at runtime, naming the exact parameter or attribute — either at resolution time (`get()`/`aget()`, construction) or during scope-leak validation. Import the annotated type at runtime instead of under `TYPE_CHECKING`, or move locally-defined types to module level |
+
+**The rule for annotations that aren't injection points:** a defaulted, non-injected
+parameter (no `Inject[T]`/`Lazy[T]`/`Live[T]`/etc. marker) may reference any type —
+even one that doesn't exist at runtime (`TYPE_CHECKING`-only import, a type local to
+another function). The container resolves each annotation independently, so an
+unresolvable one on a parameter nobody injects never affects anything else on the
+same signature: no warning, nothing to configure. Only annotate **actual injection
+points** with types that exist at runtime.

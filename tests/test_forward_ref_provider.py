@@ -27,6 +27,7 @@ Injection for all OTHER bindings must be unaffected either way.
 
 from __future__ import annotations
 
+import inspect
 import logging
 
 import pytest
@@ -34,6 +35,8 @@ import pytest
 from providify.binding import ProviderBinding
 from providify.container import DIContainer
 from providify.decorator.scope import Provider
+from providify.exceptions import AnnotationResolutionError
+from providify.type import Inject
 
 # ─────────────────────────────────────────────────────────────────
 #  Module-level domain types
@@ -344,29 +347,77 @@ def _pre_validate(container: DIContainer) -> None:
 
 
 def _boom_for(monkeypatch: pytest.MonkeyPatch, target: object, exc: Exception) -> None:
-    """Make ``get_type_hints`` raise *exc* for *target* only, real behaviour otherwise.
+    """Make annotation evaluation raise *exc* for *target*'s own annotations only.
 
-    A blanket monkeypatch (patching every ``get_type_hints`` call
-    unconditionally) is too broad here: it also fires inside Tier 2's
-    validators for bindings that aren't the one under test, making the test
-    observe validation failures instead of the injection-tier behaviour it
-    means to exercise. Mirrors ``tests/test_annotation_resolution.py``'s
-    helper of the same name.
+    Plan 001 Phase 7 (per-parameter resolution) replaced the whole-signature
+    ``get_type_hints(target, ...)`` call this helper used to intercept with a
+    per-annotation evaluator (``providify._annotations._eval_annotation``)
+    that never receives *target* itself as an argument — each annotation is
+    evaluated in isolation against a disposable holder class (plan §7.1), so
+    an identity check against *target* can no longer select "this call, not
+    that one". Selectivity instead matches on *target*'s own RAW (unevaluated)
+    annotation strings: only an ``_eval_annotation`` call whose ``raw``
+    argument is one of *target*'s own annotations is boomed; every other
+    evaluation — including another binding's annotations, which Tier 2's
+    validators would otherwise also resolve during the same ``get()`` call —
+    proceeds through the real function unaffected.
+
+    Patches THREE name bindings: ``providify._annotations._eval_annotation``
+    (looked up by ``resolve_params``/``_resolve_one``, defined in that
+    module); ``providify.container._eval_annotation`` (that module does
+    ``from ._annotations import _eval_annotation`` and holds its own copy of
+    the reference, used e.g. by ``_get_provider_return_type`` — rebinding
+    the origin module's attribute alone would not affect that
+    already-imported copy); and ``providify._annotations.eval`` (the
+    builtin, shadowed at module scope — the bootstrap classifier does its
+    OWN, independent ``eval(name, ...)`` to resolve a marker HEAD name after
+    ``_eval_annotation`` has already failed; if the boomed name is otherwise
+    genuinely resolvable, that second call would succeed unboomed and
+    reclassify the annotation as "not an injection point" instead of
+    raising).
     """
+    import builtins
+
+    import providify._annotations as annotations_module
     import providify.container as container_module
 
-    real = container_module.get_type_hints
+    raw_annotations = set(inspect.get_annotations(target, eval_str=False).values())
+    real_eval_annotation = annotations_module._eval_annotation
+    real_eval = builtins.eval
 
-    def fake(t: object, *args: object, **kwargs: object) -> dict[str, object]:
-        if t is target:
+    def fake_eval_annotation(raw: object, globalns: object, localns: object) -> object:
+        if raw in raw_annotations:
             raise exc
-        return real(t, *args, **kwargs)
+        return real_eval_annotation(raw, globalns, localns)
 
-    monkeypatch.setattr(container_module, "get_type_hints", fake)
+    def fake_eval(source: object, *args: object, **kwargs: object) -> object:
+        if source in raw_annotations:
+            raise exc
+        return real_eval(source, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(annotations_module, "_eval_annotation", fake_eval_annotation)
+    monkeypatch.setattr(container_module, "_eval_annotation", fake_eval_annotation)
+    monkeypatch.setattr(annotations_module, "eval", fake_eval, raising=False)
 
 
 class TestHintFailureIsNotSilent:
-    """A container-wide loss of injection must be loud, never silent."""
+    """A single unresolvable annotation must be loud (if it's an injection
+    point) or silent-but-harmless (if it isn't) — never a swallowed,
+    container-wide loss of injection.
+
+    Phase 7 replaced the whole-signature ``get_type_hints`` call these tests
+    used to intercept with per-parameter resolution (see ``_boom_for``'s
+    docstring for the mechanical consequence) and, more fundamentally,
+    replaced release A's Tier-1/Tier-2 split with ONE resolver that always
+    raises ``AnnotationResolutionError`` (never a bare, unwrapped exception)
+    when a parameter cannot be evaluated — see
+    ``providify._annotations._resolve_one``. The two propagation tests below
+    are updated for that uniform wrapping (the original exception is still
+    inspectable via ``__cause__``, never silently lost); the "tolerated"
+    test is replaced entirely with the per-parameter equivalent (no monkeypatch
+    needed — a genuinely unresolvable, non-injected annotation just never
+    raises in the first place under Phase 7).
+    """
 
     def test_regression_unexpected_hint_error_propagates_sync(
         self, container: DIContainer, monkeypatch: pytest.MonkeyPatch
@@ -374,8 +425,9 @@ class TestHintFailureIsNotSilent:
         """User reports: an AttributeError inside hint resolution vanished.
 
         Correct behaviour: anything other than an unresolvable-name failure is
-        a genuine bug and must propagate — swallowing it turns a precise error
-        into a bogus "missing required positional arguments" three layers away.
+        a genuine bug and must propagate (chained, never swallowed) —
+        swallowing it turns a precise error into a bogus "missing required
+        positional arguments" three layers away.
         """
 
         @Provider(singleton=True)
@@ -388,16 +440,18 @@ class TestHintFailureIsNotSilent:
 
         container.provide(tracer_provider)
         container.provide(otel_configuration)
-        _pre_validate(container)  # isolate Tier 1 — see _pre_validate docstring
+        # No _pre_validate here: Phase 7 shares ONE cache (`_hints_cache`)
+        # between every resolution tier — pre-validating first would cache
+        # otel_configuration's (unboomed) hints before the boom is even
+        # installed below, and the boom would then never fire. There is no
+        # longer a Tier 1/Tier 2 distinction to isolate for this target.
 
-        _boom_for(
-            monkeypatch,
-            otel_configuration,
-            AttributeError("'str' object has no attribute '__name__'"),
-        )
+        boom = AttributeError("'str' object has no attribute '__name__'")
+        _boom_for(monkeypatch, otel_configuration, boom)
 
-        with pytest.raises(AttributeError, match="__name__"):
+        with pytest.raises(AnnotationResolutionError) as exc_info:
             container.get(OtelConfiguration)
+        assert exc_info.value.__cause__ is boom
 
     async def test_regression_unexpected_hint_error_propagates_async(
         self, container: DIContainer, monkeypatch: pytest.MonkeyPatch
@@ -414,43 +468,68 @@ class TestHintFailureIsNotSilent:
 
         container.provide(tracer_provider)
         container.provide(otel_configuration)
-        _pre_validate(container)  # isolate Tier 1 — see _pre_validate docstring
+        # See the sync test above for why _pre_validate is intentionally
+        # omitted here — Phase 7's shared per-target cache means installing
+        # the boom AFTER validation would never fire.
 
-        _boom_for(
-            monkeypatch,
-            otel_configuration,
-            AttributeError("'str' object has no attribute '__name__'"),
-        )
+        boom = AttributeError("'str' object has no attribute '__name__'")
+        _boom_for(monkeypatch, otel_configuration, boom)
 
-        with pytest.raises(AttributeError, match="__name__"):
+        with pytest.raises(AnnotationResolutionError) as exc_info:
             await container.aget(OtelConfiguration)
+        assert exc_info.value.__cause__ is boom
 
-    def test_unresolvable_name_is_tolerated_but_logged(
+    def test_unresolvable_defaulted_param_resolves_silently(
         self,
         container: DIContainer,
-        monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """The legitimate case (unresolvable local annotation) stays non-fatal.
+        """A defaulted, non-injected, genuinely unresolvable parameter is a non-event.
 
-        It must still leave a trace: a silent loss of every injected kwarg is
-        undebuggable from the resulting TypeError.
+        Per-parameter equivalent of the old
+        ``test_unresolvable_name_is_tolerated_but_logged`` (Plan 001 Step 38):
+        no monkeypatch is needed — the parameter below is unresolvable for
+        real (``LocallyDefined`` is a function-local class absent from both
+        ``__globals__`` and the container's ``localns``). Nothing warns,
+        nothing raises: Phase 7 removes the false positive entirely rather
+        than tolerating-and-logging it.
         """
 
+        class LocallyDefined:
+            """Function-local — genuinely absent from every namespace searched."""
+
         @Provider(singleton=True)
-        def tracer_provider(unbound: object | None = None) -> TracerProvider:
+        def tracer_provider(unbound: LocallyDefined | None = None) -> TracerProvider:
             return TracerProvider()
 
         container.provide(tracer_provider)
         _pre_validate(container)  # isolate Tier 1 — see _pre_validate docstring
 
-        _boom_for(
-            monkeypatch,
-            tracer_provider,
-            NameError("name 'LocallyDefined' is not defined"),
-        )
-
         with caplog.at_level(logging.WARNING, logger="providify.container"):
             assert isinstance(container.get(TracerProvider), TracerProvider)
+        assert caplog.records == []
 
-        assert any("tracer_provider" in record.message for record in caplog.records)
+    def test_unresolvable_marked_param_raises(self, container: DIContainer) -> None:
+        """The SAME shape, but marked with `Inject[...]` — now it must raise.
+
+        Contrasts directly with the silent-skip case above: an unresolvable
+        annotation is only ever a problem when it IS an injection point.
+        """
+
+        class LocallyDefined:
+            """Function-local — genuinely absent from every namespace searched."""
+
+        @Provider(singleton=True)
+        def tracer_provider(dep: Inject[LocallyDefined] = None) -> TracerProvider:  # type: ignore[assignment]
+            return TracerProvider()
+
+        container.provide(tracer_provider)
+        # No _pre_validate here — a marked, unresolvable injection point is a
+        # real failure at EVERY tier, so it is expected to raise as soon as
+        # get()'s implicit validate_bindings() reaches this binding, not only
+        # deep inside constructor/provider resolution.
+
+        with pytest.raises(AnnotationResolutionError) as exc_info:
+            container.get(TracerProvider)
+        assert "dep" in str(exc_info.value)
+        assert "LocallyDefined" in str(exc_info.value)

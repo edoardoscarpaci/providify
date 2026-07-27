@@ -9,6 +9,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.2.0
 
+### Changed
+
+#### Annotations are now resolved per parameter / per class attribute
+- Every constructor parameter, `@Provider` parameter, and class-level annotation is
+  now evaluated **individually** instead of resolving the entire signature in one
+  `get_type_hints()` call. An unresolvable annotation on a parameter or attribute
+  that is **not** an injection point (a `TYPE_CHECKING`-only import, a defaulted
+  local type) no longer has any effect at all — no warning, nothing to configure.
+  This removes most of the `AnnotationResolutionError` failures introduced by the
+  scope-leak-validation change below, which promised exactly this: "the next
+  release removes most of these failures — an unresolvable annotation on a
+  parameter that is not an injection point will stop being fatal at all."
+
+#### ⚠️ An unresolvable annotation on an actual injection point now raises, naming the parameter
+- If a parameter or class attribute IS (or plausibly is) an injection point —
+  annotated `Inject[T]`, `Lazy[T]`, `Live[T]`, `Instance[T]`, `InjectInstances[T]`,
+  or a `ClassVar` wrapping one of those — and its annotation cannot be evaluated,
+  the container now raises `AnnotationResolutionError` naming the exact parameter
+  and the unresolvable name. This replaces two previous outcomes:
+  - the old warning-and-skip, which silently injected nothing and left the
+    instance half-constructed with no error at all;
+  - the misleading `TypeError: missing N required positional arguments` that
+    surfaced when a whole-signature resolution failure wiped out every
+    parameter's hints, not just the unresolvable one.
+  Migration: import the annotated type at runtime instead of guarding it behind
+  `TYPE_CHECKING`, or move locally-defined types to module level — same fix as
+  before, now scoped to only the injection points that actually need it.
+- `AnnotationResolutionError` gained an optional `param_name` attribute, set
+  whenever the failure can be attributed to one parameter or class attribute
+  rather than an entire signature.
+
+### Fixed
+
+#### A self-referential singleton deadlocked instead of raising
+- `container.get()` / `aget()` hung **forever** when a `SINGLETON`-scoped binding
+  resolved back to itself during its own construction. Both singleton paths hold a
+  non-reentrant per-key lock (`threading.Lock` / `asyncio.Lock`) across
+  `create()` / `acreate()`, and cycle detection runs *inside* that call — so the
+  re-entrant resolution blocked on a lock its own thread/task already held, before
+  any cycle could be detected. It now raises `CircularDependencyError`, matching
+  what the `DEPENDENT` path already did.
+  The easiest way to hit this was a parameter annotated with a bare `object` (or
+  `object | None`): `object` is a supertype of every registered interface, so it
+  matches every binding — including the one being created. Any self-referential
+  singleton reached the same lock, though.
+  Affects sync and async, class bindings and `@Provider` bindings alike.
+
+#### Provider registration no longer fails on an unrelated parameter
+- `ProviderBinding.__init__` resolved a provider's return type with a
+  whole-signature `get_type_hints(fn)`, so a `@Provider` with a `TYPE_CHECKING`-only
+  or function-local **parameter** annotation could fail to register even when its
+  return annotation was perfectly resolvable — it relied on a broad `except` and a
+  hand-rolled `eval` fallback to paper over this. The return annotation is now
+  evaluated on its own, so parameter annotations cannot affect registration.
+  Resolved types are unchanged; `Annotated[T, ...]` returns still yield `T`, and a
+  missing return annotation still raises `TypeError`.
+
+### Removed
+
+- Internal `NameError` tolerance in the injection path (`_resolve_hints_or_warn`
+  and its whole-signature warn-and-skip behaviour) — replaced by per-parameter
+  resolution above. Not a public API; no caller-visible removal beyond the
+  behaviour change described above.
+
 ### Added
 
 #### Container mutation & introspection

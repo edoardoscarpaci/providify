@@ -19,9 +19,14 @@ from typing import (
     Union,
     get_args,
     get_origin,
-    get_type_hints,
 )
 
+from ._annotations import (
+    _annotation_namespaces,
+    _eval_annotation,
+    resolve_class_annotations,
+    resolve_params,
+)
 from .binding import AnyBinding, ClassBinding, ProviderBinding
 from .decorator.interceptor import (
     _get_around_invoke_method,
@@ -55,6 +60,7 @@ from .resolution import (
     _current_stack,
     _format_cycle,
     _resolution_stack,
+    _singleton_in_progress,
 )
 from .scanner import ContainerScanner, DefaultContainerScanner
 from .scope import ScopeContext
@@ -288,8 +294,10 @@ class DIContainer:
           ``super().__init__(arg)`` call the developer writes — the same dep
           could be resolved twice, producing two separate instances.
 
-        * **Class-level annotations** — ``get_type_hints(cls)`` walks the full
-          MRO, so ``var: Inject[T]`` annotations declared on a parent class are
+        * **Class-level annotations** — :meth:`_resolve_class_annotations`
+          (Phase 7's per-attribute replacement for a single
+          ``get_type_hints(cls)`` call) walks the full MRO, so
+          ``var: Inject[T]`` annotations declared on a parent class are
           inherited and injected on every subclass instance automatically.  This
           is the right extension point for shared deps that all subclasses need.
     """
@@ -301,6 +309,17 @@ class DIContainer:
     _async_lock: ClassVar[asyncio.Lock | None] = (
         None  # created lazily — needs event loop
     )
+
+    # Exposed as a class attribute so callers (and tests) that already have
+    # a resolved `Annotated[...]` hint in hand can classify its union shape
+    # without needing a container instance — e.g. asserting that
+    # `Live[Foo | None]`'s underlying union carries `optional=True`.
+    # `optional` is a property of the *evaluated hint object*, never stamped
+    # onto the marker itself (`LiveMeta`/`InjectMeta` have no `optional`
+    # field to stamp for this case) — this module-level helper is the single
+    # source of truth for that derivation; the container's instance methods
+    # (`_resolve_hint_sync`/`_async`) call the free function directly.
+    _unwrap_union = staticmethod(_unwrap_union)
 
     # ── Initialisation ────────────────────────────────────────────
 
@@ -377,6 +396,13 @@ class DIContainer:
         # In the common case (all bindings registered before the first get()),
         # the dict is built exactly once and reused for every resolution.
         self._localns_cache: dict[str, type] | None = None
+        # Phase 7 (Plan 001) — per-callable/per-class resolved-hints cache.
+        # Key: the callable/class object itself (fn, cls, or cls.__init__) —
+        # see `_invalidate_type_caches` and `_resolve_params` /
+        # `_resolve_class_annotations` for the full caching rationale
+        # (plan §7.4). Dies together with `_localns_cache` because a
+        # resolved hint's correctness depends on `_build_localns()`.
+        self._hints_cache: dict[Any, dict[str, Any]] = {}
 
         # ── Feature 4: per-key singleton locks (double-check locking) ──────
         # DESIGN: _singleton_locks maps a cache key to a per-key threading.Lock.
@@ -587,7 +613,7 @@ class DIContainer:
             None
         """
         self._validated = False
-        self._localns_cache = None  # new binding — localns must be rebuilt
+        self._invalidate_type_caches()  # new binding — localns/hints must be rebuilt
         self._bindings.append(ClassBinding(interface, implementation))
 
         # When the caller binds an interface to a *different* implementation,
@@ -626,7 +652,7 @@ class DIContainer:
                 f"{cls.__name__} must be decorated with @Component or @Singleton."
             )
         self._validated = False
-        self._localns_cache = None  # new binding — localns must be rebuilt
+        self._invalidate_type_caches()  # new binding — localns/hints must be rebuilt
         self._bindings.append(ClassBinding(cls, cls))
 
     def provide(self, fn: Callable[..., Any]) -> None:
@@ -642,7 +668,7 @@ class DIContainer:
             None
         """
         self._validated = False
-        self._localns_cache = None  # new binding — localns must be rebuilt
+        self._invalidate_type_caches()  # new binding — localns/hints must be rebuilt
         self._bindings.append(ProviderBinding(fn))
 
     # ── Warm-up ───────────────────────────────────────────────────
@@ -792,8 +818,7 @@ class DIContainer:
         # Guard — async providers cannot be resolved synchronously
         if isinstance(best, ProviderBinding) and best.is_async:
             raise RuntimeError(
-                f"'{best.fn.__name__}' is an async provider — "
-                f"use await container.aget() instead."
+                f"'{best.fn.__name__}' is an async provider — use await container.aget() instead."
             )
         if not self._validated:
             self.validate_bindings()
@@ -1428,6 +1453,58 @@ class DIContainer:
             return binding.implementation
         return binding.fn
 
+    def _check_singleton_reentry(self, binding: AnyBinding, key: Any) -> None:
+        """Raise if this thread/task is already creating the singleton *key*.
+
+        Both singleton paths hold a non-reentrant per-key lock across
+        ``create()`` / ``acreate()``. If that call resolves back to the same
+        binding, re-acquiring the lock would block forever on a lock the
+        caller already owns — and the cycle detection that runs inside
+        ``create()`` would never be reached. This converts that hang into the
+        same :class:`CircularDependencyError` the DEPENDENT path already
+        raises, at the point where the cycle is actually detectable.
+
+        Args:
+            binding: The binding about to be instantiated — used only to name
+                     the offending component in the error message.
+            key:     Its singleton cache key (from :meth:`_get_cache_key`).
+
+        Returns:
+            None — returns silently when no re-entry is in progress.
+
+        Raises:
+            CircularDependencyError: When *key* is already being created in
+                the current context, with the resolution chain in the message.
+
+        Thread safety:  ✅ Reads a ``ContextVar`` private to this thread; a
+                        different thread waiting on the per-key lock has its
+                        own empty set and is never affected.
+        Async safety:   ✅ Each ``asyncio.Task`` inherits its own copy, so
+                        concurrent tasks cannot see each other's in-progress
+                        keys.
+
+        Edge cases:
+            - Same key, different container → different ``id(self)``, so no
+              false positive.
+            - ``create()`` raised on a previous attempt → the key was reset in
+              a ``finally``, so a retry is not mistaken for a cycle.
+        """
+        if (id(self), key) not in _singleton_in_progress.get():
+            return
+
+        # The resolution stack was pushed by _resolve_constructor / _call_provider
+        # inside create(), so it already names the component we re-entered.
+        owner = getattr(binding, "implementation", None) or binding.interface
+        name = _type_name(owner)
+        raise CircularDependencyError(
+            f"{_format_cycle(_current_stack(), owner)}\n"
+            f"The singleton '{name}' requested itself while it was still being "
+            f"created — its own constructor or provider resolved back to its own "
+            f"binding. A common cause is a parameter annotated with a type that "
+            f"matches every binding: a bare 'object' (or 'object | None') is a "
+            f"supertype of all of them, including this one."
+        )
+
     # ── Instantiation ─────────────────────────────────────────────
 
     def _instantiate_sync(self, binding: AnyBinding) -> Any:
@@ -1463,6 +1540,11 @@ class DIContainer:
             - binding.create() raises → no cache entry is stored (exception propagates).
             - Two threads race on a cold singleton key → guard lock serialises
               lock creation; per-key lock serialises instance creation.
+            - The singleton's own create() resolves back to this same key on this
+              same thread → ``CircularDependencyError`` from
+              :meth:`_check_singleton_reentry`. The per-key lock is not
+              reentrant, so without that guard the call would block forever on a
+              lock it already holds.
         """
         key = self._get_cache_key(binding)
         cache = self._get_cache(binding)
@@ -1476,6 +1558,13 @@ class DIContainer:
         # caches are per-context (ContextVar) so concurrent tasks cannot share
         # them; DEPENDENT has no cache at all.
         if cache is self._singleton_cache:
+            # Re-entrancy guard — MUST run before acquiring the per-key lock.
+            # If this thread is already inside create() for this key, taking
+            # the lock again would block forever on a lock we ourselves hold
+            # (threading.Lock is not reentrant), and the cycle detection that
+            # lives inside create() would never get to run.
+            self._check_singleton_reentry(binding, key)
+
             # Lazy-create the per-key lock under the guard lock to prevent
             # two threads from each creating a different lock object for the
             # same key — only the first one must be used.
@@ -1490,13 +1579,22 @@ class DIContainer:
                 # acquiring this lock.
                 if key in cache:
                     return cache[key]
-                instance = binding.create(self)
-                if isinstance(binding, ClassBinding):
-                    self._register_observers(instance, binding.implementation)
-                    instance = self._apply_interceptors(
-                        instance, binding.implementation
-                    )
-                cache[key] = instance
+                token = _singleton_in_progress.set(
+                    _singleton_in_progress.get() | {(id(self), key)}
+                )
+                try:
+                    instance = binding.create(self)
+                    if isinstance(binding, ClassBinding):
+                        self._register_observers(instance, binding.implementation)
+                        instance = self._apply_interceptors(
+                            instance, binding.implementation
+                        )
+                    cache[key] = instance
+                finally:
+                    # Reset even when create() raises: the failed key must not
+                    # stay marked in-progress, or a later retry in the same
+                    # context would report a phantom cycle.
+                    _singleton_in_progress.reset(token)
             return instance
 
         # ── Non-singleton path (REQUEST, SESSION, DEPENDENT) ─────────────────
@@ -1538,6 +1636,10 @@ class DIContainer:
             - binding.acreate() raises → no cache entry is stored.
             - Two concurrent tasks race on a cold singleton key → the asyncio.Lock
               serialises them; only one runs acreate().
+            - The singleton's own acreate() awaits this same key from this same
+              task → ``CircularDependencyError`` from
+              :meth:`_check_singleton_reentry`; ``asyncio.Lock`` is not reentrant
+              either, so the await would otherwise never complete.
         """
         key = self._get_cache_key(binding)
         cache = self._get_cache(binding)
@@ -1548,6 +1650,12 @@ class DIContainer:
 
         # ── SINGLETON double-check locking (async) ────────────────────────────
         if cache is self._singleton_cache:
+            # Re-entrancy guard — see _instantiate_sync. asyncio.Lock is no more
+            # reentrant than threading.Lock: a singleton whose acreate() awaits
+            # its own resolution would await a lock its own task already holds,
+            # which never completes.
+            self._check_singleton_reentry(binding, key)
+
             # Lazy-create asyncio.Lock under the threading guard lock.
             # DESIGN: the guard lock is a threading.Lock here (not asyncio.Lock)
             # because asyncio.Lock cannot be created outside an event loop and
@@ -1562,13 +1670,20 @@ class DIContainer:
             async with async_lock:
                 if key in cache:
                     return cache[key]
-                instance = await binding.acreate(self)
-                if isinstance(binding, ClassBinding):
-                    self._register_observers(instance, binding.implementation)
-                    instance = self._apply_interceptors(
-                        instance, binding.implementation
-                    )
-                cache[key] = instance  # type: ignore[index]
+                token = _singleton_in_progress.set(
+                    _singleton_in_progress.get() | {(id(self), key)}
+                )
+                try:
+                    instance = await binding.acreate(self)
+                    if isinstance(binding, ClassBinding):
+                        self._register_observers(instance, binding.implementation)
+                        instance = self._apply_interceptors(
+                            instance, binding.implementation
+                        )
+                    cache[key] = instance  # type: ignore[index]
+                finally:
+                    # Reset even when acreate() raises — see _instantiate_sync.
+                    _singleton_in_progress.reset(token)
             return instance
 
         # ── Non-singleton path ────────────────────────────────────────────────
@@ -1599,6 +1714,38 @@ class DIContainer:
         """
         # _interface_matches replaces issubclass — handles generic aliases safely
         return any(_interface_matches(b.interface, hint) for b in self._bindings)
+
+    def _invalidate_type_caches(self) -> None:
+        """Discard every cache whose contents depend on the current binding set.
+
+        `_localns_cache` and `_hints_cache` (plan §7.4) must die TOGETHER:
+        every value in `_hints_cache` was resolved using the localns
+        `_build_localns()` produced at the time, so a stale `_hints_cache`
+        entry surviving a `_localns_cache` rebuild would silently serve
+        pre-mutation hints (e.g. a parameter that was unresolvable-and-
+        skipped before a new `bind()` call, wrongly staying skipped after).
+
+        This is the ONE place both caches are cleared — every call site that
+        used to write ``self._localns_cache = None`` directly (``bind()``,
+        ``register()``, ``provide()``, ``reset_binding()``, ``copy()``, and
+        ``scanner.py``'s external poke into the container's private state)
+        now calls this method instead, so a future third cache has exactly
+        one place to be added — no "forgot the seventh site" bug.
+
+        Thread safety:  ⚠️ Same caveat as `_build_localns` — no lock. Two
+                        threads invalidating concurrently both end up with
+                        empty caches; the next resolution on either thread
+                        rebuilds from the (now-consistent) binding list. The
+                        window this closes is "stale hints survive a binding
+                        change", not "no data race" — the container's binding
+                        mutation itself is not documented as thread-safe post
+                        first resolution (see class docstring).
+
+        Returns:
+            None
+        """
+        self._localns_cache = None
+        self._hints_cache.clear()
 
     def _build_localns(self) -> dict[str, type]:
         """Return a cached ``localns`` dict for use with ``get_type_hints()``.
@@ -1684,92 +1831,113 @@ class DIContainer:
             self._localns_cache = localns
         return self._localns_cache
 
-    def _resolve_hints_or_warn(
+    def _resolve_params(
         self,
-        target: Callable[..., Any] | type,
+        target: Callable[..., Any],
         owner_name: str,
+        *,
+        owner: type | None = None,
     ) -> dict[str, Any]:
-        """Resolve *target*'s type hints, tolerating only unresolvable names.
+        """Resolve *target*'s parameters one at a time — the Phase-7 replacement for both Tier-1/2 whole-signature helpers.
 
-        Shared by :meth:`_collect_kwargs_sync` / :meth:`_collect_kwargs_async`
-        (which pass a callable) and :meth:`_inject_class_vars_sync` /
-        :meth:`_inject_class_vars_async` (which pass a class) — ``get_type_hints``
-        accepts both equally well, so one tolerant helper serves the whole
-        Tier-1 "what gets injected" policy.
+        Delegates to :func:`providify._annotations.resolve_params`, which
+        evaluates each parameter's annotation in isolation so that one
+        unresolvable, non-injected parameter can no longer wipe out every
+        other parameter's hints (the false positive both
+        ``_resolve_hints_or_warn`` and ``_resolve_hints_or_raise`` used to
+        paper over from opposite ends). Replaces both of those release-A
+        helpers — one resolver, two callers (the injection path and the
+        validation path), because the "raise vs. skip" decision is now made
+        PER PARAMETER by :func:`resolve_params` itself, not by the caller's
+        choice of helper.
+
+        Caching:
+            Keyed by *target* itself (the callable object — see
+            :attr:`_hints_cache`'s definition in ``__init__`` for why NOT
+            ``id(target)`` or a ``WeakKeyDictionary``). A cache hit returns a
+            SHALLOW COPY so a caller mutating the returned dict (several do,
+            e.g. ``hints.pop(...)`` historically) can never corrupt the
+            cached entry for the next resolution.  Only successes are
+            cached — a failure re-raises fresh every time rather than
+            replaying a exception with a stale traceback.
+
+        Thread safety:  ✅ Safe without a lock. Every cache value is a pure
+                        function of ``(target, self._bindings)`` — a race
+                        between two threads recomputes IDENTICAL data, and
+                        plain ``dict`` item assignment is atomic under the
+                        GIL, so no torn read/write is possible. The one
+                        mutable hazard (a caller editing its returned dict)
+                        is eliminated by the copy-on-read above, not by a
+                        lock — see plan 001 §7.4.
+        Async safety:   ✅ Safe — no ``await`` inside resolution; sync and
+                        async callers share one cache with no special
+                        casing needed.
 
         Args:
-            target:     The callable or class whose annotations are evaluated.
-            owner_name: Human-readable name used in the warning message.
+            target:     The callable whose parameters are resolved —
+                        typically ``cls.__init__`` or a provider function.
+            owner_name: Human-readable name embedded in any raised error.
+            owner:      The class that declares *target* as a method, for
+                        PEP-695 ``__type_params__`` seeding — forwarded to
+                        :func:`providify._annotations._annotation_namespaces`.
 
         Returns:
-            The resolved hints, or ``{}`` when a name in the annotations cannot
-            be resolved.
+            ``dict[param_name -> resolved hint]`` — a fresh copy on every
+            call, safe for the caller to mutate.
 
         Raises:
-            Exception: Anything other than ``NameError`` is re-raised unchanged.
-
-        Edge cases:
-            - ``NameError`` → ``{}`` plus a warning. This is the legitimate case
-              the original broad except protected: PEP-563 annotations that
-              reference types absent from both ``target``'s globals and the
-              container's localns (e.g. function-local classes with defaults).
+            AnnotationResolutionError: A parameter's annotation IS (or
+                plausibly is) an injection point but cannot be evaluated —
+                naming both *owner_name* and the specific parameter.
         """
-        try:
-            return get_type_hints(
-                target, include_extras=True, localns=self._build_localns()
-            )
-        except NameError as exc:
-            # WHY narrow + warn: returning {} drops EVERY injected kwarg for this
-            # callable, which downstream looks like a bogus "missing N required
-            # positional arguments" TypeError from the callable itself.  Only an
-            # unresolvable annotation name may cause that, and never silently —
-            # any other exception signals a real defect and must propagate.
-            logger.warning(
-                "Cannot resolve type hints for '%s' (%s: %s); no dependencies "
-                "will be injected into it.",
-                owner_name,
-                type(exc).__name__,
-                exc,
-            )
-            return {}
+        cached = self._hints_cache.get(target)
+        if cached is not None:
+            return dict(cached)
 
-    def _resolve_hints_or_raise(
-        self,
-        target: Callable[..., Any] | type,
-        owner_name: str,
-    ) -> dict[str, Any]:
-        """Resolve *target*'s type hints, raising on ANY failure — the Tier-2 policy.
+        globalns, localns = _annotation_namespaces(
+            target, self._build_localns(), owner=owner
+        )
+        hints = resolve_params(target, owner_name, globalns, localns)
+        self._hints_cache[target] = hints
+        return dict(hints)
 
-        Shared by the validation call sites (:meth:`_collect_class_var_hints`,
-        :meth:`_check_scope_violation`, :meth:`_check_provider_scope_violation`).
-        Unlike :meth:`_resolve_hints_or_warn`, this helper never tolerates
-        ``NameError`` (or anything else): a validator's entire job is to prove
-        a binding is safe, and if it cannot even read the annotations it has no
-        evidence either way. Returning an empty result set here would mean "no
-        leaks found" — a false "all clear" the caller cannot actually prove.
-        Invariant: a validator that cannot read the annotations must never
-        return an empty result set, because empty means "clean".
+    def _resolve_class_annotations(self, cls: type) -> dict[str, Any]:
+        """Resolve *cls*'s class-level annotations one at a time (Phase-7 replacement).
+
+        Delegates to :func:`providify._annotations.resolve_class_annotations`,
+        which walks the full MRO and evaluates each attribute's annotation in
+        isolation. Replaces the release-A pairing of
+        ``_resolve_hints_or_warn`` (Tier-1, ``_inject_class_vars_sync/async``)
+        and ``_resolve_hints_or_raise`` (Tier-2, ``_collect_class_var_hints``)
+        for this target kind — per-attribute resolution makes both policies
+        the SAME function, because an unresolvable annotation is now either
+        an injection point (raise, naming the attribute) or not (silently
+        omitted) regardless of which caller asked.
+
+        Caching:            Keyed by *cls* itself; see :meth:`_resolve_params`
+                             — identical strategy (copy-on-read, success-only
+                             caching, shared ``_hints_cache``).
+        Thread/async safety: Identical rationale to :meth:`_resolve_params`.
 
         Args:
-            target:     The callable or class whose annotations are evaluated.
-            owner_name: Human-readable name of the binding, embedded in the
-                        raised error so the failure is attributable.
+            cls: The class whose (and whose ancestors') class-level
+                 annotations are resolved.
 
         Returns:
-            The resolved hints. Never ``{}`` as a failure signal — an empty
-            dict here means the target genuinely has no annotations.
+            ``dict[attr_name -> resolved hint]`` — a fresh copy on every call.
 
         Raises:
-            AnnotationResolutionError: Wraps any exception from
-                ``get_type_hints`` (including ``NameError``), naming *owner_name*
-                and the original exception.
+            AnnotationResolutionError: A class attribute's annotation IS (or
+                plausibly is) an injection point but cannot be evaluated —
+                naming the declaring class and the attribute.
         """
-        try:
-            return get_type_hints(
-                target, include_extras=True, localns=self._build_localns()
-            )
-        except Exception as exc:
-            raise AnnotationResolutionError(owner_name, exc) from exc
+        cached = self._hints_cache.get(cls)
+        if cached is not None:
+            return dict(cached)
+
+        hints = resolve_class_annotations(cls, self._build_localns())
+        self._hints_cache[cls] = hints
+        return dict(hints)
 
     def _collect_kwargs_sync(
         self,
@@ -1794,13 +1962,14 @@ class DIContainer:
 
         Raises:
             LookupError: If a required parameter (no default) cannot be resolved.
-            Exception: Propagated from :meth:`_resolve_hints_or_warn` when
-                annotation evaluation fails for any reason other than an
-                unresolvable name — see that method for the rationale.
+            AnnotationResolutionError: A parameter's annotation IS (or
+                plausibly is) an injection point but cannot be evaluated —
+                see :meth:`_resolve_params`. Unresolvable annotations on
+                parameters that are NOT injection points no longer affect
+                this call at all (Phase 7 — per-parameter resolution).
         """
-        hints = self._resolve_hints_or_warn(fn, owner_name)
+        hints = self._resolve_params(fn, owner_name)
 
-        hints.pop("return", None)
         sig = inspect.signature(fn)
         resolved: dict[str, Any] = {}
 
@@ -1853,13 +2022,11 @@ class DIContainer:
 
         Raises:
             LookupError: If a required parameter (no default) cannot be resolved.
-            Exception: Propagated from :meth:`_resolve_hints_or_warn` when
-                annotation evaluation fails for any reason other than an
-                unresolvable name — see that method for the rationale.
+            AnnotationResolutionError: See :meth:`_collect_kwargs_sync` —
+                identical policy, async mirror.
         """
-        hints = self._resolve_hints_or_warn(fn, owner_name)
+        hints = self._resolve_params(fn, owner_name)
 
-        hints.pop("return", None)
         sig = inspect.signature(fn)
         resolved: dict[str, Any] = {}
 
@@ -1915,30 +2082,31 @@ class DIContainer:
             are silently omitted.
 
         Edge cases:
-            - ``get_type_hints`` raises → swallowed **and logged**; returns ``[]``.
-            - ``return`` hint present  → stripped before iteration.
+            - A parameter that IS an injection point but cannot be resolved
+              (``AnnotationResolutionError`` from :meth:`_resolve_params`) →
+              swallowed **and logged**; every OTHER parameter that DID
+              resolve is still included — Phase 7 yields a partial graph
+              here instead of the whole-signature ``[]`` release A produced.
             - No providify parameters → returns ``[]``.
         """
         try:
-            hints = get_type_hints(
-                fn, include_extras=True, localns=self._build_localns()
-            )
-        except Exception as exc:
+            hints = self._resolve_params(fn, getattr(fn, "__qualname__", str(fn)))
+        except AnnotationResolutionError as exc:
             # Tier 3 — advisory/reporting path (dependency-graph construction).
             # A partial or missing graph node is a worse debugging experience,
             # not a wiring bug, so the failure is swallowed — but it must never
             # be silent, or the gap in the graph looks like "no dependencies"
-            # rather than "couldn't tell".
+            # rather than "couldn't tell". Per-parameter resolution means this
+            # only fires for a parameter that IS an injection point — every
+            # OTHER parameter on *fn* already resolved fine independently, so
+            # in practice this now only ever loses ONE dependency, not all of them.
             logger.warning(
-                "Dependency graph for '%s' is incomplete — cannot resolve "
-                "type hints (%s: %s).",
+                "Dependency graph for '%s' is incomplete — cannot resolve type hints (%s).",
                 getattr(fn, "__qualname__", fn),
-                type(exc).__name__,
                 exc,
             )
             hints = {}
 
-        hints.pop("return", None)
         dependencies: list[AnyBinding] = []
 
         for _, hint in hints.items():
@@ -2316,7 +2484,9 @@ class DIContainer:
         Class-level annotations like ``var: Inject[Something]`` are not part of
         ``__init__`` — they live in ``cls.__annotations__`` and are invisible to
         :meth:`_collect_kwargs_sync`. This method reads the full MRO-resolved hints
-        for *cls* via ``get_type_hints(cls, include_extras=True)``, filters to those
+        for *cls* via :meth:`_resolve_class_annotations` (Phase 7 — evaluates each
+        attribute's annotation in isolation rather than one whole-class
+        ``get_type_hints(cls, include_extras=True)`` call), filters to those
         carrying providify metadata (``Inject[T]``, ``Live[T]``, ``Lazy[T]``), and
         sets each resolved value on the instance via ``setattr``.
 
@@ -2330,7 +2500,8 @@ class DIContainer:
         Args:
             instance: The freshly constructed instance to inject into.
             cls:      The class whose type hints are inspected. Full MRO traversal
-                      via ``get_type_hints`` — includes annotations from parent classes.
+                      via :meth:`_resolve_class_annotations` — includes annotations
+                      from parent classes.
 
         Returns:
             None
@@ -2338,20 +2509,20 @@ class DIContainer:
         Raises:
             LookupError: If a required class-var annotation (non-optional) refers to
                          a type that has no registered binding.
-            Exception: Propagated from :meth:`_resolve_hints_or_warn` when
-                annotation evaluation fails for any reason other than an
-                unresolvable name — see that method for the rationale.
+            AnnotationResolutionError: A class attribute's annotation IS (or
+                plausibly is) an injection point but cannot be evaluated —
+                see :meth:`_resolve_class_annotations`. Unresolvable
+                annotations on attributes that are NOT injection points no
+                longer affect construction at all (Phase 7).
 
         Edge cases:
             - cls has no annotations at all       → no-op (hints is empty)
             - annotation has no providify marker  → silently skipped
             - name also appears in __init__ sig   → skipped; constructor kwargs win
-            - unresolvable name (NameError)       → warning + no class-var injection
-            - any other exception                 → propagates
+            - unresolvable name, not a marker      → silently skipped, no warning
+            - unresolvable name, IS a marker       → raises, naming the attribute
         """
-        hints = self._resolve_hints_or_warn(
-            cls, f"{cls.__name__} (class-level annotations)"
-        )
+        hints = self._resolve_class_annotations(cls)
 
         if not hints:
             return
@@ -2398,14 +2569,11 @@ class DIContainer:
 
         Raises:
             LookupError: If a required class-var annotation refers to an unregistered type.
-            Exception: Propagated from :meth:`_resolve_hints_or_warn` — see
-                :meth:`_inject_class_vars_sync`.
+            AnnotationResolutionError: See :meth:`_inject_class_vars_sync`.
 
         Edge cases: same as :meth:`_inject_class_vars_sync`.
         """
-        hints = self._resolve_hints_or_warn(
-            cls, f"{cls.__name__} (class-level annotations)"
-        )
+        hints = self._resolve_class_annotations(cls)
 
         if not hints:
             return
@@ -2591,11 +2759,19 @@ class DIContainer:
     def _get_provider_return_type(self, fn: Callable[..., Any]) -> type | None:
         """Read the ``return`` type hint from a provider function.
 
-        Returns ``None`` (and logs a warning) if the hints cannot be resolved
+        Returns ``None`` (and logs a warning) if the hint cannot be resolved
         — e.g. when a forward reference is unresolvable at runtime. Tier 3 —
         advisory/reporting: a missing return type is a worse debugging
         experience, not a wiring bug, so the failure is swallowed but never
         silent.
+
+        Phase 7: resolved via :func:`providify._annotations._eval_annotation`
+        directly (not the whole-signature ``get_type_hints(fn)``) — an
+        unresolvable PARAMETER annotation must never block resolving the
+        return annotation, and vice versa; they are now fully independent
+        (see :meth:`_collect_kwargs_sync` / :meth:`_resolve_params` for the
+        parameter side, which no longer shares a single failure point with
+        this method the way both did under the old whole-signature call).
 
         Args:
             fn: The provider callable to inspect.
@@ -2603,9 +2779,13 @@ class DIContainer:
         Returns:
             The return type annotation if present and resolvable, else ``None``.
         """
+        sig = inspect.signature(inspect.unwrap(fn))
+        raw_return = sig.return_annotation
+        if raw_return is inspect.Signature.empty:
+            return None
+        globalns, localns = _annotation_namespaces(fn, self._build_localns())
         try:
-            hints = get_type_hints(fn)
-            return hints.get("return")
+            return _eval_annotation(raw_return, globalns, localns)
         except Exception as exc:
             logger.warning(
                 "Cannot resolve return type hint for '%s' (%s: %s).",
@@ -3060,25 +3240,27 @@ class DIContainer:
             parameters.
 
         Raises:
-            AnnotationResolutionError: If ``get_type_hints`` cannot resolve
-                *cls*'s annotations. A validator that cannot read the
-                annotations must not silently report "no injection points" —
-                see :meth:`_resolve_hints_or_raise`. Callers on the reporting
-                tier (:meth:`_get_dependencies`) catch this and downgrade it
-                to a warning; validators let it propagate.
+            AnnotationResolutionError: A class attribute IS (or plausibly is)
+                an injection point but its annotation cannot be evaluated —
+                see :meth:`_resolve_class_annotations`, which is strict by
+                construction (Phase 7: an attribute that resolves to
+                "unknown" ambiguity is skipped, never silently treated as
+                "no injection points"). Callers on the reporting tier
+                (:meth:`_get_dependencies`) catch this and downgrade it to a
+                warning; validators let it propagate.
 
         Edge cases:
             - cls has no annotations              → ``{}``
-            - ``get_type_hints`` raises            → ``AnnotationResolutionError``
+            - an injection-point attribute's annotation is unresolvable
+              → ``AnnotationResolutionError``
             - name is an ``__init__`` param       → excluded (already handled by
                                                     the ``__init__``-based callers)
             - name has no providify metadata      → excluded
         """
-        # include_extras=True — without it Annotated[T, InjectMeta(...)] is
-        # stripped to bare T and the metadata marker is lost.
-        hints = self._resolve_hints_or_raise(
-            cls, f"{cls.__name__} (class-level annotations)"
-        )
+        # include_extras=True is implicit in _resolve_class_annotations —
+        # without it Annotated[T, InjectMeta(...)] would be stripped to bare
+        # T and the metadata marker lost.
+        hints = self._resolve_class_annotations(cls)
 
         # Exclude __init__ params — they're already validated / graphed via the
         # existing __init__-based path.  Keeping them here would double-count them.
@@ -3130,31 +3312,32 @@ class DIContainer:
         Raises:
             LiveInjectionRequiredError: If any ``REQUEST``/``SESSION`` scoped
                 dependency is injected without ``Live[T]``/``Instance[T]``.
-            AnnotationResolutionError: If ``__init__``'s (or a class var's)
-                annotations cannot be resolved — see
-                :meth:`_resolve_hints_or_raise`. A validator that cannot read
-                the annotations must not report "no leaks found"; it raises
-                instead so the container never reports a clean bill of health
-                it cannot prove.
+            AnnotationResolutionError: An ``__init__`` parameter (or class
+                var) IS (or plausibly is) an injection point but its
+                annotation cannot be evaluated — see :meth:`_resolve_params`
+                / :meth:`_collect_class_var_hints`. A validator that cannot
+                read the annotations must not report "no leaks found"; it
+                raises instead so the container never reports a clean bill
+                of health it cannot prove. Phase 7 narrows this further: an
+                unresolvable annotation on a parameter that is NOT an
+                injection point no longer raises at all — nothing to
+                validate for it.
         """
         leaks: list[ScopeLeak] = []
         # Accumulated Live[T] violations — raised as a group so the developer
         # sees all affected parameters at once, not just the first one.
         live_violations: list[LiveInjectionViolation] = []
-        # include_extras=True preserves Annotated wrappers — we need the
-        # InjectMeta / LazyMeta / LiveMeta inside them to distinguish HOW
-        # each dep is wired, not just what type it resolves to.
-        # WHY localns here (this is the fix): without it, from __future__
-        # import annotations makes any locally-defined __init__ parameter
-        # type raise NameError, which used to be swallowed below — a real
-        # scope leak would silently validate clean. _build_localns() maps
-        # every registered binding's name, resolving those cases too.
-        init_hints = self._resolve_hints_or_raise(
+        # Per-parameter resolution (Phase 7) preserves Annotated wrappers
+        # automatically (include_extras=True is baked into _eval_annotation)
+        # and applies the container's localns per parameter — the whole-
+        # signature `localns` gap this method used to patch manually
+        # (`_resolve_hints_or_raise`) no longer exists as a distinct fix;
+        # every parameter gets it via `_resolve_params` -> `_build_localns()`.
+        init_hints = self._resolve_params(
             binding.implementation.__init__,
             f"{binding.implementation.__name__}.__init__",
+            owner=binding.implementation,
         )
-
-        init_hints.pop("return", None)
 
         # DESIGN: merge __init__ hints with class-level annotation hints so the
         # scope-leak check covers ALL injection points on the class, not just
@@ -3243,15 +3426,18 @@ class DIContainer:
         Raises:
             LiveInjectionRequiredError: If any ``REQUEST`` or ``SESSION``
                 scoped dependency is injected without ``Live[T]`` wrapping.
-            AnnotationResolutionError: If *binding.fn*'s annotations cannot be
-                resolved — see :meth:`_resolve_hints_or_raise`. A validator
-                that cannot read the annotations must not report "no leaks
-                found".
+            AnnotationResolutionError: A parameter of *binding.fn* IS (or
+                plausibly is) an injection point but its annotation cannot be
+                resolved — see :meth:`_resolve_params`. A validator that
+                cannot read the annotations must not report "no leaks
+                found". Phase 7 narrows this further: an unresolvable
+                annotation on a non-injected parameter no longer raises.
 
         Edge cases:
             - Provider with no parameters            → empty list, no error
             - Provider scope is DEPENDENT            → no leak risk, returns []
-            - ``get_type_hints`` raises              → ``AnnotationResolutionError``
+            - A parameter that IS an injection point but is unresolvable
+              → ``AnnotationResolutionError``
             - Provider parameter is ``Live[T]``      → safe, not flagged
         """
         # DEPENDENT providers create a fresh instance every call — they never
@@ -3263,17 +3449,10 @@ class DIContainer:
         leaks: list[ScopeLeak] = []
         live_violations: list[LiveInjectionViolation] = []
 
-        # include_extras=True — required to preserve Annotated wrappers so
-        # we can detect Live[T] / Lazy[T] / Inject[T] markers on each param.
-        # localns — from __future__ import annotations makes all annotations
-        # lazy strings; locally-defined types are absent from fn.__globals__.
-        # _build_localns() maps every registered class name → type, letting
-        # get_type_hints resolve parameter types that aren't in __globals__.
-        fn_hints = self._resolve_hints_or_raise(
-            binding.fn, f"@Provider({binding.fn.__name__})"
-        )
-
-        fn_hints.pop("return", None)
+        # Per-parameter resolution (Phase 7) preserves Annotated wrappers
+        # (include_extras=True baked into _eval_annotation) and applies the
+        # container's localns per parameter automatically via _resolve_params.
+        fn_hints = self._resolve_params(binding.fn, f"@Provider({binding.fn.__name__})")
 
         for param_name, hint in fn_hints.items():
             # Extract the injection marker BEFORE stripping Annotated — we need
@@ -3902,7 +4081,7 @@ class DIContainer:
 
         # Reset validation so scope checks run again
         self._validated = False
-        self._localns_cache = None
+        self._invalidate_type_caches()
 
         return len(to_remove)
 
@@ -3977,8 +4156,15 @@ class DIContainer:
         new._scanner = DefaultContainerScanner(new)
         # Not validated — scope checks run on first get()
         new._validated = False
-        # localns cache reset — built from _bindings, must reflect the copy's list
+        # localns/hints caches reset — built from _bindings, must reflect the
+        # copy's own list, and NEVER share the parent's dict object (a
+        # binding mutation on one container must not silently poison the
+        # other's cached hints). Set directly rather than via
+        # `_invalidate_type_caches()` because `new` is constructed with
+        # `__new__` — `_hints_cache` does not exist yet for that method to
+        # clear.
         new._localns_cache = None
+        new._hints_cache = {}
         # Copy runtime state introduced in v0.3.0
         new._enabled_alternatives = set(self._enabled_alternatives)
         new._interceptor_classes = list(self._interceptor_classes)

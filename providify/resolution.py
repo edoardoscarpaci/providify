@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 # ─────────────────────────────────────────────────────────────────
 #  Resolution stack — tracks the current dependency chain per task/thread
@@ -19,6 +19,42 @@ from typing import TYPE_CHECKING, Final
 _resolution_stack: ContextVar[list[type]] = ContextVar(
     "resolution_stack",
     default=[],
+)
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Singleton creation guard — tracks which singleton cache keys the
+#  CURRENT thread/task is already inside `create()` for.
+#
+#  WHY THIS EXISTS (and why _resolution_stack is not enough):
+#  `_instantiate_sync`/`_instantiate_async` acquire a per-key lock and
+#  hold it across `binding.create()`. Cycle detection (`_check_cycle`)
+#  runs *inside* create(), so a singleton that resolves back to itself
+#  re-entered the lock before any cycle could be detected — and both
+#  `threading.Lock` and `asyncio.Lock` are non-reentrant, so the call
+#  blocked on a lock its own thread/task already held. A permanent hang,
+#  not an error.
+#
+#  DESIGN: a ContextVar of (container id, cache key) pairs.
+#  Tradeoffs:
+#    ✅ Isolated per thread AND per asyncio Task, so it flags only
+#       SAME-context re-entry — a different thread legitimately waiting
+#       on the per-key lock is untouched, preserving double-check locking.
+#    ✅ Leaves the fast lock non-reentrant, so the "exactly one instance"
+#       guarantee is unchanged (an RLock would instead let a re-entrant
+#       call construct a second instance and cache the wrong one).
+#    ❌ One extra ContextVar set/reset per cold singleton creation —
+#       negligible next to constructing the object, and skipped entirely
+#       on the cache-hit fast path.
+#
+#  The container's `id()` is used rather than the container itself so the
+#  guard never keeps a container alive; the id is only compared while that
+#  container is on the stack, so recycling cannot cause a false match.
+# ─────────────────────────────────────────────────────────────────
+
+_singleton_in_progress: ContextVar[frozenset[tuple[int, Any]]] = ContextVar(
+    "singleton_in_progress",
+    default=frozenset(),
 )
 
 

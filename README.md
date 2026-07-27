@@ -551,7 +551,7 @@ The two injection paths intentionally have **different MRO behaviour**:
 | Injection path | MRO walk? | Why |
 |---|---|---|
 | `__init__` parameters | ❌ No | The declared signature is an explicit contract. If a child overrides `__init__`, it is asserting its own construction semantics. |
-| Class-level annotations | ✅ Yes | `get_type_hints(cls)` walks the full MRO — annotations declared on a parent class are inherited and injected automatically. |
+| Class-level annotations | ✅ Yes | The container resolves each class attribute's annotation across the full MRO — annotations declared on a parent class are inherited and injected automatically. |
 
 **When `__init__` is *not* overridden** the parent's `__init__` is already picked up via Python's own MRO — no special handling is needed. The asymmetry only matters when the child *does* override `__init__`.
 
@@ -770,7 +770,18 @@ Raised for other scope leaks — e.g. a `@Singleton` holding a `@Component` (DEP
 
 ### AnnotationResolutionError
 
-Raised when scope-leak validation cannot even read a binding's annotations — `get_type_hints()` itself raised (e.g. `NameError` for a locally-defined or `TYPE_CHECKING`-only type). A validator that cannot read the annotations has no evidence either way, so the container refuses to report a false "clean" bill of health instead of silently skipping the check.
+Annotations are resolved **per parameter / per class attribute**, not as a whole
+signature. Raised when a parameter or class attribute that IS (or plausibly is) an
+injection point — annotated `Inject[T]`, `Lazy[T]`, `Live[T]`, `Instance[T]`,
+`InjectInstances[T]`, or a `ClassVar` wrapping one of those — cannot be evaluated at
+runtime, naming the exact parameter or attribute. This can surface either during
+scope-leak validation (`validate_bindings()` / the first `get()`/`aget()` call) or
+directly at construction/provider-call time, since resolution and validation now
+share the same per-parameter resolver.
+
+An unresolvable annotation on a parameter that is **not** an injection point (a
+`TYPE_CHECKING`-only import, a defaulted local type) never raises this — it has no
+effect on anything else on the same signature.
 
 Fix: import the annotated type at runtime instead of under `TYPE_CHECKING`, or move locally-defined types to module level.
 
