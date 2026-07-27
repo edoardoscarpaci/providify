@@ -1,6 +1,6 @@
 [project]
 name = "providify"
-version = "1.0.0"
+version = "1.1.0"
 description = "A Python dependency injection container inspired by Jakarta CDI and Spring. Supports sync and async resolution, multiple scopes, lifecycle hooks, and configuration modules."
 authors = [
     {name = "edoardo.scarpaci", email = "edoardo.scarpaci@gmail.com"},
