@@ -2,20 +2,21 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     TypeAlias,
+    get_origin,
 )
 
+from .decorator.lifecycle import _find_post_construct, _find_pre_destroy
 from .descriptor import BindingDescriptor
 from .exceptions import (
     ClassBindingNotDecoratedError,
     ProviderBindingNotDecoratedError,
     ScopeViolationDetectedError,
 )
-from .decorator.lifecycle import _find_post_construct, _find_pre_destroy
 from .metadata import (
     DIMetadata,
     ProviderMetadata,
@@ -218,6 +219,12 @@ class ClassBinding(Binding):
             ScopeViolationDetectedError: If any direct dependency has a
                 narrower scope than this binding (e.g. a ``SINGLETON`` depending
                 on a ``REQUEST``-scoped component).
+            LiveInjectionRequiredError: If a ``REQUEST``/``SESSION`` scoped
+                dependency is injected without ``Live[T]``/``Instance[T]``.
+            AnnotationResolutionError: If the implementation's annotations
+                cannot be resolved by the container — validation cannot run
+                for it, so it is reported as a failure rather than silently
+                passed.
         """
         scope_violations = container._check_scope_violation(self)
         if scope_violations:
@@ -320,6 +327,81 @@ class ClassBinding(Binding):
 
 
 # ─────────────────────────────────────────────────────────────────
+#  Return-annotation resolution helper
+# ─────────────────────────────────────────────────────────────────
+
+# A quoted forward reference nests exactly one extra level per pair of quotes.
+# Two rounds cover every realistic form ("Foo" and '"Foo"'); the bound exists
+# purely so a pathological annotation cannot loop forever.
+_MAX_FORWARD_REF_DEPTH = 3
+
+
+def _resolve_return_annotation(annotation: str, fn: Callable[..., Any]) -> Any:
+    """Evaluate a string return annotation against *fn*'s module globals.
+
+    Args:
+        annotation: The raw string annotation taken from ``fn.__annotations__``.
+        fn:         The provider function — its ``__globals__`` is the namespace
+                    the annotation is evaluated in.
+
+    Returns:
+        The resolved type (or parameterised generic alias) the annotation names.
+
+    Raises:
+        TypeError: If the annotation cannot be resolved to a type, naming both
+            the provider and the offending annotation.
+
+    Edge cases:
+        - Quoted forward reference (``-> "Foo"``): under PEP-563 the annotation
+          stringifies to the *literal* ``"'Foo'"``, so a single ``eval`` yields
+          the ``str`` ``'Foo'`` rather than the class. We therefore re-evaluate
+          while the result is still a string.
+        - Unresolvable name (e.g. a class defined inside a function, or one
+          imported only under ``TYPE_CHECKING``) → ``TypeError``.
+    """
+    # WHY: a binding interface must be a type. Registering the unresolved
+    # ``str`` instead — which the previous ``eval``-once code silently did —
+    # corrupts every container path that reads ``interface.__name__`` and
+    # surfaces as an unrelated failure at resolution time (see
+    # tests/test_forward_ref_provider.py). Fail here, where we can name the
+    # provider and the annotation.
+    globalns: dict[str, Any] = getattr(fn, "__globals__", {})
+    value: Any = annotation
+
+    for _ in range(_MAX_FORWARD_REF_DEPTH):
+        try:
+            # eval is safe here: the input is an annotation written in the
+            # provider's own source file, never external data.
+            value = eval(value, globalns)  # type: ignore[arg-type]
+        except Exception as exc:
+            raise TypeError(
+                f"Provider '{fn.__name__}' declares an unresolvable return type "
+                f"annotation {annotation!r}. Make the type importable at module "
+                f"level (a TYPE_CHECKING-only or function-local class cannot be "
+                f"resolved at runtime)."
+            ) from exc
+
+        if not isinstance(value, str):
+            break
+    else:
+        raise TypeError(
+            f"Provider '{fn.__name__}' declares a return type annotation "
+            f"{annotation!r} that is nested too deeply to resolve."
+        )
+
+    # Concrete types and parameterised generic aliases (Repository[User], whose
+    # get_origin is the generic class) are both legal interfaces; anything else
+    # is not.
+    if not isinstance(value, type) and get_origin(value) is None:
+        raise TypeError(
+            f"Provider '{fn.__name__}' return type annotation {annotation!r} "
+            f"resolved to {value!r} ({type(value).__name__}), not a type."
+        )
+
+    return value
+
+
+# ─────────────────────────────────────────────────────────────────
 #  ProviderBinding — factory function injection
 # ─────────────────────────────────────────────────────────────────
 
@@ -364,7 +446,10 @@ class ProviderBinding(Binding):
             ProviderBindingNotDecoratedError: If *fn* has no ``ProviderMetadata``
                 — i.e. it was not decorated with ``@Provider``.
             TypeError: If *fn* has no return type annotation, since the
-                return type is used as the resolved interface.
+                return type is used as the resolved interface — or if that
+                annotation is a string that cannot be resolved to a type
+                (e.g. a quoted forward reference to a function-local or
+                ``TYPE_CHECKING``-only class).
         """
         from typing import get_type_hints
 
@@ -393,12 +478,8 @@ class ProviderBinding(Binding):
                 interface = ret
             elif isinstance(ret, str):
                 # String annotation — evaluate against fn's own globals only.
-                # If the return type is also locally-defined this also fails,
-                # and interface stays None (triggering TypeError below).
-                try:
-                    interface = eval(ret, getattr(fn, "__globals__", {}))  # type: ignore[arg-type]
-                except Exception:
-                    interface = None
+                # Raises with a clear message when the name is unresolvable.
+                interface = _resolve_return_annotation(ret, fn)
             else:
                 interface = ret  # None or unexpected — TypeError raised below
 
@@ -468,6 +549,10 @@ class ProviderBinding(Binding):
                 narrower-scoped binding in a non-safe way.
             LiveInjectionRequiredError: If any ``REQUEST`` or ``SESSION``
                 scoped parameter is injected without ``Live[T]`` wrapping.
+            AnnotationResolutionError: If the provider function's annotations
+                cannot be resolved by the container — validation cannot run
+                for it, so it is reported as a failure rather than silently
+                passed.
 
         Edge cases:
             - ``DEPENDENT`` scoped providers → no-op (no stale-reference risk).
@@ -570,4 +655,4 @@ class ProviderBinding(Binding):
 #  bare assignment looks like a runtime variable, not a type alias.
 # ─────────────────────────────────────────────────────────────────
 
-AnyBinding: TypeAlias = ClassBinding | ProviderBinding
+AnyBinding: TypeAlias = ClassBinding | ProviderBinding  # noqa: UP040

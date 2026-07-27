@@ -573,6 +573,7 @@ print(json.dumps(descriptor.to_dict(), indent=2))
 | `CircularDependencyError` | A → B → A cycle detected during resolution |
 | `ScopeViolationDetectedError` | Short-lived dep injected directly into long-lived component |
 | `LiveInjectionRequiredError` | REQUEST/SESSION dep injected into SINGLETON without `Live[T]` wrapper |
+| `AnnotationResolutionError` | Scope-leak validation couldn't resolve a binding's annotations (`get_type_hints()` raised) — the container refuses to report a false "clean" bill of health |
 | `ClassBindingNotDecoratedError` | `register(cls)` called with an undecorated class |
 | `ProviderBindingNotDecoratedError` | `provide(fn)` called with an undecorated function |
 | `NotDecoratedError` | Generic "not decorated" base error |

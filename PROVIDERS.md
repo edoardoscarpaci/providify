@@ -62,6 +62,30 @@ The **return-type annotation** is the registered interface. The provider's
 parameters are resolved from the container — see
 [Per-method injection](#per-method-injection-no-__init__-needed) below.
 
+> ⚠️ **Gotcha:** the return annotation must resolve to a real type at import
+> time, even when quoted (`-> "Foo"`). A type that only exists under
+> `if TYPE_CHECKING:` or is defined inside a function cannot be resolved and
+> now raises `TypeError` at registration — naming the provider and the
+> annotation. Fix it by importing the type normally (not under
+> `TYPE_CHECKING`) wherever the `@Provider` function is defined.
+
+```python
+# ❌ Wrong — Foo only exists for type checkers, never at runtime.
+if TYPE_CHECKING:
+    from mypkg.models import Foo
+
+@Provider(singleton=True)
+def make_foo() -> "Foo":
+    ...
+
+# ✅ Right — import Foo unconditionally so the annotation resolves.
+from mypkg.models import Foo
+
+@Provider(singleton=True)
+def make_foo() -> Foo:
+    ...
+```
+
 ### 3. Several related producers → *optionally* group them in `@Configuration`.
 
 `@Configuration` is **sugar for grouping** — nothing more. A bare `@Provider`

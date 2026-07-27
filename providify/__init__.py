@@ -40,6 +40,7 @@ __all__ = [
     "CircularDependencyError",
     "ScopeViolationDetectedError",
     "LiveInjectionRequiredError",
+    "AnnotationResolutionError",
     # Binding and descriptor types — for type annotations and introspection
     "AnyBinding",
     "BindingDescriptor",
@@ -75,71 +76,72 @@ __all__ = [
     "InterceptorBinding",
     "AroundInvoke",
 ]
+import logging
+
+from .binding import AnyBinding
 from .container import DIContainer, ScopeContext
-from .decorator.scope import (
-    Component,
-    Singleton,
-    ApplicationScoped,
-    RequestScoped,
-    SessionScoped,
-    Provider,
-    Named,
-    # Priority is a field-update decorator (same module as Named) — it was
-    # missing from the public surface despite being documented in the README.
-    Priority,
-    Inheritable,
-    # Jakarta CDI parity decorators
-    Qualifier,
-    Default,
-    Alternative,
-    Stereotype,
-    Decorator,
-)
+from .decorator.interceptor import AroundInvoke, Interceptor, InterceptorBinding
 from .decorator.lifecycle import (
-    PostConstruct,
-    PreDestroy,
     Disposes,
     DisposesMarker,
     Observes,
     ObservesMarker,
+    PostConstruct,
+    PreDestroy,
 )
 from .decorator.module import Configuration
-from .metadata import Scope, StereotypeMetadata
-from .exceptions import (
-    providifyError,
-    BindingError,
-    ClassBindingNotDecoratedError,
-    ProviderBindingNotDecoratedError,
-    CircularDependencyError,
-    ScopeViolationDetectedError,
-    LiveInjectionRequiredError,
+from .decorator.scope import (
+    Alternative,
+    ApplicationScoped,
+    Component,
+    Decorator,
+    Default,
+    Inheritable,
+    Named,
+    # Priority is a field-update decorator (same module as Named) — it was
+    # missing from the public surface despite being documented in the README.
+    Priority,
+    Provider,
+    # Jakarta CDI parity decorators
+    Qualifier,
+    RequestScoped,
+    SessionScoped,
+    Singleton,
+    Stereotype,
 )
-from .binding import AnyBinding
 from .descriptor import BindingDescriptor, DIContainerDescriptor
+from .exceptions import (
+    AnnotationResolutionError,
+    BindingError,
+    CircularDependencyError,
+    ClassBindingNotDecoratedError,
+    LiveInjectionRequiredError,
+    ProviderBindingNotDecoratedError,
+    ScopeViolationDetectedError,
+    providifyError,
+)
+from .metadata import Scope, StereotypeMetadata
 from .type import (
+    Delegate,
+    DelegateMeta,
+    Event,
+    EventMeta,
+    EventProxy,
     Inject,
     InjectInstances,
-    Lazy,
-    Live,
-    Instance,
-    Event,
-    Delegate,
-    LiveProxy,
-    LazyProxy,
-    InstanceProxy,
-    EventProxy,
-    InjectMeta,
-    LazyMeta,
-    LiveMeta,
-    InstanceMeta,
-    NamedMeta,
-    DelegateMeta,
-    EventMeta,
     InjectionPoint,
+    InjectMeta,
+    Instance,
+    InstanceMeta,
+    InstanceProxy,
     InvocationContext,
+    Lazy,
+    LazyMeta,
+    LazyProxy,
+    Live,
+    LiveMeta,
+    LiveProxy,
+    NamedMeta,
 )
-from .decorator.interceptor import Interceptor, InterceptorBinding, AroundInvoke
-
-import logging
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())

@@ -39,6 +39,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+#### ⚠️ Scope-leak validation now raises instead of silently reporting clean
+- `_check_scope_violation` / `_check_provider_scope_violation` / `_collect_class_var_hints`
+  now raise `AnnotationResolutionError` (a `ValidationError` subclass) when a binding's
+  annotations cannot be evaluated by `get_type_hints()` — instead of swallowing the failure
+  and reporting the binding clean. "I don't know" is no longer reported as "you're fine".
+  This can break downstream apps whose `__init__`/provider annotations are `TYPE_CHECKING`-only
+  imports or otherwise unresolvable at runtime; they will now fail at container wiring
+  (`validate_bindings()` / the first `get()`/`aget()` call) instead of silently passing
+  validation.
+  Migration: import the annotated type at runtime instead of guarding it behind
+  `TYPE_CHECKING`, or move locally-defined types to module level.
+  The next release (per-parameter annotation resolution) removes most of these failures —
+  an unresolvable annotation on a parameter that is *not* an injection point will stop being
+  fatal at all.
+
 #### Priority direction — documentation corrected
 - **Higher priority value wins** when multiple candidates match a `container.get()` call. The `priority` field on `BindingDescriptor` and all documentation previously stated "lower value wins" — this was incorrect. The code (`max()` in `_get_best_candidate`) was always correct; only the docs have been updated.
 - `get_all()` returns bindings sorted **ascending** by priority (lowest first), so the highest-priority binding is last — consistent with `max()` selection in `get()`.
@@ -47,10 +62,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DIContainer.__repr__` now reports scope counts and validation state:
   `DIContainer(singleton=3, request=2, dependent=6, validated=True)`
 
+#### `@Provider` return-type resolution — fails fast instead of silently
+- ⚠️ A `@Provider` whose return annotation is a quoted forward reference that
+  cannot be resolved from the function's module globals (e.g. a
+  `TYPE_CHECKING`-only import, or a locally-defined type) now raises
+  `TypeError` at registration time, naming the provider and the offending
+  annotation. Previously such a provider silently registered the *string*
+  itself as the binding interface, which then corrupted dependency injection
+  for every other binding in the container (see Fixed below). Callers whose
+  providers previously appeared to work by accident must import the
+  annotated type at runtime instead of guarding it behind `TYPE_CHECKING`.
+
 ### Fixed
 
 - `test_live.py`: imports of `Annotated`, `LiveMeta`, `LiveProxy` moved to module level — locally-scoped imports inside test functions were invisible to `get_type_hints()` under `from __future__ import annotations`, causing silent `NameError` that left injected parameters unresolved.
 - `_check_provider_scope_violation` passes `localns=self._build_localns()` to `get_type_hints()` — without this, types defined inside test/setup functions were silently dropped, causing scope-leak detection to produce false negatives.
+- `@Provider` with a quoted return annotation (e.g. `-> "ProfilingSettings"`) plus an unresolvable parameter annotation could register the plain `str` `'ProfilingSettings'` as the binding interface instead of the class. `ProviderBinding` now resolves nested forward references properly and raises `TypeError` if the annotation still cannot be resolved to a type or generic alias, rather than silently accepting a string.
+- `DIContainer._build_localns` no longer raises `AttributeError` and aborts building the container-wide type-hint namespace when one binding's interface is not a real type (e.g. left over from the bug above) — the malformed binding is now skipped with a `logger.warning`, and every other binding still resolves correctly.
+- `_collect_kwargs_sync` / `_collect_kwargs_async` no longer swallow *every* exception from `get_type_hints()` into an empty hints dict. Only `NameError` (a genuinely unresolvable annotation) is now tolerated and logged; any other exception propagates. Previously an unrelated bug elsewhere (such as the `AttributeError` above) could silently zero out all injected keyword arguments for a completely unrelated provider or constructor, surfacing as a confusing `TypeError: ... missing N required positional arguments`.
+- `_check_scope_violation` now passes `localns=self._build_localns()` to `get_type_hints()` for a `ClassBinding`'s `__init__` — its provider twin (`_check_provider_scope_violation`) already did this. Previously, a class whose `__init__` referenced a locally-defined dependency type raised `NameError`, which was swallowed and reported as "no leaks found" — a genuine `SINGLETON` → `REQUEST`/`SESSION` scope leak validated clean.
+- `_inject_class_vars_sync` / `_inject_class_vars_async` no longer swallow every exception from `get_type_hints()`; only `NameError` is tolerated (and logged), matching `_collect_kwargs_*`. Previously an unrelated error left annotated class attributes unset, and the failure surfaced much later as an `AttributeError` in unrelated code.
+- `_collect_dependencies` / `_get_provider_return_type` / the class-var lookup inside `_get_dependencies` now log a `logger.warning` when they swallow a `get_type_hints()` failure while building the dependency graph (`describe()`). Previously the graph silently lost nodes with no trace.
+
+### Added
+
+- `AnnotationResolutionError` (a `ValidationError` subclass), exported from `providify`. Raised by the scope-leak validators when a binding's annotations cannot be resolved — names the exact binding, the original exception, and how to fix it.
 
 ---
 

@@ -768,6 +768,12 @@ class AlsoDetected:
 
 Raised for other scope leaks — e.g. a `@Singleton` holding a `@Component` (DEPENDENT) dep directly. This is less critical but still signals a design issue: the singleton pins one `@Component` instance for its entire lifetime instead of getting a fresh one.
 
+### AnnotationResolutionError
+
+Raised when scope-leak validation cannot even read a binding's annotations — `get_type_hints()` itself raised (e.g. `NameError` for a locally-defined or `TYPE_CHECKING`-only type). A validator that cannot read the annotations has no evidence either way, so the container refuses to report a false "clean" bill of health instead of silently skipping the check.
+
+Fix: import the annotated type at runtime instead of under `TYPE_CHECKING`, or move locally-defined types to module level.
+
 ---
 
 ## Lifecycle hooks

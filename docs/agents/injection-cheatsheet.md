@@ -183,3 +183,5 @@ class Database:
 | `ClassBindingNotDecoratedError` | `register()` on an undecorated class |
 | `ProviderBindingNotDecoratedError` | `provide()` on an undecorated function |
 | `TypeError` from `@Named` | use `@Named(name="x")`, not bare/positional |
+| `TypeError` naming a `@Provider` and its return annotation | the return type (even quoted, e.g. `-> "Foo"`) can't be resolved to a real type — `Foo` is `TYPE_CHECKING`-only or defined inside a function; import it at module level instead |
+| `AnnotationResolutionError` | scope-leak validation couldn't read a binding's `__init__`/provider/class-var annotations (`get_type_hints()` raised, e.g. `NameError`) — the container refuses to report a clean bill of health it can't prove. Import the annotated type at runtime instead of under `TYPE_CHECKING`, or move locally-defined types to module level |

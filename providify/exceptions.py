@@ -1,5 +1,8 @@
 from __future__ import annotations
-from typing import Any, Callable
+
+from collections.abc import Callable
+from typing import Any
+
 from .metadata import LiveInjectionViolation, ScopeLeak
 
 
@@ -129,3 +132,44 @@ class ScopeViolationDetectedError(ValidationError):
             ]
         )
         super().__init__(message)
+
+
+class AnnotationResolutionError(ValidationError):
+    """Raised when a validator cannot even READ a binding's annotations.
+
+    A validator's whole job is to prove a binding is safe (no scope leaks).
+    If ``get_type_hints()`` itself fails — e.g. a ``NameError`` from a
+    locally-defined type absent from both ``__globals__`` and the container's
+    ``localns`` — the validator has no evidence either way. Silently treating
+    "I don't know" as "no leaks found" (returning an empty list) reports a
+    clean bill of health the validator cannot actually prove, which is worse
+    than raising: it is a false negative that looks identical to genuine
+    safety. Raising instead forces the container to refuse to start rather
+    than lie about having validated something it never could evaluate.
+
+    Subclassing ``ValidationError`` (rather than, say, ``LookupError``)
+    matters operationally: ``validate_all()`` catches ``ValidationError``-
+    family exceptions and appends ``str(e)`` to its violations list, so an
+    unresolvable annotation surfaces as a *violation message* — never as a
+    crash that bypasses the normal "collect every violation" flow, and never
+    as a false "you're fine".
+
+    Attributes:
+        owner_name: Human-readable name of the binding/class/function whose
+            annotations could not be resolved (e.g. ``"Impl.__init__"`` or
+            ``"@Provider(make_impl)"``).
+        cause: The original exception raised by ``get_type_hints()`` (e.g.
+            ``NameError``, ``AttributeError``) — chained via ``__cause__``.
+    """
+
+    def __init__(self, owner_name: str, cause: Exception) -> None:
+        self.owner_name = owner_name
+        self.cause = cause
+        super().__init__(
+            f"Cannot resolve type hints for '{owner_name}' "
+            f"({type(cause).__name__}: {cause}). Scope-leak validation cannot "
+            f"run for it, so the container refuses to start rather than "
+            f"report a clean bill of health it cannot prove.\n"
+            f"Fix: import the annotated type at runtime instead of under "
+            f"TYPE_CHECKING, or move locally-defined types to module level."
+        )

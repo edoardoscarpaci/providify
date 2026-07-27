@@ -8,11 +8,12 @@ import logging
 import threading
 import types
 import warnings
+import weakref
+from collections.abc import Callable
 from types import ModuleType
 from typing import (
     Annotated,
     Any,
-    Callable,
     ClassVar,
     TypeVar,
     Union,
@@ -20,8 +21,6 @@ from typing import (
     get_origin,
     get_type_hints,
 )
-
-import weakref
 
 from .binding import AnyBinding, ClassBinding, ProviderBinding
 from .decorator.interceptor import (
@@ -35,23 +34,27 @@ from .decorator.lifecycle import (
     _get_observes_marker,
 )
 from .descriptor import DIContainerDescriptor
-from .exceptions import CircularDependencyError, LiveInjectionRequiredError
+from .exceptions import (
+    AnnotationResolutionError,
+    CircularDependencyError,
+    LiveInjectionRequiredError,
+)
 from .metadata import (
     LiveInjectionViolation,
     Scope,
     ScopeLeak,
-    _has_own_metadata,
-    _has_configuration_module,
-    _is_scope_leak,
     _get_metadata,
     _get_provider_metadata,
+    _has_configuration_module,
+    _has_own_metadata,
+    _is_scope_leak,
 )
 from .resolution import (
-    _resolution_stack,
-    _current_stack,
-    _format_cycle,
     _UNRESOLVED,
     _current_injection_point,
+    _current_stack,
+    _format_cycle,
+    _resolution_stack,
 )
 from .scanner import ContainerScanner, DefaultContainerScanner
 from .scope import ScopeContext
@@ -59,8 +62,8 @@ from .type import (
     DelegateMeta,
     EventMeta,
     EventProxy,
-    InjectMeta,
     InjectionPoint,
+    InjectMeta,
     InstanceMeta,
     InstanceProxy,
     InvocationContext,
@@ -928,9 +931,9 @@ class DIContainer:
         Returns:
             A (possibly empty) list of matching bindings.
         """
+        from .binding import ClassBinding as _ClassBinding
         from .decorator.scope import Default as _Default
         from .metadata import _is_alternative
-        from .binding import ClassBinding as _ClassBinding
 
         # @Default is semantically equivalent to no qualifier
         if qualifier is _Default:
@@ -1620,6 +1623,13 @@ class DIContainer:
                         the last write wins. Both builds produce identical
                         results, so correctness is preserved.
 
+        Edge cases:
+            - A binding whose ``interface`` is not a type or generic alias
+              (e.g. corrupted by external mutation) is skipped with a
+              ``logger.warning`` rather than raising — this namespace is
+              shared by every resolution in the container, so one malformed
+              binding must never abort construction for all the others.
+
         Returns:
             A ``dict[str, type]`` mapping class ``__name__`` → class object.
         """
@@ -1631,11 +1641,20 @@ class DIContainer:
                 # map the origin type (Repository) instead so string annotations
                 # like "Repository" in PEP-563 deferred mode still resolve.
                 iface_origin = get_origin(b.interface)
-                if iface_origin is not None:
-                    # Generic alias: map "Repository" → Repository (origin type)
-                    localns[iface_origin.__name__] = iface_origin
+                iface_key = iface_origin if iface_origin is not None else b.interface
+                # WHY the getattr guard: this namespace is CONTAINER-WIDE, so an
+                # unhandled AttributeError here silently zeroes the type hints of
+                # every other binding (the original forward-reference bug).  One
+                # malformed interface must cost only itself.
+                iface_name = getattr(iface_key, "__name__", None)
+                if iface_name is None:
+                    logger.warning(
+                        "Skipping binding with non-type interface %r while building "
+                        "the type-hint namespace; its dependents may fail to resolve.",
+                        b.interface,
+                    )
                 else:
-                    localns[b.interface.__name__] = b.interface  # type: ignore[union-attr]
+                    localns[iface_name] = iface_key  # type: ignore[assignment]
                 if isinstance(b, ClassBinding):
                     # Implementation — annotations may reference the concrete
                     # class directly rather than the abstract interface.
@@ -1665,6 +1684,93 @@ class DIContainer:
             self._localns_cache = localns
         return self._localns_cache
 
+    def _resolve_hints_or_warn(
+        self,
+        target: Callable[..., Any] | type,
+        owner_name: str,
+    ) -> dict[str, Any]:
+        """Resolve *target*'s type hints, tolerating only unresolvable names.
+
+        Shared by :meth:`_collect_kwargs_sync` / :meth:`_collect_kwargs_async`
+        (which pass a callable) and :meth:`_inject_class_vars_sync` /
+        :meth:`_inject_class_vars_async` (which pass a class) — ``get_type_hints``
+        accepts both equally well, so one tolerant helper serves the whole
+        Tier-1 "what gets injected" policy.
+
+        Args:
+            target:     The callable or class whose annotations are evaluated.
+            owner_name: Human-readable name used in the warning message.
+
+        Returns:
+            The resolved hints, or ``{}`` when a name in the annotations cannot
+            be resolved.
+
+        Raises:
+            Exception: Anything other than ``NameError`` is re-raised unchanged.
+
+        Edge cases:
+            - ``NameError`` → ``{}`` plus a warning. This is the legitimate case
+              the original broad except protected: PEP-563 annotations that
+              reference types absent from both ``target``'s globals and the
+              container's localns (e.g. function-local classes with defaults).
+        """
+        try:
+            return get_type_hints(
+                target, include_extras=True, localns=self._build_localns()
+            )
+        except NameError as exc:
+            # WHY narrow + warn: returning {} drops EVERY injected kwarg for this
+            # callable, which downstream looks like a bogus "missing N required
+            # positional arguments" TypeError from the callable itself.  Only an
+            # unresolvable annotation name may cause that, and never silently —
+            # any other exception signals a real defect and must propagate.
+            logger.warning(
+                "Cannot resolve type hints for '%s' (%s: %s); no dependencies "
+                "will be injected into it.",
+                owner_name,
+                type(exc).__name__,
+                exc,
+            )
+            return {}
+
+    def _resolve_hints_or_raise(
+        self,
+        target: Callable[..., Any] | type,
+        owner_name: str,
+    ) -> dict[str, Any]:
+        """Resolve *target*'s type hints, raising on ANY failure — the Tier-2 policy.
+
+        Shared by the validation call sites (:meth:`_collect_class_var_hints`,
+        :meth:`_check_scope_violation`, :meth:`_check_provider_scope_violation`).
+        Unlike :meth:`_resolve_hints_or_warn`, this helper never tolerates
+        ``NameError`` (or anything else): a validator's entire job is to prove
+        a binding is safe, and if it cannot even read the annotations it has no
+        evidence either way. Returning an empty result set here would mean "no
+        leaks found" — a false "all clear" the caller cannot actually prove.
+        Invariant: a validator that cannot read the annotations must never
+        return an empty result set, because empty means "clean".
+
+        Args:
+            target:     The callable or class whose annotations are evaluated.
+            owner_name: Human-readable name of the binding, embedded in the
+                        raised error so the failure is attributable.
+
+        Returns:
+            The resolved hints. Never ``{}`` as a failure signal — an empty
+            dict here means the target genuinely has no annotations.
+
+        Raises:
+            AnnotationResolutionError: Wraps any exception from
+                ``get_type_hints`` (including ``NameError``), naming *owner_name*
+                and the original exception.
+        """
+        try:
+            return get_type_hints(
+                target, include_extras=True, localns=self._build_localns()
+            )
+        except Exception as exc:
+            raise AnnotationResolutionError(owner_name, exc) from exc
+
     def _collect_kwargs_sync(
         self,
         fn: Callable[..., Any],
@@ -1688,13 +1794,11 @@ class DIContainer:
 
         Raises:
             LookupError: If a required parameter (no default) cannot be resolved.
+            Exception: Propagated from :meth:`_resolve_hints_or_warn` when
+                annotation evaluation fails for any reason other than an
+                unresolvable name — see that method for the rationale.
         """
-        try:
-            hints = get_type_hints(
-                fn, include_extras=True, localns=self._build_localns()
-            )
-        except Exception:
-            hints = {}
+        hints = self._resolve_hints_or_warn(fn, owner_name)
 
         hints.pop("return", None)
         sig = inspect.signature(fn)
@@ -1749,13 +1853,11 @@ class DIContainer:
 
         Raises:
             LookupError: If a required parameter (no default) cannot be resolved.
+            Exception: Propagated from :meth:`_resolve_hints_or_warn` when
+                annotation evaluation fails for any reason other than an
+                unresolvable name — see that method for the rationale.
         """
-        try:
-            hints = get_type_hints(
-                fn, include_extras=True, localns=self._build_localns()
-            )
-        except Exception:
-            hints = {}
+        hints = self._resolve_hints_or_warn(fn, owner_name)
 
         hints.pop("return", None)
         sig = inspect.signature(fn)
@@ -1813,7 +1915,7 @@ class DIContainer:
             are silently omitted.
 
         Edge cases:
-            - ``get_type_hints`` raises → swallowed; returns ``[]``.
+            - ``get_type_hints`` raises → swallowed **and logged**; returns ``[]``.
             - ``return`` hint present  → stripped before iteration.
             - No providify parameters → returns ``[]``.
         """
@@ -1821,7 +1923,19 @@ class DIContainer:
             hints = get_type_hints(
                 fn, include_extras=True, localns=self._build_localns()
             )
-        except Exception:
+        except Exception as exc:
+            # Tier 3 — advisory/reporting path (dependency-graph construction).
+            # A partial or missing graph node is a worse debugging experience,
+            # not a wiring bug, so the failure is swallowed — but it must never
+            # be silent, or the gap in the graph looks like "no dependencies"
+            # rather than "couldn't tell".
+            logger.warning(
+                "Dependency graph for '%s' is incomplete — cannot resolve "
+                "type hints (%s: %s).",
+                getattr(fn, "__qualname__", fn),
+                type(exc).__name__,
+                exc,
+            )
             hints = {}
 
         hints.pop("return", None)
@@ -2224,23 +2338,20 @@ class DIContainer:
         Raises:
             LookupError: If a required class-var annotation (non-optional) refers to
                          a type that has no registered binding.
+            Exception: Propagated from :meth:`_resolve_hints_or_warn` when
+                annotation evaluation fails for any reason other than an
+                unresolvable name — see that method for the rationale.
 
         Edge cases:
             - cls has no annotations at all       → no-op (hints is empty)
             - annotation has no providify marker  → silently skipped
             - name also appears in __init__ sig   → skipped; constructor kwargs win
-            - get_type_hints raises               → swallowed; no class-var injection
+            - unresolvable name (NameError)       → warning + no class-var injection
+            - any other exception                 → propagates
         """
-        try:
-            # include_extras=True preserves Annotated[T, InjectMeta(...)] wrappers.
-            # Without it, get_type_hints strips Annotated and the metadata is lost.
-            hints = get_type_hints(
-                cls, include_extras=True, localns=self._build_localns()
-            )
-        except Exception:
-            # Annotation evaluation can fail for locally-defined types absent from
-            # __globals__ (same failure mode as _collect_kwargs_sync). Bail out.
-            hints = {}
+        hints = self._resolve_hints_or_warn(
+            cls, f"{cls.__name__} (class-level annotations)"
+        )
 
         if not hints:
             return
@@ -2287,15 +2398,14 @@ class DIContainer:
 
         Raises:
             LookupError: If a required class-var annotation refers to an unregistered type.
+            Exception: Propagated from :meth:`_resolve_hints_or_warn` — see
+                :meth:`_inject_class_vars_sync`.
 
         Edge cases: same as :meth:`_inject_class_vars_sync`.
         """
-        try:
-            hints = get_type_hints(
-                cls, include_extras=True, localns=self._build_localns()
-            )
-        except Exception:
-            hints = {}
+        hints = self._resolve_hints_or_warn(
+            cls, f"{cls.__name__} (class-level annotations)"
+        )
 
         if not hints:
             return
@@ -2481,8 +2591,11 @@ class DIContainer:
     def _get_provider_return_type(self, fn: Callable[..., Any]) -> type | None:
         """Read the ``return`` type hint from a provider function.
 
-        Returns ``None`` (and suppresses all exceptions) if the hints cannot
-        be resolved — e.g. when a forward reference is unresolvable at runtime.
+        Returns ``None`` (and logs a warning) if the hints cannot be resolved
+        — e.g. when a forward reference is unresolvable at runtime. Tier 3 —
+        advisory/reporting: a missing return type is a worse debugging
+        experience, not a wiring bug, so the failure is swallowed but never
+        silent.
 
         Args:
             fn: The provider callable to inspect.
@@ -2493,7 +2606,13 @@ class DIContainer:
         try:
             hints = get_type_hints(fn)
             return hints.get("return")
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Cannot resolve return type hint for '%s' (%s: %s).",
+                getattr(fn, "__qualname__", fn),
+                type(exc).__name__,
+                exc,
+            )
             return None
 
     # ── Lifecycle hooks ───────────────────────────────────────────
@@ -2938,25 +3057,28 @@ class DIContainer:
         Returns:
             ``dict[attr_name → hint]`` — only entries that carry providify metadata
             (``Inject[T]``, ``Live[T]``, ``Lazy[T]``) and are NOT ``__init__``
-            parameters.  Empty dict if ``get_type_hints`` raises.
+            parameters.
+
+        Raises:
+            AnnotationResolutionError: If ``get_type_hints`` cannot resolve
+                *cls*'s annotations. A validator that cannot read the
+                annotations must not silently report "no injection points" —
+                see :meth:`_resolve_hints_or_raise`. Callers on the reporting
+                tier (:meth:`_get_dependencies`) catch this and downgrade it
+                to a warning; validators let it propagate.
 
         Edge cases:
             - cls has no annotations              → ``{}``
-            - ``get_type_hints`` raises            → ``{}``
+            - ``get_type_hints`` raises            → ``AnnotationResolutionError``
             - name is an ``__init__`` param       → excluded (already handled by
                                                     the ``__init__``-based callers)
             - name has no providify metadata      → excluded
         """
-        try:
-            # include_extras=True — without it Annotated[T, InjectMeta(...)] is
-            # stripped to bare T and the metadata marker is lost.
-            hints = get_type_hints(
-                cls, include_extras=True, localns=self._build_localns()
-            )
-        except Exception:
-            # Annotation evaluation can fail for locally-defined types absent from
-            # __globals__.  Same defensive swallow used throughout the container.
-            return {}
+        # include_extras=True — without it Annotated[T, InjectMeta(...)] is
+        # stripped to bare T and the metadata marker is lost.
+        hints = self._resolve_hints_or_raise(
+            cls, f"{cls.__name__} (class-level annotations)"
+        )
 
         # Exclude __init__ params — they're already validated / graphed via the
         # existing __init__-based path.  Keeping them here would double-count them.
@@ -3004,20 +3126,33 @@ class DIContainer:
         Returns:
             A list of :class:`~providify.metadata.ScopeLeak` instances, one
             per violating dependency. An empty list means no leaks were found.
+
+        Raises:
+            LiveInjectionRequiredError: If any ``REQUEST``/``SESSION`` scoped
+                dependency is injected without ``Live[T]``/``Instance[T]``.
+            AnnotationResolutionError: If ``__init__``'s (or a class var's)
+                annotations cannot be resolved — see
+                :meth:`_resolve_hints_or_raise`. A validator that cannot read
+                the annotations must not report "no leaks found"; it raises
+                instead so the container never reports a clean bill of health
+                it cannot prove.
         """
         leaks: list[ScopeLeak] = []
         # Accumulated Live[T] violations — raised as a group so the developer
         # sees all affected parameters at once, not just the first one.
         live_violations: list[LiveInjectionViolation] = []
-        try:
-            # include_extras=True preserves Annotated wrappers — we need the
-            # InjectMeta / LazyMeta / LiveMeta inside them to distinguish HOW
-            # each dep is wired, not just what type it resolves to.
-            init_hints = get_type_hints(
-                binding.implementation.__init__, include_extras=True
-            )
-        except Exception:
-            return leaks
+        # include_extras=True preserves Annotated wrappers — we need the
+        # InjectMeta / LazyMeta / LiveMeta inside them to distinguish HOW
+        # each dep is wired, not just what type it resolves to.
+        # WHY localns here (this is the fix): without it, from __future__
+        # import annotations makes any locally-defined __init__ parameter
+        # type raise NameError, which used to be swallowed below — a real
+        # scope leak would silently validate clean. _build_localns() maps
+        # every registered binding's name, resolving those cases too.
+        init_hints = self._resolve_hints_or_raise(
+            binding.implementation.__init__,
+            f"{binding.implementation.__name__}.__init__",
+        )
 
         init_hints.pop("return", None)
 
@@ -3059,7 +3194,7 @@ class DIContainer:
                     # time — that instance becomes stale the moment the scope boundary
                     # rotates.  Instance[T] re-resolves on every .get() call (like
                     # Live[T]) so it is also safe here.
-                    if not isinstance(inject_marker, (LiveMeta, InstanceMeta)):
+                    if not isinstance(inject_marker, LiveMeta | InstanceMeta):
                         live_violations.append(
                             LiveInjectionViolation(
                                 binding=(binding.implementation, binding.scope),
@@ -3108,11 +3243,15 @@ class DIContainer:
         Raises:
             LiveInjectionRequiredError: If any ``REQUEST`` or ``SESSION``
                 scoped dependency is injected without ``Live[T]`` wrapping.
+            AnnotationResolutionError: If *binding.fn*'s annotations cannot be
+                resolved — see :meth:`_resolve_hints_or_raise`. A validator
+                that cannot read the annotations must not report "no leaks
+                found".
 
         Edge cases:
             - Provider with no parameters            → empty list, no error
             - Provider scope is DEPENDENT            → no leak risk, returns []
-            - ``get_type_hints`` raises              → returns [] (defensive)
+            - ``get_type_hints`` raises              → ``AnnotationResolutionError``
             - Provider parameter is ``Live[T]``      → safe, not flagged
         """
         # DEPENDENT providers create a fresh instance every call — they never
@@ -3124,21 +3263,15 @@ class DIContainer:
         leaks: list[ScopeLeak] = []
         live_violations: list[LiveInjectionViolation] = []
 
-        try:
-            # include_extras=True — required to preserve Annotated wrappers so
-            # we can detect Live[T] / Lazy[T] / Inject[T] markers on each param.
-            # localns — from __future__ import annotations makes all annotations
-            # lazy strings; locally-defined types are absent from fn.__globals__.
-            # _build_localns() maps every registered class name → type, letting
-            # get_type_hints resolve parameter types that aren't in __globals__.
-            fn_hints = get_type_hints(
-                binding.fn, include_extras=True, localns=self._build_localns()
-            )
-        except Exception:
-            # Annotation evaluation can fail for locally-defined parameter types
-            # even after localns injection (e.g. complex forward references).
-            # Defensive posture: skip validation rather than crash.
-            return leaks
+        # include_extras=True — required to preserve Annotated wrappers so
+        # we can detect Live[T] / Lazy[T] / Inject[T] markers on each param.
+        # localns — from __future__ import annotations makes all annotations
+        # lazy strings; locally-defined types are absent from fn.__globals__.
+        # _build_localns() maps every registered class name → type, letting
+        # get_type_hints resolve parameter types that aren't in __globals__.
+        fn_hints = self._resolve_hints_or_raise(
+            binding.fn, f"@Provider({binding.fn.__name__})"
+        )
 
         fn_hints.pop("return", None)
 
@@ -3168,7 +3301,7 @@ class DIContainer:
                     # A singleton provider that receives a REQUEST-scoped param
                     # will call container.get(T) once and hold that instance —
                     # it becomes stale on the next request boundary.
-                    if not isinstance(inject_marker, (LiveMeta, InstanceMeta)):
+                    if not isinstance(inject_marker, LiveMeta | InstanceMeta):
                         live_violations.append(
                             LiveInjectionViolation(
                                 # ProviderBinding has no implementation class —
@@ -3333,6 +3466,14 @@ class DIContainer:
 
         Raises:
             TypeError: *binding* is not a ``ClassBinding`` or ``ProviderBinding``.
+
+        Edge cases:
+            - Class-var hints for a ``ClassBinding`` fail to resolve
+              (``AnnotationResolutionError`` from :meth:`_collect_class_var_hints`)
+              → downgraded to a logged warning; the class-var deps are omitted
+              from the returned list but ``__init__`` deps are unaffected. This
+              tier is reporting/enrichment (``describe()``), not wiring, so a
+              partial graph beats aborting the whole traversal.
         """
         if isinstance(binding, ClassBinding):
             deps = self._collect_dependencies(
@@ -3344,7 +3485,22 @@ class DIContainer:
             # points too (var: Inject[T]), but invisible to _collect_dependencies
             # which only reads __init__.  The helper already filters to hints that
             # carry providify metadata and excludes __init__ param names.
-            class_var_hints = self._collect_class_var_hints(binding.implementation)
+            #
+            # Tier downgrade: _collect_class_var_hints is strict (raises
+            # AnnotationResolutionError) because its OTHER caller is a
+            # validator. Here we are building a dependency graph for
+            # describe() — advisory/reporting, not wiring — so a resolution
+            # failure is downgraded to a logged warning and a partial graph,
+            # rather than aborting the whole graph traversal.
+            try:
+                class_var_hints = self._collect_class_var_hints(binding.implementation)
+            except AnnotationResolutionError as exc:
+                logger.warning(
+                    "Dependency graph for '%s' is incomplete: %s",
+                    binding.implementation.__name__,
+                    exc,
+                )
+                class_var_hints = {}
             for hint in class_var_hints.values():
                 resolved = self._resolve_dependency(
                     hint,
