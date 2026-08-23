@@ -36,7 +36,6 @@ from providify.container import DIContainer
 from providify.decorator.module import Configuration
 from providify.decorator.scope import Component, Provider, Singleton
 
-
 # ─────────────────────────────────────────────────────────────────
 #  Module-level sentinel for provider return-type tests
 #
@@ -671,3 +670,34 @@ class TestDIContainerAutoScan:
             assert recorded == [False]
         finally:
             sys.modules.pop(mod.__name__, None)
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Plan 002 — returns= discovery through scan()
+# ─────────────────────────────────────────────────────────────────
+
+
+class _ScannedReturnsWidget:
+    """Interface bound only via returns= — the scanned factory has no annotation."""
+
+
+class TestScanReturnsOverride:
+    """Covers Test coverage item 17: scan() must carry `returns=` through for free.
+
+    scanner.py:233 passes the raw function straight to ProviderBinding, so
+    a module-level @Provider(returns=...) discovered by scan() must resolve
+    under the explicit interface with no extra wiring.
+    """
+
+    def test_scan_registers_provider_under_explicit_returns_interface(
+        self, container: DIContainer, fake_mod: types.ModuleType
+    ) -> None:
+        @Provider(returns=_ScannedReturnsWidget)
+        def make_widget():
+            return object.__new__(_ScannedReturnsWidget)
+
+        _add(fake_mod, make_widget)
+        container.scan(fake_mod)
+
+        result = container.get(_ScannedReturnsWidget)
+        assert isinstance(result, _ScannedReturnsWidget)

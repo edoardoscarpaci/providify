@@ -145,6 +145,25 @@ explicit, no-scan path.
 `@Named` requires the keyword form `@Named(name="smtp")` — both bare `@Named` and
 positional `@Named("smtp")` raise `TypeError`.
 
+If the interface a factory produces is only known at call time — a
+parameterised generic alias built inside a loop, for example — pass
+`returns=` on `@Provider` or `container.provide()` instead of mutating
+`fn.__annotations__["return"]` before registering:
+
+```python
+for model in (User, Order):
+    def repo_factory(model=model) -> Any:
+        return InMemoryRepo(model)
+    container.provide(repo_factory, returns=Repository[model])
+```
+
+Mutating another function's `__annotations__` is an anti-pattern (see
+`anti-patterns.md`): it patches a function object the caller may not own,
+the ordering between decoration and the mutation is load-bearing but
+invisible in either signature, and it breaks the moment anything reads
+annotations at decoration time instead of registration time. `returns=`
+bypasses return-annotation reading entirely, so there is nothing to patch.
+
 ---
 
 ## R11 — Manage the container's lifecycle

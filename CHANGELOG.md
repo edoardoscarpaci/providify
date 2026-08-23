@@ -101,6 +101,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TypeError: @Named requires a keyword argument: use @Named(name='smtp') instead of @Named('smtp').`
   Previously the runtime produced an opaque `TypeError: 'str' object is not callable`.
 
+#### `returns=` — explicit interface override for `@Provider` and `provide()`
+- `DIContainer.provide(fn, *, returns=None)` and `@Provider(returns=None)` accept an
+  explicit binding interface: a type, a parameterised generic alias (e.g.
+  `Repository[User]`), an `Annotated[...]` wrapper (unwrapped automatically), or a
+  zero-arg callable evaluated once at registration time (`ProviderBinding`
+  construction), not at decoration time.
+- When `returns=` is given, the factory's return annotation is not read, not
+  evaluated, and not validated — it can be `-> Any`, an unresolvable forward ref, or
+  absent entirely. This removes the only reason a caller ever had to mutate
+  `factory.__annotations__["return"]` before registering, e.g. for an interface only
+  nameable as a generic alias built inside a loop.
+- Precedence, highest first: `provide(fn, returns=...)` call-site override, then
+  `@Provider(returns=...)` decoration-time override, then `fn`'s resolved return
+  annotation.
+- Omitting `returns=` changes nothing: behaviour and error messages on the
+  annotation-derived path are unchanged.
+
 ### Changed
 
 #### ⚠️ Scope-leak validation now raises instead of silently reporting clean

@@ -44,7 +44,6 @@ from providify.decorator.scope import Priority
 from providify.exceptions import NotDecoratedError
 from providify.metadata import _get_metadata, _get_provider_metadata
 
-
 # ─────────────────────────────────────────────────────────────────
 #  @Named — sets qualifier on classes and providers
 # ─────────────────────────────────────────────────────────────────
@@ -411,3 +410,98 @@ class TestDecoratorStacking:
         assert meta is not None
         assert meta.qualifier == "stacked"
         assert meta.priority == 6
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Plan 002 — ProviderMetadata.returns
+# ─────────────────────────────────────────────────────────────────
+
+
+class _ReturnsMetadataTarget:
+    """Module-level type used as a `returns=` value across metadata tests."""
+
+
+class TestProviderMetadataReturns:
+    """Covers Test coverage item 18 — the `returns` slot's merge/pickle contract."""
+
+    def test_merge_without_returns_key_preserves_existing_returns(self) -> None:
+        """ProviderMetadata(returns=X).merge(qualifier='q').returns is X.
+
+        merge() must not clobber `returns` when the key is simply absent
+        from the update kwargs — only an explicit `returns=None` should.
+        """
+        from providify.metadata import ProviderMetadata
+
+        meta = ProviderMetadata(returns=_ReturnsMetadataTarget)
+        merged = meta.merge(qualifier="q")
+
+        assert merged.returns is _ReturnsMetadataTarget
+
+    def test_stacked_provider_qualifier_over_provider_returns_preserves_returns(
+        self,
+    ) -> None:
+        """@Provider(qualifier="q") on top of @Provider(returns=X) must not clobber returns back to None."""
+
+        @Provider(qualifier="q")
+        @Provider(returns=_ReturnsMetadataTarget)
+        def make_thing():
+            return object.__new__(_ReturnsMetadataTarget)
+
+        meta = _get_provider_metadata(make_thing)
+        assert meta is not None
+        assert meta.returns is _ReturnsMetadataTarget
+
+    def test_stacked_provider_returns_over_provider_qualifier_preserves_returns(
+        self,
+    ) -> None:
+        """The reverse stacking order must equally preserve returns."""
+
+        @Provider(returns=_ReturnsMetadataTarget)
+        @Provider(qualifier="q")
+        def make_thing():
+            return object.__new__(_ReturnsMetadataTarget)
+
+        meta = _get_provider_metadata(make_thing)
+        assert meta is not None
+        assert meta.returns is _ReturnsMetadataTarget
+
+    def test_repr_includes_returns(self) -> None:
+        """repr() must surface the returns field for debuggability."""
+        from providify.metadata import ProviderMetadata
+
+        meta = ProviderMetadata(returns=_ReturnsMetadataTarget)
+
+        assert "returns=" in repr(meta)
+
+    def test_pickle_round_trips_returns_set_to_module_level_type(self) -> None:
+        """A `returns` value that is itself a module-level type must survive pickling."""
+        import pickle
+
+        from providify.metadata import ProviderMetadata
+
+        meta = ProviderMetadata(returns=_ReturnsMetadataTarget)
+        restored = pickle.loads(pickle.dumps(meta))
+
+        assert restored.returns is _ReturnsMetadataTarget
+
+    def test_setstate_from_pre_1_2_payload_defaults_returns_to_none(self) -> None:
+        """A pickle written before `returns` existed must not raise on first read.
+
+        `__setstate__` must seed defaults for slots missing from `state` so a
+        pre-1.2 payload (no "returns" key) unpickles into a usable object
+        instead of leaving the slot unset and raising AttributeError.
+        """
+        from providify.metadata import ProviderMetadata
+
+        meta = ProviderMetadata.__new__(ProviderMetadata)
+        meta.__setstate__(
+            {
+                "qualifier": None,
+                "priority": 0,
+                "singleton": False,
+                "is_async": False,
+                "scope": None,
+            }
+        )
+
+        assert meta.returns is None

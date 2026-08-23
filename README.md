@@ -251,6 +251,17 @@ async def make_pool() -> ConnectionPool:
 
 Providers also accept `qualifier=` and `priority=`.
 
+`returns=` overrides the resolved interface explicitly, bypassing the return
+annotation entirely — useful when the interface is only known at call time
+(e.g. a generic alias built inside a loop):
+
+```python
+for model in (User, Order):
+    def repo_factory(model=model):
+        return InMemoryRepo(model)
+    container.provide(repo_factory, returns=Repository[model])
+```
+
 ---
 
 ## Container API

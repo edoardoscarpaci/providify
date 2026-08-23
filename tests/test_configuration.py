@@ -22,10 +22,9 @@ from __future__ import annotations
 import pytest
 
 from providify.container import DIContainer
-from providify.decorator.scope import Provider, Singleton
 from providify.decorator.module import Configuration
+from providify.decorator.scope import Provider, Singleton
 from providify.metadata import _has_configuration_module
-
 
 # ─────────────────────────────────────────────────────────────────
 #  @Configuration decorator tests
@@ -300,3 +299,49 @@ class TestAinstall:
 
         # The injected cache dep was resolved correctly via async path
         assert repo.cache.ready is True  # type: ignore[attr-defined]
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Plan 002 — returns= discovery through @Configuration / install()
+# ─────────────────────────────────────────────────────────────────
+
+
+class _ReturnsRepository:
+    """Interface bound only via returns= — never named by any annotation below."""
+
+
+class TestConfigurationReturnsOverride:
+    """@Configuration must carry `@Provider(returns=...)` through install() for free.
+
+    Covers Test coverage item 16: both a plain method provider and a
+    @property field provider must register under the explicit interface,
+    since install() copies effective_fn.__dict__ / proxies to __func__ per
+    the plan's discovery-path note (container.py:3823/3826).
+    """
+
+    def test_method_provider_with_returns_registers_under_explicit_interface(
+        self, container: DIContainer
+    ) -> None:
+        @Configuration
+        class MethodReturnsModule:
+            @Provider(returns=_ReturnsRepository)
+            def make_repo(self):
+                return object.__new__(_ReturnsRepository)
+
+        container.install(MethodReturnsModule)
+
+        assert isinstance(container.get(_ReturnsRepository), _ReturnsRepository)
+
+    def test_property_provider_with_returns_registers_under_explicit_interface(
+        self, container: DIContainer
+    ) -> None:
+        @Configuration
+        class PropertyReturnsModule:
+            @property
+            @Provider(returns=_ReturnsRepository)
+            def repo(self):
+                return object.__new__(_ReturnsRepository)
+
+        container.install(PropertyReturnsModule)
+
+        assert isinstance(container.get(_ReturnsRepository), _ReturnsRepository)

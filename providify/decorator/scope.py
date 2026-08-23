@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from typing import (
-    Callable,
     Any,
     TypeVar,
     overload,
@@ -14,14 +14,14 @@ from ..metadata import (
     ProviderMetadata,
     Scope,
     StereotypeMetadata,
-    _is_decorated,
     _get_own_metadata,
-    _set_metadata,
     _get_provider_metadata,
-    _set_provider_metadata,
-    _set_qualifier_marker,
+    _is_decorated,
     _set_alternative_marker,
     _set_decorator_marker,
+    _set_metadata,
+    _set_provider_metadata,
+    _set_qualifier_marker,
     _set_stereotype,
 )
 
@@ -483,6 +483,7 @@ def Provider(
     priority: int = 0,
     singleton: bool = False,
     scope: Scope | None = None,
+    returns: Any = None,
 ) -> Callable[[Callable[..., R]], Callable[..., R]]: ...
 
 
@@ -497,6 +498,13 @@ def Provider(
     # mirroring Jakarta CDI's @Produces @RequestScoped pattern.
     # Example: @Provider(scope=Scope.REQUEST)
     scope: Scope | None = None,
+    # returns — explicit interface override, bypassing return-annotation
+    # derivation entirely. See `binding._normalize_explicit_interface` for the
+    # full accepted-shapes table: a type, a parameterised generic alias, an
+    # `Annotated[...]` wrapper, or a zero-arg callable evaluated once at
+    # `ProviderBinding` construction (i.e. at `provide()`/`scan()`/`install()`
+    # time, never at decoration time).
+    returns: Any = None,
 ) -> Any:
     """
     Marks a function as a DI provider.
@@ -512,6 +520,15 @@ def Provider(
         1. ``scope=Scope.REQUEST`` / ``scope=Scope.SESSION`` — explicit scope
         2. ``singleton=True``                                — Scope.SINGLETON
         3. default                                           — Scope.DEPENDENT
+
+    Interface resolution priority (highest wins):
+        1. ``container.provide(fn, returns=...)`` — call-site override
+        2. ``@Provider(returns=...)``              — decoration-time override
+        3. ``fn``'s resolved return annotation
+
+    When ``returns=`` is given, the return annotation is not read, not
+    evaluated, and not validated — the factory may be annotated ``-> Any``,
+    annotated with an unresolvable forward ref, or unannotated.
 
     Usage:
         @Provider
@@ -533,23 +550,45 @@ def Provider(
         @Provider(scope=Scope.REQUEST)
         def jwt_token(header: Inject[AuthHeader]) -> JWTToken:
             return JWTToken.decode(header.value)
+
+        # Interface known only via a generic alias built inside a loop —
+        # no static return annotation could ever name it.
+        @Provider(returns=Repository[User])
+        def user_repository() -> Any:
+            return InMemoryRepo()
+
+        # Deferred form — evaluated once at registration, not at decoration.
+        @Provider(returns=lambda: Repository[User])
+        def user_repository() -> Any:
+            return InMemoryRepo()
     """
 
     def decorator(fn: Callable[..., R]) -> Callable[..., R]:
         existing = _get_provider_metadata(fn)
 
+        # `returns` is only included in the merge-kwargs dict when it is not
+        # None. `ProviderMetadata.merge()` preserves a key that is *not
+        # passed*; if we always passed `returns=returns`, stacking a plain
+        # `@Provider(qualifier="a")` on top of `@Provider(returns=X)` would
+        # clobber `returns` back to None. Every other field is intentionally
+        # NOT given this treatment — their current clobbering behaviour is
+        # relied on by existing tests.
+        updates: dict[str, Any] = {
+            "singleton": singleton,
+            "qualifier": qualifier,
+            "priority": priority,
+            "scope": scope,
+            "is_async": inspect.iscoroutinefunction(
+                fn
+            ),  # detected once at decoration time
+        }
+        if returns is not None:
+            updates["returns"] = returns
+
         _set_provider_metadata(
             fn,
             (
-                existing.merge(  # merge if already decorated
-                    singleton=singleton,
-                    qualifier=qualifier,
-                    priority=priority,
-                    scope=scope,
-                    is_async=inspect.iscoroutinefunction(
-                        fn
-                    ),  # detected once at decoration time
-                )
+                existing.merge(**updates)  # merge if already decorated
                 if existing is not None
                 else ProviderMetadata(  # fresh if first decorator
                     singleton=singleton,
@@ -559,6 +598,7 @@ def Provider(
                     is_async=inspect.iscoroutinefunction(
                         fn
                     ),  # detected once at decoration
+                    returns=returns,
                 )
             ),
         )

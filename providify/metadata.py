@@ -1,7 +1,8 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TypeVar, Type, Any
+from typing import Any, TypeVar
 
 T = TypeVar("T")
 
@@ -41,8 +42,8 @@ def _scope_rank(scope: Scope) -> int:
 
 @dataclass(frozen=True)
 class ScopeLeak:
-    binding: tuple[Type, Scope]
-    reference: tuple[Type, Scope]
+    binding: tuple[type, Scope]
+    reference: tuple[type, Scope]
 
 
 @dataclass(frozen=True)
@@ -60,8 +61,8 @@ class LiveInjectionViolation:
         param_name: Constructor parameter name where the violation occurred.
     """
 
-    binding: tuple[Type, Scope]
-    dep: tuple[Type, Scope]
+    binding: tuple[type, Scope]
+    dep: tuple[type, Scope]
     # Tracks which parameter the violation came from — used in error messages
     # so developers can find the exact injection point without reading stack traces.
     param_name: str
@@ -113,7 +114,7 @@ class StereotypeMetadata:
     priority: int = 0
     inherited: bool = False
 
-    def resolved_scope(self) -> "Scope":
+    def resolved_scope(self) -> Scope:
         """Return the effective scope, defaulting to DEPENDENT."""
         return self.scope if self.scope is not None else Scope.DEPENDENT
 
@@ -193,7 +194,7 @@ class ProviderMetadata:
         3. default — Scope.DEPENDENT (new instance on every resolution)
     """
 
-    __slots__ = ("qualifier", "priority", "singleton", "is_async", "scope")
+    __slots__ = ("qualifier", "priority", "singleton", "is_async", "scope", "returns")
 
     def __init__(
         self,
@@ -205,12 +206,20 @@ class ProviderMetadata:
         # Allows @Provider to produce REQUEST or SESSION scoped values,
         # mirroring Jakarta CDI's @Produces @RequestScoped pattern.
         scope: Scope | None = None,
+        # Explicit interface override (see `binding._normalize_explicit_interface`
+        # for the full accepted-shapes table: a type, a parameterised generic
+        # alias, an ``Annotated[...]`` wrapper, or a zero-arg callable deferred
+        # until `ProviderBinding` construction). Stored raw and unvalidated here
+        # — validation happens exactly once, at `ProviderBinding.__init__`, so a
+        # deferred callable is never invoked merely by decorating a function.
+        returns: Any = None,
     ) -> None:
         self.qualifier = qualifier
         self.priority = priority
         self.singleton = singleton
         self.is_async = is_async
         self.scope = scope
+        self.returns = returns
 
     def merge(self, **updates: Any) -> ProviderMetadata:
         return ProviderMetadata(
@@ -219,21 +228,28 @@ class ProviderMetadata:
             singleton=updates.get("singleton", self.singleton),
             is_async=updates.get("is_async", self.is_async),
             scope=updates.get("scope", self.scope),
+            returns=updates.get("returns", self.returns),
         )
 
     def __repr__(self) -> str:
         return (
             f"ProviderMetadata(qualifier={self.qualifier!r}, "
             f"priority={self.priority}, singleton={self.singleton}, "
-            f"scope={self.scope}, is_async={self.is_async})"
+            f"scope={self.scope}, is_async={self.is_async}, "
+            f"returns={self.returns!r})"
         )
 
     def __getstate__(self) -> dict[str, Any]:
         return {s: getattr(self, s) for s in self.__slots__}
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        for key, val in state.items():
-            object.__setattr__(self, key, val)
+        # Defensive: a pickle written by <=1.1.0 has no "returns" key (the slot
+        # did not exist yet). Seed every slot missing from `state` with the
+        # constructor default instead of leaving it unset, which would raise
+        # AttributeError on first read rather than at unpickle time.
+        defaults = ProviderMetadata()
+        for slot in self.__slots__:
+            object.__setattr__(self, slot, state.get(slot, getattr(defaults, slot)))
 
     @classmethod
     def default(cls) -> ProviderMetadata:

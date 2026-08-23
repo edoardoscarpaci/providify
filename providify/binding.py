@@ -425,6 +425,117 @@ def _resolve_return_annotation(annotation: Any, fn: Callable[..., Any]) -> Any:
     return value
 
 
+def _normalize_explicit_interface(returns: Any, fn: Callable[..., Any]) -> Any:
+    """Resolve a ``returns=`` override into a concrete binding interface.
+
+    Applied identically at both entry points that accept ``returns=``
+    (``@Provider`` and ``container.provide()``) via ``ProviderBinding``, so
+    the two call sites can never disagree about what a given override means.
+
+    WHY type-before-callable: ``returns=SomeClass`` means "the interface is
+    ``SomeClass``", never "call ``SomeClass()`` to obtain the interface" —
+    even though classes are themselves callable. A factory that *returns a
+    type object* is not something providify can bind anyway, so there is no
+    ambiguity to preserve by calling it.
+
+    WHY strings are rejected: accepting ``returns="Repository[User]"`` would
+    re-introduce the namespace question (whose globals? the caller's frame?
+    ``fn.__globals__``?) that this feature exists to let callers escape. The
+    deferred-callable form (``returns=lambda: Repository[User]``) covers
+    every case a string would, without the ambiguity.
+
+    Args:
+        returns: The raw value passed to ``returns=``. Resolved in this
+            order:
+            - a type (``isinstance(v, type)``) → used directly, never called.
+            - ``Annotated[X, ...]`` → unwrapped to ``X``, then re-validated.
+              Checked before the generic-alias case below because
+              ``get_origin(Annotated[X, ...])`` is itself ``Annotated``
+              (not ``None``), so it would otherwise be mistaken for an
+              already-parameterised interface.
+            - a parameterised generic alias (``get_origin(v) is not None``),
+              e.g. ``Repository[User]`` → used directly.
+            - any other callable (lambda, function, ``functools.partial``)
+              → called with zero args; the result is re-run through this
+              same table exactly once (no recursion into a callable that
+              itself returns a callable).
+            - a ``str`` → rejected; see WHY above.
+            - anything else → rejected.
+        fn: The provider function the override was attached to, used only to
+            name the provider in error messages.
+
+    Returns:
+        A type or a parameterised generic alias, suitable to assign directly
+        to ``ProviderBinding.interface``.
+
+    Raises:
+        TypeError: If *returns* is a ``str``; if the (possibly deferred)
+            value is not a type or a parameterised generic alias; or if
+            invoking a deferred callable raises (chained via ``from exc``).
+
+    Edge cases:
+        - ``returns=Repository`` (bare, unparameterised generic class) is
+          legal — ``isinstance(..., type)`` is True — and binds under the
+          unparameterised interface exactly as ``-> Repository`` would.
+        - ``functools.partial`` is not a type and has no ``get_origin``, so
+          it falls into the "other callable" branch and is invoked.
+        - A deferred callable returning ``Annotated[X, ...]`` is unwrapped to
+          ``X``, since the result is re-run through the full table.
+        - A deferred callable returning another callable raises — the table
+          is applied only once, deliberately, to keep the failure mode
+          predictable rather than silently chasing an arbitrary call chain.
+    """
+    # str is rejected before the generic "any other callable" branch would
+    # otherwise swallow it (str is not callable-as-a-zero-arg-factory in any
+    # useful sense, but checking type/get_origin first keeps the ordering
+    # explicit and matches the table in the plan verbatim).
+    if isinstance(returns, str):
+        raise TypeError(
+            f"Provider '{fn.__name__}' was given returns={returns!r}, a str. "
+            f"String forward refs are not accepted by returns= — use the "
+            f"deferred-callable form instead, e.g. returns=lambda: {returns}."
+        )
+
+    if isinstance(returns, type):
+        value = returns
+    elif get_origin(returns) is Annotated:
+        # Checked before the generic-alias branch below: Annotated[...]'s own
+        # get_origin() is Annotated (not None), so it would otherwise be
+        # mistaken for an already-parameterised interface like Repository[User].
+        value = get_args(returns)[0]
+    elif get_origin(returns) is not None:
+        value = returns
+    elif callable(returns):
+        try:
+            value = returns()
+        except Exception as exc:
+            raise TypeError(
+                f"Provider '{fn.__name__}' was given a deferred returns= "
+                f"callable that raised while resolving the interface."
+            ) from exc
+        # One level only: unwrap Annotated, but do not recurse into a
+        # callable-returning-callable — see Edge cases above.
+        if get_origin(value) is Annotated:
+            value = get_args(value)[0]
+    else:
+        raise TypeError(
+            f"Provider '{fn.__name__}' was given returns={returns!r} "
+            f"({type(returns).__name__}), which is neither a type, a "
+            f"parameterised generic alias, nor a zero-arg callable."
+        )
+
+    # Same final predicate as `_resolve_return_annotation` (binding.py:419) —
+    # an explicitly given interface can never be weaker than a derived one,
+    # so every downstream consumer sees exactly the same shape either way.
+    if not isinstance(value, type) and get_origin(value) is None:
+        raise TypeError(
+            f"Provider '{fn.__name__}' returns={returns!r} resolved to "
+            f"{value!r} ({type(value).__name__}), not a type."
+        )
+
+    return value
+
+
 # ─────────────────────────────────────────────────────────────────
 #  ProviderBinding — factory function injection
 # ─────────────────────────────────────────────────────────────────
@@ -444,7 +555,8 @@ class ProviderBinding(Binding):
                     no shared mutable state across tasks.
 
     Edge cases:
-        - Provider with no return annotation → raises ``TypeError`` at registration.
+        - Provider with no return annotation → raises ``TypeError`` at
+          registration, unless ``returns=`` is given.
         - Provider decorated ``@Provider(singleton=False)`` → ``Scope.DEPENDENT``,
           a new instance is created on every resolution.
         - Provider decorated ``@Provider(singleton=True)`` → ``Scope.SINGLETON``,
@@ -453,15 +565,31 @@ class ProviderBinding(Binding):
           dependencies to inspect for scope leaks.
     """
 
-    def __init__(self, fn: Callable[..., Any]) -> None:
+    def __init__(self, fn: Callable[..., Any], *, returns: Any = None) -> None:
         """Create a provider binding from a decorated factory function.
 
-        Reads ``ProviderMetadata`` from *fn*, extracts the return type hint
-        as the interface, and detects whether the provider is async.
+        Reads ``ProviderMetadata`` from *fn*, resolves the interface, and
+        detects whether the provider is async.
+
+        Interface resolution priority (highest wins):
+            1. ``returns`` — the keyword given directly to this constructor
+               (i.e. ``container.provide(fn, returns=...)``'s call-site override).
+            2. ``meta.returns`` — ``@Provider(returns=...)``'s decoration-time
+               override.
+            3. ``fn``'s resolved return annotation.
+
+        When an override from level 1 or 2 is present, the return annotation
+        is **not read, not evaluated, and not validated** — a caller who
+        already told providify what the factory produces must not also have
+        to repair an unrelated static annotation (``-> Any``, a
+        ``TYPE_CHECKING``-only forward ref) to register.
 
         Args:
             fn: A callable decorated with ``@Provider``. May be a regular
-                function or ``async def``. Must declare a return type annotation.
+                function or ``async def``. Must declare a return type
+                annotation, unless an interface override is in effect.
+            returns: Call-site interface override — see precedence above and
+                ``_normalize_explicit_interface`` for the accepted shapes.
 
         Returns:
             None
@@ -469,40 +597,58 @@ class ProviderBinding(Binding):
         Raises:
             ProviderBindingNotDecoratedError: If *fn* has no ``ProviderMetadata``
                 — i.e. it was not decorated with ``@Provider``.
-            TypeError: If *fn* has no return type annotation, since the
-                return type is used as the resolved interface — or if that
-                annotation is a string that cannot be resolved to a type
-                (e.g. a quoted forward reference to a function-local or
-                ``TYPE_CHECKING``-only class).
+            TypeError: If no interface override is in effect and *fn* has no
+                return type annotation, since the return type is used as the
+                resolved interface — or if that annotation is a string that
+                cannot be resolved to a type (e.g. a quoted forward reference
+                to a function-local or ``TYPE_CHECKING``-only class). Also
+                raised by ``_normalize_explicit_interface`` when an override
+                is present but cannot be resolved to a type or generic alias.
         """
         meta: ProviderMetadata | None = _get_provider_metadata(fn)
         if meta is None:
-            raise ProviderBindingNotDecoratedError(fn)
+            # A call-site `returns=` fully determines the interface without
+            # ever consulting metadata, so an undecorated function is legal
+            # in that one case — the whole point of `returns=` on provide()
+            # is registering a plain factory someone else wrote, which was
+            # never decorated with `@Provider` and may not even be ours to
+            # decorate. Absent that override, undecorated is still an error:
+            # scope/qualifier/priority have nowhere else to come from.
+            if returns is None:
+                raise ProviderBindingNotDecoratedError(fn)
+            meta = ProviderMetadata.default()
 
-        # DESIGN: read the RAW return annotation and evaluate only it.
-        #
-        # ✅ A parameter whose type is unresolvable at registration time (a
-        #    TYPE_CHECKING-only import, a class defined inside a test function)
-        #    can no longer prevent the provider from being registered — the
-        #    whole-signature get_type_hints(fn) it replaces was all-or-nothing,
-        #    which is exactly why this method needed a try/except fallback.
-        # ✅ One resolution path instead of two, so the happy path and the
-        #    fallback can no longer disagree about what the interface is.
-        # ❌ Parameter annotations are no longer validated at registration;
-        #    they surface at resolution instead. That is deliberate and matches
-        #    the container: parameters resolve against _build_localns(), which
-        #    does not exist yet here, so registration-time validation of them
-        #    was never trustworthy anyway.
-        raw_annotations = _raw_annotations(fn)
-        # Membership test, not `.get(...) is None`: `def p() -> None` in a module
-        # WITHOUT PEP-563 yields the literal object `None` as its annotation, which
-        # is a *declared* return type (get_type_hints normalises it to NoneType) and
-        # must not be confused with "no return annotation at all".
-        if "return" not in raw_annotations:
-            raise TypeError(
-                f"Provider '{fn.__name__}' must declare a return type hint."
-            )
-        interface = _resolve_return_annotation(raw_annotations["return"], fn)
+        # Call-site override wins over the decoration-time override, which
+        # wins over the annotation. `None` means "not given" at every level
+        # (see module docs for why `None` is safe as a sentinel here).
+        override = returns if returns is not None else meta.returns
+        if override is not None:
+            interface = _normalize_explicit_interface(override, fn)
+        else:
+            # DESIGN: read the RAW return annotation and evaluate only it.
+            #
+            # ✅ A parameter whose type is unresolvable at registration time (a
+            #    TYPE_CHECKING-only import, a class defined inside a test function)
+            #    can no longer prevent the provider from being registered — the
+            #    whole-signature get_type_hints(fn) it replaces was all-or-nothing,
+            #    which is exactly why this method needed a try/except fallback.
+            # ✅ One resolution path instead of two, so the happy path and the
+            #    fallback can no longer disagree about what the interface is.
+            # ❌ Parameter annotations are no longer validated at registration;
+            #    they surface at resolution instead. That is deliberate and matches
+            #    the container: parameters resolve against _build_localns(), which
+            #    does not exist yet here, so registration-time validation of them
+            #    was never trustworthy anyway.
+            raw_annotations = _raw_annotations(fn)
+            # Membership test, not `.get(...) is None`: `def p() -> None` in a module
+            # WITHOUT PEP-563 yields the literal object `None` as its annotation, which
+            # is a *declared* return type (get_type_hints normalises it to NoneType) and
+            # must not be confused with "no return annotation at all".
+            if "return" not in raw_annotations:
+                raise TypeError(
+                    f"Provider '{fn.__name__}' must declare a return type hint."
+                )
+            interface = _resolve_return_annotation(raw_annotations["return"], fn)
 
         self.interface = interface
         self.fn = fn

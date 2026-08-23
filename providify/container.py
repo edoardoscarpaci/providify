@@ -655,21 +655,50 @@ class DIContainer:
         self._invalidate_type_caches()  # new binding — localns/hints must be rebuilt
         self._bindings.append(ClassBinding(cls, cls))
 
-    def provide(self, fn: Callable[..., Any]) -> None:
+    def provide(self, fn: Callable[..., Any], *, returns: Any = None) -> None:
         """Register a provider function (sync or async) as a binding.
 
-        The function's return type annotation is used as the resolved interface.
+        The function's return type annotation is used as the resolved
+        interface, unless overridden — see ``returns`` below.
+
+        Interface resolution priority (highest wins):
+            1. ``returns`` — this call's override.
+            2. ``@Provider(returns=...)`` — decoration-time override.
+            3. ``fn``'s resolved return annotation.
+
+        When an override is in effect, the return annotation is not read,
+        not evaluated, and not validated.
+
+        Example — an interface only nameable as a generic alias built inside
+        a loop, which no static return annotation could ever express::
+
+            for model in (User, Order):
+                def repo_factory(model=model) -> Any:
+                    return InMemoryRepo(model)
+                container.provide(repo_factory, returns=Repository[model])
 
         Args:
             fn: A callable that creates and returns the dependency.
                 May be a regular function or an ``async def``.
+            returns: Explicit interface override for this registration. A
+                type, a parameterised generic alias (e.g. ``Repository[User]``),
+                an ``Annotated[...]`` wrapper (unwrapped automatically), or a
+                zero-arg callable evaluated once, right now, to produce one of
+                the above. See ``binding._normalize_explicit_interface`` for
+                the full accepted-shapes table.
 
         Returns:
             None
+
+        Raises:
+            TypeError: If no override is in effect and *fn* has no return
+                type annotation (or it is unresolvable); or if a given
+                ``returns`` value cannot be resolved to a type or generic
+                alias.
         """
         self._validated = False
         self._invalidate_type_caches()  # new binding — localns/hints must be rebuilt
-        self._bindings.append(ProviderBinding(fn))
+        self._bindings.append(ProviderBinding(fn, returns=returns))
 
     # ── Warm-up ───────────────────────────────────────────────────
 

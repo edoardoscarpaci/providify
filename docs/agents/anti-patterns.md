@@ -156,6 +156,26 @@ happens.
 
 ---
 
+## 12. Patching `__annotations__['return']` before `provide()`
+
+```python
+factory.__annotations__["return"] = Repository[User]   # ❌ mutates a foreign function
+container.provide(factory)
+```
+
+**Why wrong:** mutates a function object the caller may not own; the ordering
+between building the factory and patching its annotation is load-bearing but
+invisible in either signature; breaks the moment anything reads annotations
+at decoration time rather than registration time.
+**Fix:** pass the interface explicitly instead —
+`container.provide(factory, returns=Repository[User])` (or
+`@Provider(returns=Repository[User])` at decoration time). This fully
+bypasses return-annotation reading; nothing to patch, nothing to order.
+**Symptom:** the patched annotation silently drifts from what the factory
+actually returns after a refactor, since nothing ties the two together.
+
+---
+
 ## Quick self-check before finishing
 
 - [ ] Every class I own is decorated, not wrapped in a needless `@Provider`.
