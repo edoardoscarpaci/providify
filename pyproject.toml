@@ -34,11 +34,19 @@ classifiers = [
 [project.urls]
 Repository = "https://github.com/edoardoscarpaci/providify"
 
+[project.optional-dependencies]
+yaml = ["PyYAML>=6.0"]
+
+[project.entry-points.pytest11]
+providify = "providify.pytest_plugin"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "ruff>=0.9.0",
+    "PyYAML>=6.0",
+    "pydantic>=2.13",
 ]
 
 [build-system]

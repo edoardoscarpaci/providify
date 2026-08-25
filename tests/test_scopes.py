@@ -24,7 +24,6 @@ from providify.decorator.scope import Component, RequestScoped, SessionScoped, S
 from providify.exceptions import LiveInjectionRequiredError
 from providify.type import Inject, Live
 
-
 # ─────────────────────────────────────────────────────────────────
 #  Domain types
 # ─────────────────────────────────────────────────────────────────
@@ -603,3 +602,82 @@ class TestInvalidateSessionPreDestroy:
     ) -> None:
         """ainvalidate_session() on an unknown session_id must not raise."""
         await container.ainvalidate_session("nonexistent")
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Plan 004 (F9) — reverse-dependency-order teardown on scope exit
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestRequestScopeExitTeardownOrder:
+    """On request()/arequest() exit, the dependent's @PreDestroy must run
+    before its dependency's — mirroring singleton reverse-creation-order
+    teardown at no extra state cost (Step 16, container.py:3139-3161/3190-3203).
+    """
+
+    def test_sync_request_exit_tears_down_dependent_before_dependency(
+        self, container: DIContainer
+    ) -> None:
+        """with container.scope_context.request(): a dependent RequestScoped
+        component must have its @PreDestroy called before the dependency it
+        holds, on scope exit.
+        """
+        from providify.decorator.lifecycle import PreDestroy
+
+        order: list[str] = []
+
+        @RequestScoped
+        class Dependency:
+            @PreDestroy
+            def teardown(self) -> None:
+                order.append("Dependency")
+
+        @RequestScoped
+        class Dependent:
+            def __init__(self, dep: Dependency) -> None:
+                self.dep = dep
+
+            @PreDestroy
+            def teardown(self) -> None:
+                order.append("Dependent")
+
+        container.register(Dependency)
+        container.register(Dependent)
+
+        with container.scope_context.request():
+            container.get(Dependent)
+
+        assert order == ["Dependent", "Dependency"]
+
+    async def test_async_request_exit_tears_down_dependent_before_dependency(
+        self, container: DIContainer
+    ) -> None:
+        """async with container.scope_context.arequest(): same reverse-order
+        guarantee as the sync request scope exit, for async @PreDestroy hooks.
+        """
+        from providify.decorator.lifecycle import PreDestroy
+
+        order: list[str] = []
+
+        @RequestScoped
+        class Dependency:
+            @PreDestroy
+            async def teardown(self) -> None:
+                order.append("Dependency")
+
+        @RequestScoped
+        class Dependent:
+            def __init__(self, dep: Dependency) -> None:
+                self.dep = dep
+
+            @PreDestroy
+            async def teardown(self) -> None:
+                order.append("Dependent")
+
+        container.register(Dependency)
+        container.register(Dependent)
+
+        async with container.scope_context.arequest():
+            await container.aget(Dependent)
+
+        assert order == ["Dependent", "Dependency"]

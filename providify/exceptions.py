@@ -1,9 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from .metadata import LiveInjectionViolation, ScopeLeak
+
+if TYPE_CHECKING:
+    # Only for the type annotation on ContainerValidationError.__init__ —
+    # `from __future__ import annotations` makes this a string at runtime,
+    # so importing under TYPE_CHECKING avoids a real circular import:
+    # validation.py never imports exceptions.py, but guard anyway so this
+    # module's import graph stays acyclic even if that ever changes.
+    from .validation import ValidationReport
 
 
 class providifyError(Exception):
@@ -191,4 +200,245 @@ class AnnotationResolutionError(ValidationError):
             f"report a clean bill of health it cannot prove.\n"
             f"Fix: import the annotated type at runtime instead of under "
             f"TYPE_CHECKING, or move locally-defined types to module level."
+        )
+
+
+class ContainerValidationError(ValidationError):
+    """Raised by ``DIContainer.validate()`` when the full-graph report contains
+    at least one ``ERROR``-severity issue and ``raise_on_error=True`` (the
+    default).
+
+    Aggregates EVERY error found in one shot — missing bindings, ambiguous
+    bindings, circular dependencies, scope leaks, ``Live[T]`` violations, and
+    unresolvable annotations — rather than stopping at the first failure, so
+    a misconfigured app can be fixed in one pass instead of one error at a
+    time across repeated boot attempts.
+
+    Subclasses ``ValidationError`` (not ``LookupError``) deliberately:
+    startup validation is an explicit, opt-in call — aliasing its failure
+    mode to the lazy-resolution error type (``LookupError``, raised by
+    ``get()``) would blur two genuinely different situations for a caller
+    with a bare ``except LookupError`` around request handling. Subclassing
+    ``ValidationError`` still keeps ``except ValidationError`` (the existing
+    ``validate_all()``/``validate_bindings()`` catch-all) working unchanged.
+
+    Attributes:
+        report: The full ``ValidationReport`` the container computed —
+            every issue, not just the first, so callers can inspect
+            ``exc.report.errors`` / ``exc.report.warnings`` directly instead
+            of re-parsing ``str(exc)``.
+
+    Example:
+        try:
+            container.validate()
+        except ContainerValidationError as exc:
+            for issue in exc.report.errors:
+                log.error("%s: %s", issue.owner, issue.message)
+            raise SystemExit(1)
+    """
+
+    def __init__(self, report: ValidationReport) -> None:
+        self.report = report
+        # One line per ERROR issue — warnings are intentionally omitted from
+        # the raised message (they never gate startup; report.warnings is
+        # still reachable via exc.report for callers who want them anyway).
+        lines = [
+            f"  - [{issue.severity.value.upper()}] {issue.owner}: {issue.message}"
+            for issue in report.errors
+        ]
+        super().__init__(
+            f"Container validation failed with {len(report.errors)} error(s):\n"
+            + "\n".join(lines)
+        )
+
+
+@dataclass(frozen=True)
+class ShutdownFailure:
+    """One teardown hook or disposer that raised during ``shutdown()``/``ashutdown()``.
+
+    Frozen because a failure record is a fact about what already happened —
+    there is no legitimate reason to mutate it after capture, and immutability
+    lets ``ShutdownError`` hand out ``self.failures`` without defensive copying.
+
+    Attributes:
+        owner: Human-readable identifier of what raised — e.g. ``"Db.close"``
+            for an ``@PreDestroy`` method or ``"@Disposes(close_pool)"`` for a
+            provider disposer — so a caller can pinpoint the failing component
+            without re-deriving it from the traceback.
+        exception: The original exception instance, preserved as-is (not
+            re-wrapped) so ``type(f.exception)`` and ``f.exception.args`` stay
+            usable for callers that branch on the underlying error type.
+    """
+
+    owner: str
+    exception: BaseException
+
+
+class ShutdownError(providifyError):
+    """Raised by ``DIContainer.shutdown()`` / ``ashutdown()`` when one or more
+    teardown hooks (``@PreDestroy`` methods or ``@Disposes`` disposers) raise.
+
+    Aggregates EVERY failure in one shot — mirroring ``ContainerValidationError``
+    (exceptions.py above) — rather than stopping at the first failing hook.
+    This is a deliberate behaviour change from the old raise-on-first
+    ``shutdown()``: every remaining teardown still runs, every cache is still
+    cleared (``finally: self._clear_caches()`` in ``shutdown()``/``ashutdown()``),
+    and every failure is reported together so a bad hook cannot mask, or be
+    masked by, another one.
+
+    ``__cause__`` is chained to the exception of the **earliest-created**
+    failing component (``raise ShutdownError(failures) from failures[-1].exception``
+    — ``failures`` is appended in teardown order, i.e. reverse-creation
+    order, so its last entry is the earliest-created one). That is
+    deliberately not "the first hook that happened to fail during the
+    teardown walk": the earliest-created component is typically the most
+    foundational one (e.g. a database connection pool), and its teardown
+    failure is often the actual root cause behind failures in components
+    created after it, which may just be downstream symptoms of the same
+    unavailable resource.
+
+    Attributes:
+        failures: Every ``ShutdownFailure`` captured during the teardown pass,
+            in teardown (reverse-dependency) order — not just the first one —
+            so callers can inspect ``exc.failures`` directly instead of
+            re-parsing ``str(exc)``.
+
+    Example:
+        try:
+            container.shutdown()
+        except ShutdownError as exc:
+            for failure in exc.failures:
+                log.error("teardown failed: %s", failure.owner, exc_info=failure.exception)
+            raise SystemExit(1)
+    """
+
+    def __init__(self, failures: list[ShutdownFailure]) -> None:
+        self.failures = failures
+        # One line per failure — mirrors ContainerValidationError's message
+        # shape so both aggregation errors read consistently in logs.
+        lines = [
+            f"  - {f.owner}: {type(f.exception).__name__}: {f.exception}"
+            for f in failures
+        ]
+        super().__init__(
+            f"Shutdown completed with {len(failures)} teardown failure(s); "
+            f"all caches were cleared:\n" + "\n".join(lines)
+        )
+
+
+class ModuleCycleError(providifyError):
+    """Raised when ``@Configuration`` module ``depends_on=`` edges form a cycle.
+
+    Detected by ``providify.modules.resolve_install_order`` (a DFS post-order
+    walk with a ``path`` list) *before* any module is instantiated — a cycle
+    therefore leaves the container completely untouched (see plan 008
+    §Design "Install pipeline": cycle detection happens strictly before
+    ``_resolve_constructor`` is ever called for any class in the batch).
+
+    Mirrors ``CircularDependencyError`` above (same "name every class in the
+    cycle, in order" shape) but is deliberately a *separate* exception type
+    rather than reused: a singleton `get()` cycle and a module install-order
+    cycle are different failure surfaces raised by different code paths
+    (`container.py`'s resolution stack vs. `modules.py`'s pure DFS) — merging
+    them would force a caller with a narrow `except CircularDependencyError`
+    around `get()` to also start catching module-install failures it never
+    asked about.
+
+    Attributes:
+        cycle: The classes forming the cycle, in traversal order — e.g.
+            ``(A, B, C, A)`` for ``A -> B -> C -> A``. The first and last
+            elements are the same class, matching the arrow-chain rendering
+            in the message.
+
+    Example:
+        @Configuration(depends_on=[C])
+        class A: ...
+        @Configuration(depends_on=[A])
+        class B: ...
+        @Configuration(depends_on=[B])
+        class C: ...
+
+        container.install(A)  # raises ModuleCycleError: A -> B -> C -> A
+    """
+
+    def __init__(self, cycle: Sequence[type]) -> None:
+        self.cycle: tuple[type, ...] = tuple(cycle)
+        rendered = " → ".join(cls.__name__ for cls in self.cycle)
+        super().__init__(
+            f"Circular @Configuration depends_on detected: {rendered}\n"
+            f"Break the cycle by removing one of the depends_on= edges above, "
+            f"or merging the mutually-dependent modules into one."
+        )
+
+
+@dataclass(frozen=True)
+class ConfigIssue:
+    """One field-level problem discovered while binding a ``@ConfigProperties``
+    target (``providify/config.py``'s stdlib coercion path, or a source-loading
+    failure that leaves nothing else to attempt).
+
+    Frozen for the same reason as ``ShutdownFailure`` above — an issue is a
+    fact about what already happened during binding, never mutated after
+    capture, so ``ConfigBindingError`` can hand out ``self.issues`` without
+    defensive copying.
+
+    Attributes:
+        field: Dotted/indexed path to the offending field, e.g.
+            ``"pool_size"`` or ``"db.replicas[1]"`` — precise enough to point
+            a caller at the exact declaration without re-deriving it from the
+            merged mapping.
+        message: Human-readable description of the failure, e.g.
+            ``"expected int, got 'twenty'"``.
+        source: Human-readable identifier of the originating source, e.g.
+            ``"EnvSource(DB__POOL_SIZE)"`` or ``"YamlSource(config.yaml)"`` —
+            ``None`` when the issue cannot be attributed to a single source
+            (e.g. a missing required field with no source at all).
+    """
+
+    field: str
+    message: str
+    source: str | None
+
+
+class ConfigBindingError(providifyError):
+    """Raised when binding a ``@ConfigProperties`` target fails — either a
+    source could not be loaded (unreadable/malformed file, missing PyYAML) or
+    one or more declared fields could not be coerced from the merged mapping.
+
+    Aggregates EVERY field failure in one shot — mirroring
+    ``ContainerValidationError``/``ShutdownError`` above — rather than
+    stopping at the first bad field, so a config file with four typos reports
+    four issues, not one. Source-loading failures are the one exception:
+    there is nothing left to attempt, so they raise immediately with a single
+    issue.
+
+    Attributes:
+        target: Human-readable name of the class being bound, e.g.
+            ``"DbSettings"``.
+        issues: Every ``ConfigIssue`` captured while attempting the bind —
+            not just the first — so callers can inspect ``exc.issues``
+            directly instead of re-parsing ``str(exc)``.
+
+    Example:
+        try:
+            container.get(DbSettings)
+        except ConfigBindingError as exc:
+            for issue in exc.issues:
+                log.error("%s: %s (%s)", issue.field, issue.message, issue.source)
+            raise SystemExit(1)
+    """
+
+    def __init__(self, target: str, issues: Sequence[ConfigIssue]) -> None:
+        self.target = target
+        self.issues = list(issues)
+        # One line per issue — mirrors ContainerValidationError's/ShutdownError's
+        # message shape so all three aggregation errors read consistently in logs.
+        lines = [
+            f"  - {issue.field}: {issue.message}"
+            + (f" (source: {issue.source})" if issue.source is not None else "")
+            for issue in self.issues
+        ]
+        super().__init__(
+            f"Failed to bind configuration for '{target}' "
+            f"({len(self.issues)} issue(s)):\n" + "\n".join(lines)
         )

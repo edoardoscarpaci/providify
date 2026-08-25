@@ -188,6 +188,58 @@ gw = container.get(PaymentGateway)   # RealPaymentGateway ✅
 
 ---
 
+## @Profile — deployment-time bean activation
+
+`@Profile` gates a class or `@Provider` function on the container's **active profile set** — the
+providify equivalent of Spring's `@Profile`. A binding whose expression doesn't match the active
+profiles is invisible to `get()`, `get_all()`, `is_resolvable()`, and `validate()`, exactly like a
+non-enabled `@Alternative`.
+
+```python
+from providify import Component, DIContainer, Profile, Singleton
+
+@Profile("prod")
+@Singleton
+class RealMailer(Mailer): ...
+
+@Profile("dev", "test")            # OR — active in either
+@Singleton
+class ConsoleMailer(Mailer): ...
+
+@Profile("!prod")                  # negation — active whenever "prod" is NOT active
+@Component
+class FakeClock(Clock): ...
+```
+
+The active profile set comes from an explicit `profiles=` argument, the `PROVIDIFY_PROFILES`
+environment variable (comma-separated), or imperative calls — in that precedence order (an explicit
+argument, even an empty one, always wins over the environment variable):
+
+```python
+container = DIContainer(profiles=("prod",))     # explicit wins
+container = DIContainer()                        # reads PROVIDIFY_PROFILES=prod,eu if set
+container.activate_profile("debug")              # imperative, mirrors enable_alternative()
+container.deactivate_profile("debug")
+container.active_profiles                        # frozenset({"prod", "eu", "debug"})
+```
+
+`@Profile` also acts as the **declarative activator for `@Alternative`**: an `@Alternative` class
+(or `@Provider` function) that also carries `@Profile` is governed by its profile instead of
+requiring an imperative `enable_alternative()` call — the profile is a hard AND-gate, so
+`enable_alternative()` cannot bypass a non-matching profile.
+
+> **Validation is profile-aware**: `container.validate()` reports `MISSING_BINDING` for an
+> interface whose only provider is gated by a `@Profile` that isn't currently active — that's
+> intentional (it validates the graph *as it will actually be wired*), but it means you should
+> validate once per deployment configuration you care about, not just once with no profiles set.
+
+> **Breaking change**: before this feature, `@Alternative` stamped on a `@Provider` **function**
+> (as opposed to a class) was silently ignored — the provider was always active. That asymmetry is
+> now fixed: `@Alternative` on a provider function is disabled by default, same as on a class. See
+> `CHANGELOG.md`.
+
+---
+
 ## @Stereotype — reusable composed annotations
 
 `@Stereotype` bundles scope, qualifier, priority, and inherited into a single reusable decorator — the Python equivalent of Jakarta CDI `@Stereotype`.
@@ -283,6 +335,9 @@ container.override(Interface, MockImpl)    # replace all bindings for Interface 
 container.reset_binding(Interface)         # remove all bindings for Interface; returns count removed
 container.enable_alternative(MockImpl)     # activate an @Alternative bean for this container
 container.disable_alternative(MockImpl)    # deactivate an @Alternative bean
+container.activate_profile("prod")         # activate a @Profile for this container
+container.deactivate_profile("prod")       # deactivate a @Profile
+container.active_profiles                  # frozenset of currently active profile names
 container.add_interceptor(LoggingInterceptor)  # register an @Interceptor class
 
 # ── Sync resolution ───────────────────────────────────────────────
@@ -862,6 +917,11 @@ container.shutdown()         # calls @PreDestroy on all cached singletons, clear
 await container.ashutdown()  # async — awaits async @PreDestroy hooks
 ```
 
+- Singletons are torn down in **reverse dependency order** (dependents before the
+  dependencies they may still reference), matching Spring/.NET/Quarkus — see
+  [`docs/agents/usage-rules.md`](docs/agents/usage-rules.md) R11 for the ordering
+  guarantee and `ShutdownError` aggregation semantics.
+
 Calling `shutdown()` when any cached singleton has an `async @PreDestroy` raises `RuntimeError` —
 use `ashutdown()` in that case.
 
@@ -986,6 +1046,49 @@ class DatabaseModule:
         return ConnectionPool(self._config.db_url, size=self._config.pool_size)
 ```
 
+### Multi-module ordering — `depends_on=`
+
+When one module's constructor (or `@Provider` method) needs a type produced by
+**another** module, declare the ordering explicitly with `depends_on=` — don't rely
+on `scan()`'s alphabetical discovery order:
+
+```python
+@Configuration
+class InfraModule:
+    @Provider(singleton=True)
+    def pool(self) -> DatabasePool: ...
+    @PreDestroy
+    def close(self) -> None: ...          # runs last, after every singleton
+
+@Configuration(depends_on=[InfraModule])
+class RepoModule:
+    def __init__(self, pool: DatabasePool): ...   # resolvable — Infra installs first
+```
+
+```
+install order  :  InfraModule → RepoModule → ServiceModule
+shutdown order :  singletons (reverse creation order)
+                  then ServiceModule → RepoModule → InfraModule
+```
+
+`container.install(ServiceModule)` transitively installs its `depends_on` closure
+first, in a deterministic order — deps before dependents, shared dependencies
+installed exactly once. A cycle in `depends_on` raises `ModuleCycleError` (naming
+every class in the cycle) **before** any module is instantiated, so a cycle leaves
+the container completely untouched.
+
+A module's `@PostConstruct` runs once, at install time, after `__init__` and before
+its `@Provider` methods are registered. A module's `@PreDestroy` runs at
+`shutdown()`/`ashutdown()` — in exact reverse install order, strictly **after**
+every singleton has already been torn down (a module's `@PreDestroy` typically
+releases a resource, like a pool, that every singleton consumer of it is already
+gone by the time it runs). `ainstall()` mirrors `install()` for async-only module
+constructor deps and async `@PostConstruct`/`@PreDestroy` hooks.
+
+Installing the same module twice — explicitly, or via `install()` followed by
+`scan()` covering it — registers its providers exactly once; the container is the
+dedup authority, keyed on the module class.
+
 ### Field-level `@Provider` — `@property` pattern
 
 Combine `@property` with `@Provider` to declare a provider as a property on the module class. The return type annotation determines the registered interface — identical to a regular `@Provider` method but allows `self.config` syntax for accessing the produced value within the module:
@@ -1008,6 +1111,95 @@ class AppModule:
 ```
 
 Both `@Provider` and `@Provider(scope=...)` work on properties. The inner `@Provider` must be the innermost decorator (closest to the function definition) and `@property` wraps it on the outside.
+
+---
+
+## @ConfigProperties — typed configuration binding
+
+`@ConfigProperties` marks a class as a typed settings target bound from
+environment variables, YAML, JSON, or TOML — removing the need to
+hand-write a `@Provider` that reads `os.environ` yourself. It is **not**
+`@Configuration` — see the next section for that distinction.
+
+```python
+from dataclasses import dataclass
+from providify import DIContainer, ConfigProperties, EnvSource, YamlSource
+
+@ConfigProperties(
+    prefix="db",
+    sources=(EnvSource(), YamlSource("config.yaml", required=False)),
+)
+@dataclass(frozen=True)
+class DbSettings:
+    url: str
+    pool_size: int = 5
+    replicas: tuple[str, ...] = ()
+
+container = DIContainer()
+container.bind_config(DbSettings)   # …or container.scan("myapp") discovers it
+db = container.get(DbSettings)      # DbSettings(url=..., pool_size=..., ...)
+```
+
+`EnvSource()` reads `DB__URL`, `DB__POOL_SIZE`, `DB__REPLICAS=a,b` (`__` nests
+by default); `YamlSource("config.yaml")` reads a `db:` section from a YAML
+file. Sources are loaded in order and deep-merged — the **later** source
+wins on a key conflict — then `prefix="db"` selects the `db` subtree before
+binding. `JsonSource` and `TomlSource` work the same way for `.json` / `.toml`
+files; `DictSource` is an in-memory source, handy for tests.
+
+Declared fields are coerced to their annotated type (`str`, `int`, `float`,
+`bool`, `pathlib.Path`, sequences, `dict`, `X | None`, `Enum`, `Literal`,
+nested dataclasses) — env vars are always strings, so `pool_size: int` works
+from a literal `"20"`. Every field failure is aggregated into one
+`ConfigBindingError` instead of stopping at the first bad field:
+
+```python
+from providify import ConfigBindingError
+
+try:
+    container.get(DbSettings)
+except ConfigBindingError as exc:
+    for issue in exc.issues:
+        log.error("%s: %s (%s)", issue.field, issue.message, issue.source)
+```
+
+`YamlSource` requires the optional `providify[yaml]` extra (`pip install
+providify[yaml]`) — the core install stays dependency-free, and `YamlSource`
+only imports PyYAML lazily, inside `.load()`, so nothing breaks until you
+actually construct one without the extra installed.
+
+### Pydantic hand-off — `model_validate`
+
+If the target class exposes `model_validate` (pydantic v2, or anything
+API-compatible), providify hands it the merged mapping **verbatim** and
+performs **no coercion of its own** — the pydantic model owns validation
+entirely, giving you full pydantic constraints (ranges, regexes,
+cross-field rules) with zero coercion-table maintenance:
+
+```python
+from pydantic import BaseModel
+
+@ConfigProperties(prefix="db", sources=(EnvSource(),))
+class DbSettings(BaseModel):
+    url: str
+    pool_size: int = 5
+
+container.bind_config(DbSettings)
+container.get(DbSettings)   # cls.model_validate(merged_mapping) — pydantic validates
+```
+
+This is a **duck-typed** check (`hasattr(cls, "model_validate")`) — providify
+never imports or pins pydantic, so it stays an optional *target* type, never
+a runtime dependency of the library itself.
+
+### When errors surface
+
+Binding is **lazy**: sources are read and coercion/validation happens on the
+**first** `container.get(DbSettings)` call, not at `bind_config()`
+registration time. Call `container.warm_up()` to catch a misconfigured value
+at startup instead of on first use — `container.validate()` does **not**
+catch this, because it never instantiates anything (see
+[`docs/agents/usage-rules.md`](docs/agents/usage-rules.md)).
 
 ---
 
@@ -1231,6 +1423,47 @@ await container.awarm_up(qualifier="db")
 `warm_up()` is all-or-nothing: if any matching singleton is backed by an async
 provider it raises **before** touching the cache, so the cache is never left
 partially warmed.  Use `awarm_up()` when you have async providers.
+
+---
+
+## Startup validation — `validate()`
+
+Call `container.validate()` **once, after all registration and before serving
+traffic.** It walks the entire declared dependency graph — every constructor
+parameter, class-level annotation, and `@Provider` parameter — without
+instantiating anything, and reports every wiring defect in one shot: missing
+bindings, ambiguous bindings, dependency cycles, scope leaks, `Live[T]`
+violations, and unresolvable annotations.
+
+```python
+from providify import DIContainer, ContainerValidationError
+
+container = DIContainer()
+container.scan("myapp")
+
+container.validate()   # raises ContainerValidationError if any ERROR-severity issue exists
+```
+
+Or inspect the report instead of raising:
+
+```python
+report = container.validate(raise_on_error=False)
+if not report.ok:
+    for issue in report.errors:
+        log.error("%s", issue.message)
+    for issue in report.warnings:
+        log.warning("%s", issue.message)
+```
+
+`validate()` is a superset of `validate_bindings()` / `validate_all()`: those
+two remain unchanged (scope-leak tier only, triggered automatically on the
+first `get()`/`aget()`); `validate()` adds the whole-graph checks — missing
+bindings, ambiguous bindings, and static cycle detection — that only a full
+walk can catch, and never mutates state (no `create()`, no cache write, no
+`@PostConstruct`). The report/issue types (`ValidationReport`,
+`ValidationIssue`, `IssueKind`, `Severity`) live in `providify/validation.py`;
+see the `validate()` docstring in `providify/container.py` for the full
+per-issue-kind breakdown (which forms are `ERROR` vs `WARNING` and why).
 
 ---
 
@@ -1511,6 +1744,111 @@ Subtype events match supertype observers: if `AdminRegistered` extends `UserRegi
 
 ---
 
+## Observability — `container.add_hook()`
+
+Observe what the container does — instance creation, disposal, and scope
+transitions — with nanosecond timing, and bridge it to OpenTelemetry (or
+structlog, statsd, Prometheus, ...) in your own code. providify emits plain
+event objects; it does not create spans, a tracer, or propagate context —
+that stays the consumer's job.
+
+> **Not the same thing as `Event[T]` / `@Observes` above.** `add_hook()` is
+> **container telemetry**: it delivers plain, immutable event objects to
+> plain callables, describing what the *container itself* did (an instance
+> was created, a scope frame closed). `Event[T]` / `@Observes` is an
+> **application event bus**: it resolves *beans* through the container and
+> dispatches *domain* events your application defines (`UserRegistered`,
+> etc.). The two systems share no code and no state — never mix them: do
+> not fire application events from a hook, and do not register a hook
+> callback as an `@Observes` method.
+
+```python
+from providify import DIContainer, InstanceCreated, ScopeEntered
+
+container = DIContainer()
+
+def on_created(e: InstanceCreated) -> None:
+    print(f"created {e.interface} in {e.duration_ns}ns (async={e.is_async})")
+
+unsubscribe = container.add_hook(InstanceCreated, on_created)
+container.add_hook(ScopeEntered, lambda e: print(f"{e.kind} scope {e.scope_id} entered"))
+```
+
+An OpenTelemetry bridge, in about 10 lines, from the plan this feature shipped from:
+
+```python
+from opentelemetry import trace
+from providify import InstanceCreated, ScopeEntered
+
+tracer = trace.get_tracer("providify")
+
+def on_created(e: InstanceCreated) -> None:
+    span = tracer.start_span("di.create", attributes={
+        "di.interface": getattr(e.interface, "__name__", str(e.interface)),
+        "di.scope": str(e.scope),
+        "di.async": e.is_async,
+    })
+    span.end(end_time=None)          # duration also available as e.duration_ns
+
+container.add_hook(InstanceCreated, on_created)
+container.add_hook(ScopeEntered, lambda e: ...)
+```
+
+**providify takes no dependency on OpenTelemetry — not even `opentelemetry-api`.**
+The container has zero runtime dependencies; the snippet above only works if
+*you* install `opentelemetry-api`/an SDK yourself. Also note: at the time of
+writing there is **no official OTel semantic convention for dependency-injection
+or lifecycle spans** ([open-telemetry/semantic-conventions#2133](https://github.com/open-telemetry/semantic-conventions/issues/2133)
+is still unresolved) — the attribute names in the recipe above (`di.interface`,
+`di.scope`, `di.async`) are providify's own choice, not a standard, and may
+need to change if/when a convention lands.
+
+### Event types
+
+| Event | Emitted when | Key fields |
+|-------|---------------|------------|
+| `InstanceCreated` | A binding produces a **new** instance (never on a cache hit) | `interface`, `implementation`, `scope`, `qualifier`, `duration_ns`, `is_async` |
+| `InstanceDisposed` | A `@PreDestroy`/`@Disposes` teardown hook runs, at `shutdown()`/`ashutdown()` or scope exit | `interface`, `implementation`, `scope`, `owner`, `duration_ns`, `error` (`None` on success) |
+| `ScopeEntered` | `container.request()` / `arequest()` / `session()` / `asession()` is entered | `kind` (`"request"` \| `"session"`), `scope_id` |
+| `ScopeExited` | The matching scope frame exits — including when the block raises | `kind`, `scope_id`, `duration_ns` |
+
+All four are `@dataclass(frozen=True, slots=True, kw_only=True)` — immutable,
+hashable where all fields are hashable, and safe to hand to arbitrary
+consumer code, including across threads.
+
+### Registration and unsubscribing
+
+```python
+unsubscribe = container.add_hook(InstanceCreated, on_created)
+...
+unsubscribe()                                   # or:
+container.remove_hook(InstanceCreated, on_created)
+```
+
+- Dispatch is by **exact type** — a hook registered for a supertype (e.g.
+  `object`) never receives `InstanceCreated`/etc. events.
+- Registering the same callback twice makes it fire twice per event.
+- `add_hook()` returns a zero-argument unsubscribe closure; `remove_hook()`
+  returns `True`/`False` and never raises.
+
+### Rules hooks must follow
+
+- **Hooks are synchronous and called inline**, in the caller's thread/task —
+  they run on the hot path and must not block.
+- **A hook that raises never breaks resolution or shutdown.** The exception
+  is caught, logged at `WARNING`, and the remaining hooks for that event
+  still run.
+- **A hook must not call back into `container.get()`/`aget()`** for a
+  different container, or resolve across threads — that re-entrancy is the
+  caller's problem to avoid. (Re-resolving the *same* already-cached
+  singleton from inside its own `InstanceCreated` hook is safe: emission
+  happens after the cache write and outside the per-key lock.)
+- With **no hooks registered, there is zero overhead**: no timer call, no
+  event allocation, and `container.request()`/`session()` etc. return the
+  underlying scope context manager unchanged.
+
+---
+
 ## InjectionPoint — injection context metadata
 
 Inject an `InjectionPoint` to receive metadata about _where_ a dependency is being injected — useful for dynamic configuration like per-class loggers.
@@ -1575,6 +1913,68 @@ class ReportService:
 
 ---
 
+## Testing
+
+Installing providify registers a `pytest11` plugin — no conftest
+boilerplate needed to get working test fixtures:
+
+```python
+def test_checkout(di_container, di_overrides):
+    di_container.scan("myapp")
+    di_overrides.instance(Clock, FrozenClock("2026-01-01"))   # instance, not class
+    di_overrides.bind(Notifier, FakeNotifier)                 # class swap
+    di_overrides.remove(PaymentGateway)                       # unregister
+
+    assert di_container.get(Checkout).run() == "ok"
+    # every override is undone automatically at teardown — no reset_binding() calls
+```
+
+Fixtures (all function-scoped, `yield`-based, opt-in — none are autouse):
+
+| Fixture | Yields | Teardown |
+|---|---|---|
+| `di_container` | A fresh, empty `DIContainer()` | `shutdown()` |
+| `di_acontainer` | A fresh, empty `DIContainer()` (async) | `await ashutdown()` — requires pytest-asyncio/anyio |
+| `di_overrides` | A `ContainerOverrides(di_container)`, already entered | restores every override made during the test |
+| `di_global` | `di_container`, installed as `DIContainer.current()` | restores the previous global |
+
+If your app already builds its own container, override `di_container` in
+your own conftest — standard pytest fixture overriding, and it wins over
+the plugin's default:
+
+```python
+@pytest.fixture
+def di_container(app_container):
+    return app_container.copy()   # isolated per test, no re-scan
+```
+
+The same machinery works without pytest — from `unittest`, a script, or a
+REPL:
+
+```python
+from providify import ContainerOverrides
+
+with ContainerOverrides(container) as ov:
+    ov.instance(Clock, FrozenClock(...))
+    ov.bind(Notifier, FakeNotifier)
+# every override undone here
+```
+
+`ContainerOverrides` methods: `instance(iface, obj)`, `bind(iface, impl)`,
+`factory(iface, fn)`, `remove(iface, *, qualifier=None)`, `profiles(*names)`,
+`alternative(cls)`, and an explicit `reset()`. Every method returns `self`
+for chaining.
+
+⚠️ **Overrides restore configuration, not lifecycle.** Anything
+instantiated *during* an override window is dropped without teardown
+(no `@PreDestroy`/`@Disposes` runs for it) — `restore()` writes the
+snapshotted singleton cache back wholesale. The default `di_container`
+fixture sidesteps this because it is fresh per test with `shutdown()` in
+its own teardown; only a consumer who points `di_container` at a
+long-lived app container is exposed.
+
+---
+
 ## Running tests
 
 ```bash
@@ -1608,6 +2008,7 @@ Tests are organised by feature — one file per subsystem:
 | `test_qualifier.py` | `@Qualifier` marker, type qualifier in binding and `get()`, string qualifier backward compat |
 | `test_default.py` | `@Default` resolves same as no qualifier; `@Component(qualifier=Default)` visible on unqualified lookup |
 | `test_alternative.py` | `@Alternative` excluded by default; activated by `enable_alternative()`; reverted by `disable_alternative()` |
+| `test_profiles.py` | `@Profile` OR/negation matching, `PROVIDIFY_PROFILES` env var, `profiles=`/`activate_profile()`/`deactivate_profile()`, `@Profile` as `@Alternative` activator, profile-aware `validate()` |
 | `test_stereotype.py` | `Stereotype(...)` applies scope/priority; explicit annotation wins over stereotype defaults |
 | `test_interceptor.py` | `@Interceptor` wraps method; `ctx.proceed()` calls original; chain ordering by registration |
 | `test_decorator_bean.py` | `@Decorator` wraps delegate; `DelegateMeta` receives inner implementation; multiple decorators stack |

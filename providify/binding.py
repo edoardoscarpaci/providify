@@ -25,6 +25,7 @@ from .metadata import (
     ProviderMetadata,
     Scope,
     _get_metadata,
+    _get_profile_expressions,
     _get_provider_metadata,
 )
 from .utils import _is_generic_subtype, _type_name
@@ -183,6 +184,9 @@ class ClassBinding(Binding):
         self.implementation = implementation
         # Controls participation in supertype sweeps — see docstring above.
         self.exact_only = exact_only
+        # DESIGN: resolved once at construction — _filter() runs per
+        # resolution and must not re-read markers (plan 005 §Design).
+        self.profiles: tuple[str, ...] = _get_profile_expressions(implementation)
 
         meta: DIMetadata | None = _get_metadata(implementation)
         if meta is None:
@@ -652,6 +656,9 @@ class ProviderBinding(Binding):
 
         self.interface = interface
         self.fn = fn
+        # DESIGN: resolved once at construction — _filter() runs per
+        # resolution and must not re-read markers (plan 005 §Design).
+        self.profiles: tuple[str, ...] = _get_profile_expressions(fn)
 
         # Detect async at registration time — avoids repeated inspect calls
         # on every resolution. iscoroutinefunction is cheap but registrations

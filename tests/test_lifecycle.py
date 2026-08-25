@@ -24,7 +24,6 @@ from providify.container import DIContainer
 from providify.decorator.lifecycle import PostConstruct, PreDestroy
 from providify.decorator.scope import Component, Singleton
 
-
 # ─────────────────────────────────────────────────────────────────
 #  @PostConstruct tests
 # ─────────────────────────────────────────────────────────────────
@@ -280,3 +279,65 @@ class TestPreDestroy:
             pass  # __aexit__ calls ashutdown()
 
         assert torn_down == [True]
+
+    def test_shutdown_raises_shutdown_error_and_still_clears_cache_on_hook_failure(
+        self, container: DIContainer
+    ) -> None:
+        """Plan 004 (F9): shutdown() no longer raises the bare hook exception and
+        aborts before clearing caches. It must raise ShutdownError (aggregating
+        every failure) while still running _clear_caches() in a finally block.
+
+        This replaces the old raise-on-first-and-leak-the-cache behaviour.
+        """
+        from providify.exceptions import ShutdownError
+
+        @Singleton
+        class Resource:
+            @PreDestroy
+            def teardown(self) -> None:
+                raise ValueError("boom")
+
+        container.register(Resource)
+        container.get(Resource)
+
+        with pytest.raises(ShutdownError):
+            container.shutdown()
+
+        # Cache must be cleared even though the hook raised.
+        assert container._singleton_cache == {}
+
+    def test_shutdown_teardown_order_follows_dependencies_not_registration(
+        self, container: DIContainer
+    ) -> None:
+        """Plan 004 (F9): teardown order is reverse-*creation*-order (dependents
+        before dependencies), not the order bindings were registered in.
+        """
+        order: list[str] = []
+
+        @Singleton
+        class Config:
+            @PreDestroy
+            def teardown(self) -> None:
+                order.append("Config")
+
+        @Singleton
+        class Service:
+            def __init__(self, config: Config) -> None:
+                self.config = config
+
+            @PreDestroy
+            def teardown(self) -> None:
+                order.append("Service")
+
+        # Registered in dependency order here (Config before Service) but the
+        # true assertion is about creation order, which is fixed by the
+        # constructor call graph regardless of registration order.
+        container.register(Config)
+        container.register(Service)
+
+        container.get(Service)
+        container.shutdown()
+
+        # Service depends on Config, so Service (the dependent) must be torn
+        # down BEFORE Config (its dependency) — reverse creation order.
+        assert order == ["Service", "Config"]

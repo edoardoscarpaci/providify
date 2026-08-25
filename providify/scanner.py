@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Generic, get_origin
 
 from .binding import ClassBinding, ProviderBinding
 from .metadata import (
+    _has_config_properties,
     _has_configuration_module,
     _has_own_metadata,
     _has_provider_metadata,
@@ -70,6 +71,18 @@ class DefaultContainerScanner(ContainerScanner):
 
         # DESIGN: Track installed @Configuration classes by identity (set[type]).
         #
+        # Plan 008/F5: the CONTAINER (``DIContainer._installed_modules``) is
+        # now the dedup *authority* — it is the only thing that can see both
+        # an explicit ``container.install(M)`` call and a later ``scan()``
+        # covering the same ``M``, which is exactly the double-registration
+        # bug this set alone could not prevent (a scan-only set never learns
+        # about an explicit install() that happened first). This set is kept
+        # as a same-session fast-path shortcut so a scan re-run within one
+        # scanner instance skips the dict lookup in the common case; the
+        # container's own ``if cls in self._installed_modules: continue``
+        # check inside ``install()``/``ainstall()`` is what actually
+        # guarantees correctness.
+        #
         # Tradeoffs:
         #   ✅ O(1) lookup — no linear scan of bindings on every scan call
         #   ✅ Handles the bound-method vs unbound-function identity mismatch:
@@ -79,8 +92,15 @@ class DefaultContainerScanner(ContainerScanner):
         #   ❌ The set lives on the scanner, not the container — if a second
         #      scanner instance is created for the same container it won't
         #      inherit this history. Acceptable: container.scan() always
-        #      delegates to self._scanner, so only one scanner is ever active.
+        #      delegates to self._scanner, so only one scanner is ever active,
+        #      and the container's own dict is the real safety net regardless.
         self._installed_configurations: set[type] = set()
+
+        # Same rationale as _installed_configurations above: bind_config()
+        # registers a *closure* (`_config_factory`), never identical to
+        # anything reachable from `vars(cls)` — a set[type] keyed on the
+        # decorated class itself is the only reliable dedup signal.
+        self._bound_configs: set[type] = set()
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -132,6 +152,12 @@ class DefaultContainerScanner(ContainerScanner):
                 self._autoregister_class(obj)
             elif inspect.isfunction(obj) and _has_provider_metadata(obj):
                 self._autoregister_provider(obj)
+            elif inspect.isclass(obj) and _has_config_properties(obj):
+                # Placed BEFORE the @Configuration branch below so a class
+                # carrying both markers is treated as config (plan 006
+                # §Design/"scan() picks @ConfigProperties classes up" —
+                # documented as unsupported/ambiguous, not dual-role).
+                self._autoregister_config_properties(obj)
             elif inspect.isclass(obj) and _has_configuration_module(obj):
                 self._autoregister_configurator(obj)
 
@@ -260,6 +286,35 @@ class DefaultContainerScanner(ContainerScanner):
 
         self._installed_configurations.add(cls)
         self._container.install(cls)
+
+    def _autoregister_config_properties(self, cls: type) -> None:
+        """Register a ``@ConfigProperties`` class into the container, skipping
+        duplicates.
+
+        Uses a class-identity set (``_bound_configs``) to detect repeated
+        scans of the same module — the same rationale as
+        ``_autoregister_configurator``/``_installed_configurations`` above:
+        ``bind_config()`` registers a *closure* (``_config_factory``), never
+        identical to anything reachable from ``vars(cls)``, so a naïve
+        ``b.fn is fn`` comparison could never detect the duplicate.
+
+        Args:
+            cls: The class decorated with ``@ConfigProperties``.
+
+        Returns:
+            None
+
+        Edge cases:
+            - Same cls encountered in two different module scans → skipped
+              on second encounter because the set tracks the class object,
+              not the module path (test: scanning twice registers one
+              binding).
+        """
+        if cls in self._bound_configs:
+            return
+
+        self._bound_configs.add(cls)
+        self._container.bind_config(cls)
 
     def _find_interfaces(self, cls: type) -> list[Any]:
         """Return all interfaces that *cls* should be bound against during auto-scan.

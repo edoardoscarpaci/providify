@@ -18,6 +18,8 @@ __all__ = [
     "Qualifier",
     "Default",
     "Alternative",
+    "Profile",
+    "ProfileMetadata",
     "Stereotype",
     "StereotypeMetadata",
     "Decorator",
@@ -30,6 +32,18 @@ __all__ = [
     "ObservesMarker",
     # Module
     "Configuration",
+    # Configuration binding (env / YAML / JSON / TOML → typed objects)
+    "ConfigProperties",
+    "ConfigSource",
+    "DictSource",
+    "EnvSource",
+    "JsonSource",
+    "TomlSource",
+    "YamlSource",
+    "ConfigPropertiesMetadata",
+    # Testing helpers
+    "ContainerOverrides",
+    "ContainerSnapshot",
     # Scope enum — exported so users never need to import from metadata
     "Scope",
     # Exception hierarchy — exported for except clauses without internal imports
@@ -41,10 +55,27 @@ __all__ = [
     "ScopeViolationDetectedError",
     "LiveInjectionRequiredError",
     "AnnotationResolutionError",
+    "ContainerValidationError",
+    "ShutdownError",
+    "ShutdownFailure",
+    "ConfigBindingError",
+    "ConfigIssue",
+    "ModuleCycleError",
     # Binding and descriptor types — for type annotations and introspection
     "AnyBinding",
     "BindingDescriptor",
     "DIContainerDescriptor",
+    # Startup-time full-graph validation (container.validate())
+    "ValidationReport",
+    "ValidationIssue",
+    "IssueKind",
+    "Severity",
+    # Observability (container telemetry)
+    "InstanceCreated",
+    "InstanceDisposed",
+    "ScopeEntered",
+    "ScopeExited",
+    "ContainerEvent",
     # Types
     "Inject",
     "InjectInstances",
@@ -79,7 +110,16 @@ __all__ = [
 import logging
 
 from .binding import AnyBinding
-from .container import DIContainer, ScopeContext
+from .config import (
+    ConfigSource,
+    DictSource,
+    EnvSource,
+    JsonSource,
+    TomlSource,
+    YamlSource,
+)
+from .container import ContainerSnapshot, DIContainer, ScopeContext
+from .decorator.config import ConfigProperties
 from .decorator.interceptor import AroundInvoke, Interceptor, InterceptorBinding
 from .decorator.lifecycle import (
     Disposes,
@@ -101,6 +141,7 @@ from .decorator.scope import (
     # Priority is a field-update decorator (same module as Named) — it was
     # missing from the public surface despite being documented in the README.
     Priority,
+    Profile,
     Provider,
     # Jakarta CDI parity decorators
     Qualifier,
@@ -115,12 +156,31 @@ from .exceptions import (
     BindingError,
     CircularDependencyError,
     ClassBindingNotDecoratedError,
+    ConfigBindingError,
+    ConfigIssue,
+    ContainerValidationError,
     LiveInjectionRequiredError,
+    ModuleCycleError,
     ProviderBindingNotDecoratedError,
     ScopeViolationDetectedError,
+    ShutdownError,
+    ShutdownFailure,
     providifyError,
 )
-from .metadata import Scope, StereotypeMetadata
+from .metadata import (
+    ConfigPropertiesMetadata,
+    ProfileMetadata,
+    Scope,
+    StereotypeMetadata,
+)
+from .observability import (
+    ContainerEvent,
+    InstanceCreated,
+    InstanceDisposed,
+    ScopeEntered,
+    ScopeExited,
+)
+from .testing import ContainerOverrides
 from .type import (
     Delegate,
     DelegateMeta,
@@ -143,5 +203,6 @@ from .type import (
     LiveProxy,
     NamedMeta,
 )
+from .validation import IssueKind, Severity, ValidationIssue, ValidationReport
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())

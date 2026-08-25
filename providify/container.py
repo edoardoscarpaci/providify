@@ -9,12 +9,17 @@ import threading
 import types
 import warnings
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass, replace
+from time import perf_counter_ns
 from types import ModuleType
 from typing import (
+    TYPE_CHECKING,
     Annotated,
     Any,
     ClassVar,
+    Literal,
     TypeVar,
     Union,
     get_args,
@@ -28,6 +33,7 @@ from ._annotations import (
     resolve_params,
 )
 from .binding import AnyBinding, ClassBinding, ProviderBinding
+from .config import bind_config_object
 from .decorator.interceptor import (
     _get_around_invoke_method,
     _is_interceptor,
@@ -35,25 +41,36 @@ from .decorator.interceptor import (
 )
 from .decorator.lifecycle import (
     LifecycleMarker,
+    _find_post_construct,
+    _find_pre_destroy,
     _get_disposes_marker,
     _get_observes_marker,
 )
+from .decorator.scope import Provider
 from .descriptor import DIContainerDescriptor
 from .exceptions import (
     AnnotationResolutionError,
     CircularDependencyError,
     LiveInjectionRequiredError,
+    ScopeViolationDetectedError,
+    ShutdownError,
+    ShutdownFailure,
 )
 from .metadata import (
     LiveInjectionViolation,
     Scope,
     ScopeLeak,
+    _get_config_properties,
     _get_metadata,
     _get_provider_metadata,
     _has_configuration_module,
     _has_own_metadata,
     _is_scope_leak,
 )
+from .modules import resolve_install_order
+from .observability import InstanceCreated, InstanceDisposed, ScopeEntered, ScopeExited
+from .profiles import _normalise as _normalise_profile
+from .profiles import resolve_active_profiles
 from .resolution import (
     _UNRESOLVED,
     _current_injection_point,
@@ -83,6 +100,16 @@ from .type import (
     _unwrap_classvar,
 )
 from .utils import _interface_matches, _type_name
+
+if TYPE_CHECKING:
+    # Only needed for validate()'s -> ValidationReport return annotation and
+    # _iter_injection_points()'s _HintSpec yield type — `from __future__
+    # import annotations` (top of file) means neither executes at runtime,
+    # so this cannot create the import cycle a top-level `from .validation
+    # import ...` would (validation.py's docstring notes it must never
+    # import container.py; container.py importing IT is fine, just deferred
+    # to inside each method itself for the runtime symbols).
+    from .validation import ValidationReport, _HintSpec
 
 T = TypeVar("T")
 
@@ -148,28 +175,131 @@ def _unwrap_union(hint: Any) -> tuple[list[Any], bool] | None:
 
 
 # ─────────────────────────────────────────────────────────────────
+#  ContainerSnapshot — opaque, restorable capture of mutable state
+# ─────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class ContainerSnapshot:
+    """Opaque, restorable capture of a :class:`DIContainer`'s mutable state.
+
+    Produced by :meth:`DIContainer.snapshot` and consumed by
+    :meth:`DIContainer.restore`. The **only** supported use is
+    ``container.restore(snap)`` on the *same* container instance that
+    produced it — this is a value object for round-tripping state, not a
+    general-purpose container description. Field values are opaque to
+    callers other than ``DIContainer`` itself; do not read or mutate them.
+
+    Frozen because a snapshot is a fact about a point in time — mutating one
+    after capture would silently desync it from what ``restore()`` claims to
+    reproduce (same reasoning as ``ValidationIssue``/``ShutdownFailure``/
+    ``ConfigIssue``).
+
+    Attributes:
+        bindings: Shallow copy of ``_bindings`` at capture time.
+        singleton_cache: Shallow copy of ``_singleton_cache`` at capture time.
+        singleton_order: Shallow copy of ``_singleton_order`` at capture time.
+        enabled_alternatives: Copy of ``_enabled_alternatives`` at capture time.
+        active_profiles: The ``_active_profiles`` frozenset at capture time
+            (already immutable, so no copy is needed).
+        interceptor_classes: Shallow copy of ``_interceptor_classes`` at
+            capture time.
+
+    Edge cases:
+        - Restoring into a *different* container than the one that produced
+          the snapshot is not guarded against — it is a private-ish escape
+          hatch, deliberately undocumented as a supported feature.
+    """
+
+    bindings: tuple[AnyBinding, ...]
+    singleton_cache: dict[Any, object]
+    singleton_order: tuple[tuple[Any, AnyBinding], ...]
+    enabled_alternatives: frozenset[type]
+    active_profiles: frozenset[str]
+    interceptor_classes: tuple[type, ...]
+
+
+# ─────────────────────────────────────────────────────────────────
+#  _ModuleRecord — one entry per installed @Configuration module (Plan 008)
+# ─────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class _ModuleRecord:
+    """One entry in ``DIContainer._installed_modules`` — tracks a single
+    installed ``@Configuration`` module instance.
+
+    Three roles, one dict entry (see ``_installed_modules``'s DESIGN comment
+    in ``__init__`` for the full rationale):
+        1. **Dedup** — key (the module class) presence in the dict IS the
+           "already installed" check; ``install()``/``ainstall()`` skip any
+           class already present instead of re-instantiating it.
+        2. **Install order** — dict insertion order (Python 3.7+ dicts are
+           ordered) records the order modules were actually installed in.
+        3. **Teardown order** — ``shutdown()``/``ashutdown()`` walk
+           ``reversed(_installed_modules.items())`` to run ``@PreDestroy``
+           hooks in exact reverse install order.
+
+    Frozen — a record is a fact about one install event; ``owned``/
+    ``disposed`` are updated via ``dataclasses.replace()`` (never mutated
+    in place), mirroring ``ShutdownFailure``/``ConfigIssue``'s immutability
+    rationale elsewhere in this codebase.
+
+    Attributes:
+        instance: The live module instance — ``getattr(instance, hook_name)``
+            is how its ``@PreDestroy`` hook (if any) is invoked at shutdown.
+        owned: ``True`` if *this* container created the instance (via
+            ``install()``/``ainstall()``); ``False`` on a ``copy()`` — the
+            copy inherits the dedup/install-order history (so it never
+            re-registers providers it already holds bindings for) but did
+            not create the instance, so it must never dispose it. Mirrors
+            ``_singleton_order``'s ownership reasoning for ``copy()``.
+        disposed: ``True`` after this record's ``@PreDestroy`` hook has run
+            at shutdown — makes ``shutdown()``/``ashutdown()`` idempotent:
+            a second ``shutdown()`` call skips every already-disposed
+            record instead of re-running its hook.
+    """
+
+    instance: object
+    owned: bool
+    disposed: bool
+
+
+# ─────────────────────────────────────────────────────────────────
 #  _ScopedContainer — installs a temporary container as global
 # ─────────────────────────────────────────────────────────────────
 
 
 class _ScopedContainer:
     """
-    Installs a fresh DIContainer as the global for the duration of the block.
-    Restores the previous global on exit — even if an exception is raised.
+    Installs a fresh (or adopted) DIContainer as the global for the duration
+    of the block. Restores the previous global on exit — even if an
+    exception is raised.
 
     Supports both sync and async usage:
         with DIContainer.scoped() as c: ...
         async with DIContainer.scoped() as c: ...
+
+    Adopting an existing container (``DIContainer.scoped(existing)``) does
+    **not** shut it down on exit — only the global reference is restored.
+    The caller remains responsible for the adopted container's lifecycle
+    (e.g. via ``with existing: ...`` or an explicit ``shutdown()``).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, container: DIContainer | None = None) -> None:
         self._previous: DIContainer | None = None
         self._container: DIContainer | None = None
+        # The container to adopt, if any — kept separate from ``_container``
+        # (which only holds the *installed* container once _install() runs)
+        # so repeated __enter__/__exit__ cycles on one _ScopedContainer keep
+        # adopting the same instance rather than falling back to a fresh one
+        # after the first cycle.
+        self._container_arg = container
 
     def _install(self) -> DIContainer:
-        """Creates and installs a fresh container as the global."""
+        """Creates (or adopts) and installs a container as the global."""
         self._previous = DIContainer._global
-        self._container = DIContainer()
+        self._container = self._container_arg or DIContainer()
         DIContainer._global = self._container
         return self._container
 
@@ -328,6 +458,7 @@ class DIContainer:
         *,
         scan: str | list[str] | None = None,
         recursive: bool = True,
+        profiles: Iterable[str] | None = None,
     ) -> None:
         """Initialise an empty container with no bindings.
 
@@ -353,6 +484,35 @@ class DIContainer:
                        entry are walked recursively.  Has no effect when *scan*
                        is ``None``.
 
+            profiles:  The container's initial active profile set for
+                       ``@Profile``-gated bindings (plan 005). Precedence,
+                       deliberately explicit:
+
+                       .. list-table::
+                          :header-rows: 1
+
+                          * - ``profiles=``
+                            - ``PROVIDIFY_PROFILES``
+                            - active set
+                          * - ``None`` (default)
+                            - unset
+                            - ``frozenset()``
+                          * - ``None``
+                            - ``"prod,eu"``
+                            - ``{"prod", "eu"}``
+                          * - ``("prod",)``
+                            - ignored
+                            - ``{"prod"}``
+                          * - ``()``
+                            - ignored
+                            - ``frozenset()`` — *explicitly* no profiles
+
+                       An explicit argument (even an empty one) always wins
+                       over the environment variable. See
+                       ``providify.profiles.resolve_active_profiles`` for the
+                       resolution logic and ``providify.profiles.ENV_VAR``
+                       for the environment variable name.
+
         Returns:
             None
 
@@ -365,9 +525,32 @@ class DIContainer:
             - ``scan="myapp"`` — single string, scanned once with *recursive*.
             - ``scan=["a", "b"]`` — each module scanned left-to-right; later
               modules may add bindings that complement earlier ones.
+            - ``profiles=()`` with ``PROVIDIFY_PROFILES`` set in the
+              environment — the explicit empty set wins; ``active_profiles``
+              is ``frozenset()``.
         """
         self._bindings: list[AnyBinding] = []
         self._singleton_cache: dict[Any, object] = {}
+        # DESIGN: append-only creation log for singletons; reversed at
+        # shutdown to obtain reverse-dependency order — valid because
+        # ``_instantiate_sync``/``_instantiate_async`` cache a dependency
+        # before its dependent (see line ~1611-1615): a binding's own
+        # dependencies are resolved *inside* ``binding.create(self)`` and
+        # only written to ``_singleton_cache`` afterwards, so this list is
+        # always a valid topological order of the singleton dependency DAG.
+        #
+        # Tradeoffs:
+        #   ✅ O(1) append on creation, O(n) reverse-scan on shutdown —
+        #      no graph re-derivation, no cycle handling needed
+        #   ✅ Captures the *actual* runtime graph, including edges only
+        #      visible at runtime (Lazy[T]/Live[T]/Provider[T])
+        #   ❌ A late Lazy[T]/Provider[T] pull can invert an edge relative
+        #      to "true" dependency order (documented on shutdown()'s
+        #      docstring) — inherent to reverse-creation-order tracking
+        # Alternative considered: static topological sort over
+        # _get_dependencies() — rejected (see plans/004 §Alternatives):
+        # that method is deliberately lossy for its real caller, describe().
+        self._singleton_order: list[tuple[Any, AnyBinding]] = []
         # DESIGN: ScopeContext receives @PreDestroy callbacks so it can run
         # lifecycle hooks exactly when a request/session scope frame exits —
         # before the cache is popped.  Both sync and async callbacks are wired
@@ -431,12 +614,52 @@ class DIContainer:
         # ── Jakarta CDI parity state ───────────────────────────────
         # @Alternative — activated per-container; excluded by default from _filter()
         self._enabled_alternatives: set[type] = set()
+        # @Profile — active profile set for this container; consulted by
+        # _binding_is_active() inside _filter() on every resolution.
+        # resolve_active_profiles() handles the explicit-arg-vs-env-var
+        # precedence documented on __init__'s docstring above.
+        self._active_profiles: frozenset[str] = resolve_active_profiles(profiles)
         # @Interceptor — registered interceptor classes applied to all resolved instances
         self._interceptor_classes: list[type] = []
         # Event[T] / @Observes — maps event type → [(weakref, method_name)]
         self._observers: dict[type, list] = {}
         # @Component(track=True) — tracked DEPENDENT instances for flush_dependents()
         self._tracked_dependents: list[object] = []
+
+        # ── Observability hooks (Plan 009/F6) ───────────────────────
+        # DESIGN: keyed by exact event TYPE (InstanceCreated, InstanceDisposed,
+        # ScopeEntered, ScopeExited), never a base class — `self._hooks.get(type(event))`
+        # gives exact-type dispatch with no Protocol/base-class machinery, and
+        # makes the zero-hook fast path a single truthiness test (`if self._hooks:`)
+        # BEFORE any timer or event-object work, all the way down in
+        # `_instantiate_sync`/`_instantiate_async`/`shutdown`/the scope façades.
+        # This is deliberately NOT the `Event[T]` / `@Observes` dispatcher above
+        # (`self._observers`) — that system resolves *observer beans* through the
+        # container for *application* events; this dispatches *container
+        # telemetry* to *plain callables* and never re-enters resolution. See
+        # `observability.py`'s module docstring for the full isolation rationale.
+        self._hooks: dict[type, list[Callable[[Any], None]]] = {}
+
+        # ── @Configuration module install/teardown tracking (Plan 008/F5) ──
+        # DESIGN: one dict, three roles — see _ModuleRecord's docstring above
+        # for the full breakdown (dedup / install order / teardown order).
+        # Moves dedup authority from the scanner (scanner.py's
+        # _installed_configurations, a same-session shortcut only) to the
+        # container, which is the only thing that can see BOTH an explicit
+        # install(M) call and a later scan() covering the same M — fixing
+        # the historical double-registration bug (plan 008 §Design, item 4).
+        #
+        # Tradeoffs:
+        #   ✅ O(1) "already installed?" check via key presence
+        #   ✅ dict insertion order gives install order for free (no separate list)
+        #   ✅ owned=False on copy() prevents a copy from disposing instances
+        #      it never created (mirrors _singleton_order's copy() handling)
+        #   ❌ Survives shutdown() (deliberately — see _clear_caches, which
+        #      does NOT touch this dict): re-installing after shutdown() into
+        #      the SAME container is a no-op, not a re-registration. A fully
+        #      reusable container after shutdown() requires copy() or a new
+        #      DIContainer() — documented on install()/ainstall().
+        self._installed_modules: dict[type, _ModuleRecord] = {}
 
         # ── Auto-scan at construction time ────────────────────────
         # DESIGN: Eager scan (at __init__) rather than lazy scan (deferred to
@@ -511,18 +734,34 @@ class DIContainer:
             cls._async_lock = None  # reset lock too — next acurrent() recreates it
 
     @classmethod
-    def scoped(cls) -> _ScopedContainer:
-        """Return a context manager that installs a fresh container as global.
+    def scoped(cls, container: DIContainer | None = None) -> _ScopedContainer:
+        """Return a context manager that installs a container as global.
 
         Supports both sync and async:
 
             with DIContainer.scoped() as container: ...
             async with DIContainer.scoped() as container: ...
 
+        Args:
+            container: An existing container to adopt as the global for the
+                duration of the block. When ``None`` (default), a fresh
+                ``DIContainer()`` is created instead — the original
+                behaviour. Adopting an existing container does **not**
+                shut it down on exit; only the previous global reference is
+                restored. This is the mechanism behind pytest's ``di_global``
+                fixture, which needs ``DIContainer.current()`` to resolve to
+                a specific, already-configured test container.
+
         Returns:
             A :class:`_ScopedContainer` context manager.
+
+        Example:
+            test_container = DIContainer()
+            test_container.bind(Clock, FrozenClock)
+            with DIContainer.scoped(test_container):
+                assert DIContainer.current() is test_container
         """
-        return _ScopedContainer()
+        return _ScopedContainer(container)
 
     # ── Instance context manager ──────────────────────────────────
     #
@@ -700,6 +939,66 @@ class DIContainer:
         self._invalidate_type_caches()  # new binding — localns/hints must be rebuilt
         self._bindings.append(ProviderBinding(fn, returns=returns))
 
+    def bind_config(self, cls: type, *, sources: Sequence[Any] | None = None) -> None:
+        """Register a ``@ConfigProperties`` class as a singleton binding.
+
+        Config binding is *exactly* a provider registration — no new
+        ``Binding`` subclass (plan 006 §Design/"Container integration").
+        The class's merged configuration (env/YAML/JSON/TOML, per its
+        ``@ConfigProperties`` sources) is loaded and bound into an instance
+        the first time it is resolved, via ``provide(fn, returns=cls)``:
+        it is visible to ``describe()``, ``validate()``, ``override()`` and
+        ``reset_binding()`` with no special-casing, and torn down/ordered by
+        ``_singleton_order`` like any other provider.
+
+        ``sources`` precedence (highest wins):
+            1. ``sources`` — this call's override.
+            2. ``@ConfigProperties(sources=...)`` — decoration-time sources.
+
+        The override-at-call-site precedence mirrors ``provide(fn,
+        returns=...)``'s own (``:692-698`` above) — it is also the test
+        seam: ``bind_config(DbSettings, sources=[DictSource({...})])`` needs
+        no env or files.
+
+        Binding is **lazy** and **singleton**: the factory runs once, on the
+        first ``get(cls)`` — not at registration time. A misconfigured
+        deployment (missing required field, unparsable value) therefore
+        raises ``ConfigBindingError`` at first resolution, not at
+        ``bind_config()`` call time. See ``warm_up()`` / ``validate()`` for
+        fail-at-startup — ``validate()`` does not instantiate anything, so it
+        will not catch a bad config *value*; only ``warm_up()`` will.
+
+        Args:
+            cls: A class decorated with ``@ConfigProperties``.
+            sources: Optional override for the sources declared on the
+                decorator — loaded in order, later sources win on key
+                conflicts (deep merge, plan 006 §Design).
+
+        Returns:
+            None
+
+        Raises:
+            TypeError: If *cls* is not decorated with ``@ConfigProperties``.
+
+        Example:
+            @ConfigProperties(prefix="db", sources=(EnvSource(),))
+            @dataclass(frozen=True)
+            class DbSettings:
+                url: str
+
+            container.bind_config(DbSettings)
+            container.get(DbSettings)   # raises ConfigBindingError here, not above,
+                                         # if DB__URL is unset
+        """
+        meta = _get_config_properties(cls)  # raises TypeError if not decorated
+        effective = tuple(sources) if sources is not None else meta.sources
+
+        @Provider(singleton=True)
+        def _config_factory() -> Any:
+            return bind_config_object(cls, effective, prefix=meta.prefix)
+
+        self.provide(_config_factory, returns=cls)
+
     # ── Warm-up ───────────────────────────────────────────────────
 
     def _validate_no_async_providers(self, bindings: list[AnyBinding]) -> None:
@@ -740,6 +1039,10 @@ class DIContainer:
         Validates the full binding list before instantiating anything — if any
         async provider is present the method raises immediately without touching
         the singleton cache, giving a clean all-or-nothing guarantee.
+
+        Note: only instantiates SINGLETONs — use :meth:`validate` for
+        whole-graph checks (missing/ambiguous bindings, circular
+        dependencies) that cover every scope without instantiating anything.
 
         Args:
             qualifier: Named qualifier to restrict which singletons are warmed up.
@@ -966,6 +1269,80 @@ class DIContainer:
 
     # ── Filtering helpers ─────────────────────────────────────────
 
+    def _binding_is_active(self, b: AnyBinding) -> bool:
+        """Return True if *b* is eligible for resolution under current activation state.
+
+        Uniform activation predicate consulted by ``_filter()`` on every
+        resolution — the single place that decides whether a binding exists
+        "right now", combining ``@Profile`` and ``@Alternative`` activation
+        (plan 005 §Design):
+
+        ::
+
+            _binding_is_active(b) <=> profile_ok(b) AND alternative_ok(b)
+
+            profile_ok(b)      : b.profiles == ()      -> True   (unprofiled)
+                                  any expr in b.profiles matches self._active_profiles
+
+            alternative_ok(b)  : b.source not @Alternative -> True
+                                  b.profiles != ()          -> True  (@Profile is the activator)
+                                  b.source in self._enabled_alternatives
+
+        ``b.source`` is ``ClassBinding.implementation`` or
+        ``ProviderBinding.fn`` — both ``@Alternative`` and ``@Profile``
+        markers are read from ``__dict__``, matching ``_is_alternative``'s
+        non-inherited lookup. This closes a pre-existing asymmetry: before
+        this plan, the ``@Alternative`` guard only inspected
+        ``ClassBinding``, so the marker on a ``@Provider`` function was
+        silently ignored (always active) — this predicate now reads it off
+        ``ProviderBinding.fn`` too (plan 005 §Design, "behaviour change").
+
+        Args:
+            b: The binding to test — a ``ClassBinding`` or ``ProviderBinding``.
+
+        Returns:
+            True if *b* should be visible to ``get()``/``get_all()``/
+            ``is_resolvable()``/``validate()`` right now.
+
+        Thread safety: ⚠️ Conditional — safe only if ``_active_profiles`` /
+            ``_enabled_alternatives`` are not mutated concurrently with a
+            resolution (same caveat as ``_filter()``).
+        Async safety:  ✅ No await points; no shared mutable state written.
+
+        Edge cases:
+            - No ``@Profile`` and no ``@Alternative`` anywhere -> always True
+              (short-circuits on ``not b.profiles``, falls through to the
+              unchanged ``@Alternative`` rule for the rare marked case).
+            - ``@Alternative`` + matching ``@Profile`` + inactive in
+              ``_enabled_alternatives`` -> still active; the profile is the
+              activator and ``_enabled_alternatives`` membership is not
+              consulted once ``b.profiles`` is non-empty.
+            - ``@Alternative`` + ``@Profile`` that does NOT match -> inactive,
+              even after ``enable_alternative()`` — the profile is a hard
+              gate (AND), not overridable imperatively.
+        """
+        from .binding import ClassBinding as _ClassBinding
+        from .metadata import _is_alternative
+        from .profiles import matches as _profile_matches
+
+        # Short-circuit order: `not b.profiles` first — the overwhelmingly
+        # common case is an unprofiled binding, and this avoids the frozenset
+        # scan in `matches()` entirely for it.
+        profile_ok = not b.profiles or _profile_matches(
+            b.profiles, self._active_profiles
+        )
+        if not profile_ok:
+            return False
+
+        source = b.implementation if isinstance(b, _ClassBinding) else b.fn
+        if not _is_alternative(source):
+            return True
+        # @Profile is the declarative activator for @Alternative — once a
+        # profile expression is present, it alone governs eligibility.
+        if b.profiles:
+            return True
+        return source in self._enabled_alternatives
+
     def _filter(
         self,
         cls: type,
@@ -977,6 +1354,17 @@ class DIContainer:
         Optionally narrows the result by *qualifier* and/or *priority*.
         The same logic is shared by both the sync and async resolution paths.
 
+        Activation rules (plan 005) applied via ``_binding_is_active()``:
+
+        | condition                                   | included? |
+        |----------------------------------------------|-----------|
+        | unprofiled, not @Alternative                  | always    |
+        | unprofiled @Alternative, not enabled           | no        |
+        | unprofiled @Alternative, enabled               | yes       |
+        | @Profile matches active set                    | yes       |
+        | @Profile does not match active set              | no        |
+        | @Profile matches + @Alternative (any enable state) | yes   |
+
         Args:
             cls:       The base type to match against ``binding.interface``.
             qualifier: If given, only bindings with a matching qualifier are kept.
@@ -985,9 +1373,7 @@ class DIContainer:
         Returns:
             A (possibly empty) list of matching bindings.
         """
-        from .binding import ClassBinding as _ClassBinding
         from .decorator.scope import Default as _Default
-        from .metadata import _is_alternative
 
         # @Default is semantically equivalent to no qualifier
         if qualifier is _Default:
@@ -1010,11 +1396,8 @@ class DIContainer:
             and (not getattr(b, "exact_only", False) or b.interface is cls)
             and (qualifier is None or b.qualifier == qualifier)
             and (priority is None or b.priority == priority)
-            # @Alternative bindings are excluded unless explicitly enabled
-            and (
-                not (isinstance(b, _ClassBinding) and _is_alternative(b.implementation))
-                or b.implementation in self._enabled_alternatives
-            )
+            # @Profile / @Alternative activation — see _binding_is_active().
+            and self._binding_is_active(b)
         ]
 
     def is_resolvable(
@@ -1064,7 +1447,7 @@ class DIContainer:
         # side effects — calling it here does not trigger validation or instantiation.
         return bool(self._filter(cls, qualifier=qualifier, priority=priority))
 
-    # ── @Alternative — deployment-time bean activation ────────────
+    # ── @Alternative / @Profile — deployment-time bean activation ──
 
     def enable_alternative(self, cls: type) -> None:
         """Activate an @Alternative-marked class for this container.
@@ -1081,12 +1464,115 @@ class DIContainer:
     def disable_alternative(self, cls: type) -> None:
         """Deactivate a previously enabled @Alternative class.
 
-        After disabling, the alternative is excluded from resolution again.
+        After disabling, the alternative is excluded from resolution again —
+        UNLESS *cls* also carries ``@Profile`` and that profile currently
+        matches ``active_profiles``. In that case the profile is the
+        activator (plan 005 §Design) and this call has no visible effect on
+        resolution: ``_binding_is_active()`` never consults
+        ``_enabled_alternatives`` once a binding's ``.profiles`` is
+        non-empty. ``_enabled_alternatives`` is still updated (so a later
+        profile deactivation and re-enable-by-name compose predictably), but
+        the class remains resolvable until its profile itself stops matching.
 
         Args:
             cls: A class previously passed to enable_alternative().
         """
         self._enabled_alternatives.discard(cls)
+        self._validated = False
+
+    @property
+    def active_profiles(self) -> frozenset[str]:
+        """Return a read-only snapshot of this container's active profile set.
+
+        Returns:
+            The current ``frozenset[str]`` of normalised, active profile
+            names. Frozensets are immutable, so the returned object cannot
+            be mutated by the caller to affect container state — mirroring
+            the read-only intent of other snapshot-style properties in this
+            class.
+
+        Thread safety: ✅ Safe — reads a single reference; the frozenset
+            itself is immutable once built.
+        Async safety:  ✅ No await points.
+
+        Example:
+            container.activate_profile("prod")
+            assert "prod" in container.active_profiles
+        """
+        return self._active_profiles
+
+    def activate_profile(self, name: str) -> None:
+        """Add *name* to this container's active profile set.
+
+        Mirrors ``enable_alternative()``'s shape exactly, including the
+        ``self._validated = False`` reset — the reachable graph may have
+        changed (a previously-filtered ``@Profile``d binding can now be
+        selected), so the next resolution should re-run scope-leak /
+        graph checks. ``_invalidate_type_caches()`` is deliberately **not**
+        called: no binding was added or removed, so ``_localns_cache`` and
+        ``_hints_cache`` (which key off bindings, not activation state)
+        remain valid.
+
+        Args:
+            name: A profile name — normalised (stripped, lower-cased) the
+                same way ``@Profile(...)`` and ``resolve_active_profiles``
+                normalise their inputs, so ``"Dev"`` and ``"dev"`` are the
+                same profile.
+
+        Returns:
+            None
+
+        Thread safety: ⚠️ Not synchronized — mutating ``_active_profiles``
+            concurrently with an in-flight resolution is a plain race, the
+            same caveat as ``enable_alternative()``.
+        Async safety:  Same caveat as thread safety.
+
+        Edge cases:
+            - Activating an already-active profile is a no-op (frozenset
+              union is idempotent).
+            - A ``@Profile``d singleton already resolved under the OLD
+              profile set is **not** evicted from ``_singleton_cache`` —
+              profiles are a startup-time concern; ``override()`` /
+              ``reset_binding()`` remain the eviction tools.
+
+        Example:
+            container.activate_profile("prod")
+            container.get(Mailer)  # now sees @Profile("prod") bindings
+        """
+        self._active_profiles = self._active_profiles | {_normalise_profile(name)}
+        self._validated = False
+
+    def deactivate_profile(self, name: str) -> None:
+        """Remove *name* from this container's active profile set.
+
+        Mirrors ``disable_alternative()``'s shape exactly, including the
+        ``self._validated = False`` reset. A silent no-op when *name* is not
+        currently active — mirroring ``set.discard()``'s tolerance, which
+        ``disable_alternative()`` already relies on.
+
+        Args:
+            name: A profile name — normalised the same way
+                ``activate_profile`` normalises its input, so
+                ``deactivate_profile("dev")`` removes a profile that was
+                activated as ``"Dev"``.
+
+        Returns:
+            None
+
+        Thread safety: ⚠️ Not synchronized — same caveat as
+            ``activate_profile()``.
+        Async safety:  Same caveat as thread safety.
+
+        Edge cases:
+            - *name* not currently active -> silent no-op, no exception.
+            - Does not evict any cached singleton — see
+              ``activate_profile()``'s note; profiles select bindings, never
+              cached instances.
+
+        Example:
+            container.deactivate_profile("dev")  # safe even if never activated
+        """
+        self._active_profiles = self._active_profiles - {_normalise_profile(name)}
         self._validated = False
 
     # ── Interceptor registration (F5) ────────────────────────────
@@ -1482,6 +1968,35 @@ class DIContainer:
             return binding.implementation
         return binding.fn
 
+    def _record_singleton_creation(self, key: Any, binding: AnyBinding) -> None:
+        """Append ``(key, binding)`` to the singleton creation log.
+
+        Called exactly once per key: both call sites (``_instantiate_sync``
+        and ``_instantiate_async``) are inside the per-key double-check lock
+        (see ``_check_singleton_reentry`` / the ``with self._locks[key]:``
+        blocks around lines ~1618 and ~1707), so a given key can never reach
+        ``cache[key] = instance`` twice. The log therefore stays free of
+        duplicate entries without any dedup logic here — ``_teardown_plan``
+        still defends against duplicates defensively (see its docstring).
+
+        Args:
+            key:     The singleton cache key, from :meth:`_get_cache_key`.
+            binding: The binding that produced the instance now at *key* —
+                     stored so teardown can find its ``pre_destroy``/disposer
+                     without re-deriving it from ``_bindings``.
+
+        Returns:
+            None.
+
+        Thread safety: ✅ Safe — appends under ``self._singleton_lock_guard``,
+            the same cheap, no-I/O guard already held on this code path
+            (the per-key lock creation guard), so recording the creation adds
+            no new lock contention and the list stays consistent without
+            relying on GIL atomicity for ``list.append``.
+        """
+        with self._singleton_lock_guard:
+            self._singleton_order.append((key, binding))
+
     def _check_singleton_reentry(self, binding: AnyBinding, key: Any) -> None:
         """Raise if this thread/task is already creating the singleton *key*.
 
@@ -1535,6 +2050,33 @@ class DIContainer:
         )
 
     # ── Instantiation ─────────────────────────────────────────────
+
+    @staticmethod
+    def _instance_created_implementation(
+        binding: AnyBinding,
+    ) -> type | Callable[..., Any] | None:
+        """Return the ``implementation`` field for an ``InstanceCreated``/``InstanceDisposed`` event.
+
+        A ``ClassBinding`` carries the concrete class directly
+        (``binding.implementation``); a ``ProviderBinding`` has no such
+        attribute — its "implementation" is the factory function
+        (``binding.fn``). Centralised here so both instrumentation sites
+        (`_instantiate_sync`, `_instantiate_async`) and both disposal sites
+        agree on the mapping.
+
+        Args:
+            binding: The binding being created or disposed.
+
+        Returns:
+            The implementation class for a ``ClassBinding``, the factory
+            callable for a ``ProviderBinding``, or ``None`` for any other
+            binding kind.
+        """
+        if isinstance(binding, ClassBinding):
+            return binding.implementation
+        if isinstance(binding, ProviderBinding):
+            return binding.fn
+        return None
 
     def _instantiate_sync(self, binding: AnyBinding) -> Any:
         """Instantiate *binding* synchronously, respecting scope caching.
@@ -1608,6 +2150,11 @@ class DIContainer:
                 # acquiring this lock.
                 if key in cache:
                     return cache[key]
+                # Zero-cost rule (plan 009 §Design): the timer is only started
+                # when a hook is registered — `perf_counter_ns` is imported by
+                # name so a test can patch `providify.container.perf_counter_ns`
+                # and assert it is never called with zero hooks.
+                started = perf_counter_ns() if self._hooks else 0
                 token = _singleton_in_progress.set(
                     _singleton_in_progress.get() | {(id(self), key)}
                 )
@@ -1619,18 +2166,40 @@ class DIContainer:
                             instance, binding.implementation
                         )
                     cache[key] = instance
+                    # Record AFTER the cache write so a concurrent shutdown()
+                    # racing this creation never sees the key in _singleton_order
+                    # before it is actually retrievable from _singleton_cache.
+                    self._record_singleton_creation(key, binding)
                 finally:
                     # Reset even when create() raises: the failed key must not
                     # stay marked in-progress, or a later retry in the same
                     # context would report a phantom cycle.
                     _singleton_in_progress.reset(token)
+            # Emission happens OUTSIDE the per-key lock (plan 009 §Design) — a
+            # hook is arbitrary user code; running it while holding the
+            # creation lock would deadlock if it re-resolves another singleton.
+            if self._hooks:
+                self._emit(
+                    InstanceCreated(
+                        interface=binding.interface,
+                        implementation=self._instance_created_implementation(binding),
+                        scope=binding.scope,
+                        qualifier=binding.qualifier,
+                        duration_ns=perf_counter_ns() - started,
+                        is_async=False,
+                    )
+                )
             return instance
 
         # ── Non-singleton path (REQUEST, SESSION, DEPENDENT) ─────────────────
+        started = perf_counter_ns() if self._hooks else 0
         instance = binding.create(self)
         if isinstance(binding, ClassBinding):
             self._register_observers(instance, binding.implementation)
             instance = self._apply_interceptors(instance, binding.implementation)
+        # REQUEST/SESSION: emit only when this call actually populates the
+        # scope cache for the first time — a second get() within the same
+        # scope frame is a cache hit (checked above) and must emit nothing.
         if cache is not None:
             cache[key] = instance
         elif isinstance(binding, ClassBinding):
@@ -1638,6 +2207,17 @@ class DIContainer:
             meta = _get_metadata(binding.implementation)
             if meta is not None and meta.track:
                 self._tracked_dependents.append(instance)
+        if self._hooks:
+            self._emit(
+                InstanceCreated(
+                    interface=binding.interface,
+                    implementation=self._instance_created_implementation(binding),
+                    scope=binding.scope,
+                    qualifier=binding.qualifier,
+                    duration_ns=perf_counter_ns() - started,
+                    is_async=False,
+                )
+            )
         return instance
 
     async def _instantiate_async(self, binding: AnyBinding) -> Any:
@@ -1699,6 +2279,8 @@ class DIContainer:
             async with async_lock:
                 if key in cache:
                     return cache[key]
+                # Zero-cost rule — see _instantiate_sync's matching comment.
+                started = perf_counter_ns() if self._hooks else 0
                 token = _singleton_in_progress.set(
                     _singleton_in_progress.get() | {(id(self), key)}
                 )
@@ -1710,12 +2292,28 @@ class DIContainer:
                             instance, binding.implementation
                         )
                     cache[key] = instance  # type: ignore[index]
+                    # Record AFTER the cache write — see _instantiate_sync.
+                    self._record_singleton_creation(key, binding)
                 finally:
                     # Reset even when acreate() raises — see _instantiate_sync.
                     _singleton_in_progress.reset(token)
+            # Emission outside the asyncio.Lock — see _instantiate_sync's
+            # matching comment; the invariant is identical on the async path.
+            if self._hooks:
+                self._emit(
+                    InstanceCreated(
+                        interface=binding.interface,
+                        implementation=self._instance_created_implementation(binding),
+                        scope=binding.scope,
+                        qualifier=binding.qualifier,
+                        duration_ns=perf_counter_ns() - started,
+                        is_async=True,
+                    )
+                )
             return instance
 
         # ── Non-singleton path ────────────────────────────────────────────────
+        started = perf_counter_ns() if self._hooks else 0
         instance = await binding.acreate(self)
         if isinstance(binding, ClassBinding):
             self._register_observers(instance, binding.implementation)
@@ -1726,6 +2324,17 @@ class DIContainer:
             meta = _get_metadata(binding.implementation)
             if meta is not None and meta.track:
                 self._tracked_dependents.append(instance)
+        if self._hooks:
+            self._emit(
+                InstanceCreated(
+                    interface=binding.interface,
+                    implementation=self._instance_created_implementation(binding),
+                    scope=binding.scope,
+                    qualifier=binding.qualifier,
+                    duration_ns=perf_counter_ns() - started,
+                    is_async=True,
+                )
+            )
         return instance
 
     # ── Type-hint resolution ──────────────────────────────────────
@@ -2890,12 +3499,83 @@ class DIContainer:
     #   Before:  with container.scope_context.request(): ...
     #   After:   with container.request(): ...
 
+    @contextmanager
+    def _emit_scope_events(
+        self, kind: Literal["request", "session"], inner: Any
+    ) -> Iterator[Any]:
+        """Wrap a sync ``ScopeContext`` context manager with ``ScopeEntered``/``ScopeExited`` emission.
+
+        Only constructed by the façade methods below, and only when
+        ``self._hooks`` is non-empty — see each façade's "zero-cost" branch.
+        Yields the SAME scope id the wrapped context manager yields, so the
+        wrapper is transparent to callers that only use the ``with ... as
+        scope_id:`` protocol.
+
+        Args:
+            kind: ``"request"`` or ``"session"`` — which façade this wraps.
+            inner: The raw ``ScopeContext`` context manager to wrap
+                (``self.scope_context.request()`` / ``.session(...)``).
+
+        Yields:
+            The scope id string yielded by *inner*.
+
+        Thread safety / Async safety: same as the wrapped ``ScopeContext``
+            context manager — this adds no new shared state.
+        """
+        with inner as scope_id:
+            self._emit(ScopeEntered(kind=kind, scope_id=scope_id))
+            started = perf_counter_ns()
+            try:
+                yield scope_id
+            finally:
+                self._emit(
+                    ScopeExited(
+                        kind=kind,
+                        scope_id=scope_id,
+                        duration_ns=perf_counter_ns() - started,
+                    )
+                )
+
+    @asynccontextmanager
+    async def _aemit_scope_events(
+        self, kind: Literal["request", "session"], inner: Any
+    ) -> Any:
+        """Async mirror of :meth:`_emit_scope_events` — wraps an async ``ScopeContext`` CM.
+
+        Args:
+            kind: ``"request"`` or ``"session"``.
+            inner: The raw async ``ScopeContext`` context manager to wrap.
+
+        Yields:
+            The scope id string yielded by *inner*.
+        """
+        async with inner as scope_id:
+            self._emit(ScopeEntered(kind=kind, scope_id=scope_id))
+            started = perf_counter_ns()
+            try:
+                yield scope_id
+            finally:
+                self._emit(
+                    ScopeExited(
+                        kind=kind,
+                        scope_id=scope_id,
+                        duration_ns=perf_counter_ns() - started,
+                    )
+                )
+
     def request(self) -> Any:
         """Activate a sync request scope context.
 
         Shorthand for ``container.scope_context.request()``.
         All @RequestScoped components resolved inside this block share one
         instance; a fresh instance is created for each new block.
+
+        With no hooks registered, returns the raw ``ScopeContext`` context
+        manager UNCHANGED (plan 009 §Design — zero-cost rule extends to
+        scope façades: no wrapper object is built when nobody is listening).
+        Calling ``container.scope_context.request()`` directly always
+        bypasses ``ScopeEntered``/``ScopeExited`` instrumentation, even when
+        hooks are registered — see plan 009 §Design.
 
         Returns:
             A sync context manager that yields the request ID string.
@@ -2904,12 +3584,15 @@ class DIContainer:
             with container.request():
                 svc = container.get(MyRequestScopedService)
         """
-        return self.scope_context.request()
+        if not self._hooks:
+            return self.scope_context.request()
+        return self._emit_scope_events("request", self.scope_context.request())
 
     def arequest(self) -> Any:
         """Activate an async request scope context.
 
-        Shorthand for ``container.scope_context.arequest()``.
+        Shorthand for ``container.scope_context.arequest()``. See
+        :meth:`request`'s docstring for the zero-cost / direct-access caveats.
 
         Returns:
             An async context manager that yields the request ID string.
@@ -2918,14 +3601,17 @@ class DIContainer:
             async with container.arequest():
                 svc = await container.aget(MyRequestScopedService)
         """
-        return self.scope_context.arequest()
+        if not self._hooks:
+            return self.scope_context.arequest()
+        return self._aemit_scope_events("request", self.scope_context.arequest())
 
     def session(self, session_id: str | None = None) -> Any:
         """Activate a sync session scope context.
 
         Shorthand for ``container.scope_context.session(session_id)``.
         Reuses an existing session cache when the same session_id is
-        provided, creating a new one on first use.
+        provided, creating a new one on first use. See :meth:`request`'s
+        docstring for the zero-cost / direct-access caveats.
 
         Args:
             session_id: Explicit session identifier (e.g. a user ID or
@@ -2938,12 +3624,17 @@ class DIContainer:
             with container.session("user-abc"):
                 profile = container.get(UserProfile)
         """
-        return self.scope_context.session(session_id)
+        if not self._hooks:
+            return self.scope_context.session(session_id)
+        return self._emit_scope_events(
+            "session", self.scope_context.session(session_id)
+        )
 
     def asession(self, session_id: str | None = None) -> Any:
         """Activate an async session scope context.
 
-        Shorthand for ``container.scope_context.asession(session_id)``.
+        Shorthand for ``container.scope_context.asession(session_id)``. See
+        :meth:`request`'s docstring for the zero-cost / direct-access caveats.
 
         Args:
             session_id: Explicit session identifier. A random UUID is
@@ -2957,7 +3648,11 @@ class DIContainer:
                 async with container.arequest():
                     profile = await container.aget(UserProfile)
         """
-        return self.scope_context.asession(session_id)
+        if not self._hooks:
+            return self.scope_context.asession(session_id)
+        return self._aemit_scope_events(
+            "session", self.scope_context.asession(session_id)
+        )
 
     def invalidate_session(self, session_id: str) -> None:
         """Destroy a session cache and run sync @PreDestroy hooks — call on logout or expiry.
@@ -3067,96 +3762,546 @@ class DIContainer:
 
     # ── Shutdown ──────────────────────────────────────────────────
 
-    def shutdown(self) -> None:
-        """Sync shutdown — call ``@PreDestroy`` on all cached singleton instances.
+    def _teardown_plan(self) -> list[tuple[Any, AnyBinding]]:
+        """Build the ordered list of ``(key, binding)`` pairs to tear down.
 
-        Raises if any ``@PreDestroy`` method is ``async def`` — use
-        ``ashutdown()`` in that case. Clears all caches after teardown.
+        Walks ``self._singleton_order`` in reverse — the append order IS the
+        creation order (see the DESIGN comment on ``_singleton_order`` in
+        ``__init__``), and every dependency is cached before its dependent,
+        so reversing it yields reverse-dependency order: dependents are torn
+        down before the dependencies they hold a reference to.
+
+        Args:
+            None.
+
+        Returns:
+            ``[(key, binding), ...]`` in teardown order. Never contains a key
+            more than once, and never contains a key that is no longer in
+            ``_singleton_cache`` (evicted by :meth:`override` /
+            :meth:`reset_binding` since it was created).
+
+        Edge cases:
+            - Never-instantiated singleton → absent from ``_singleton_order``,
+              never appears in the plan (nothing to tear down).
+            - Same key recorded twice (should not happen — see
+              :meth:`_record_singleton_creation`'s docstring for why the
+              per-key lock makes this impossible in practice) → the second
+              occurrence is dropped by the ``seen`` dedup guard, defensively.
+            - Key evicted by ``override()``/``reset_binding()`` after being
+              recorded → dropped (no longer in ``_singleton_cache``), so an
+              instance the container no longer owns is never torn down.
+            - A future code path seeds ``_singleton_cache`` without going
+              through ``_instantiate_sync``/``_instantiate_async`` (today
+              nothing does — see plan 004 Risks) → that key would be absent
+              from ``_singleton_order`` entirely. The **fallback tail** below
+              defends against this degrading to "never torn down": any key
+              still in ``_singleton_cache`` but unseen by the main walk is
+              appended at the end (reverse ``_bindings`` order), so it is
+              torn down last rather than silently skipped.
+
+        Thread safety: ⚠️ Reads ``_singleton_order``/``_singleton_cache``/
+            ``_bindings`` without a lock. Shutdown is expected to run once,
+            after concurrent creation has quiesced (mirrors the pre-existing
+            contract of ``shutdown()``/``ashutdown()``, which never held a
+            lock across the whole teardown loop either).
+        """
+        plan: list[tuple[Any, AnyBinding]] = []
+        seen: set[Any] = set()
+        # Reverse creation order == reverse-dependency order (deps cached
+        # before their dependent — see _singleton_order's DESIGN comment).
+        for key, binding in reversed(self._singleton_order):
+            if key in seen:
+                continue  # defensive dedup — see docstring Edge cases
+            if key not in self._singleton_cache:
+                continue  # evicted by override()/reset_binding() — not ours anymore
+            seen.add(key)
+            plan.append((key, binding))
+
+        # ── Fallback tail: cached-but-unrecorded keys ─────────────────────
+        # Defensive only — nothing in today's codebase seeds _singleton_cache
+        # outside _instantiate_sync/_instantiate_async (verified: set_scoped
+        # only writes request/session caches). Kept so a future seeding path
+        # degrades to "torn down last" instead of "never torn down".
+        if len(seen) < len(self._singleton_cache):
+            key_to_binding = {self._get_cache_key(b): b for b in self._bindings}
+            for key in list(reversed(list(self._singleton_cache.keys()))):
+                if key in seen:
+                    continue
+                binding = key_to_binding.get(key)
+                if binding is None:
+                    continue  # cached instance with no matching binding — nothing to call
+                seen.add(key)
+                plan.append((key, binding))
+
+        return plan
+
+    # Sentinel exception used to let the async-@PreDestroy RuntimeError escape
+    # _dispose_sync's generic-failure aggregation instead of being captured as
+    # a ShutdownFailure — it is a programmer error (wrong shutdown() variant
+    # called), not a teardown failure, so it must still crash loudly.
+    class _AsyncHookInSyncShutdown(RuntimeError):
+        """Internal marker: an async @PreDestroy hook was reached from shutdown()."""
+
+    @staticmethod
+    def _has_teardown_hook(binding: AnyBinding) -> bool:
+        """Return ``True`` if *binding* has a teardown hook that would actually run.
+
+        Guards the ``InstanceDisposed`` emission sites (`shutdown`,
+        `ashutdown`, `_run_pre_destroy_for_scope`,
+        `_arun_pre_destroy_for_scope`): a binding with no ``@PreDestroy``/
+        ``@Disposes`` hook has nothing torn down, so no event is emitted
+        (plan 009 §Edge cases — "Binding with no @PreDestroy/@Disposes hook
+        emits no InstanceDisposed").
+
+        Args:
+            binding: The binding to inspect.
+
+        Returns:
+            ``True`` for a ``ClassBinding`` with a ``pre_destroy`` marker or
+            a ``ProviderBinding`` with a ``disposer``; ``False`` otherwise.
+        """
+        if isinstance(binding, ProviderBinding):
+            return binding.disposer is not None
+        return isinstance(binding, ClassBinding) and binding.pre_destroy is not None
+
+    def _dispose_sync(self, key: Any, binding: AnyBinding) -> None:
+        """Run the sync disposer / ``@PreDestroy`` hook for one teardown entry.
+
+        Args:
+            key:     The singleton cache key (from :meth:`_get_cache_key`).
+            binding: The binding whose instance is being torn down.
+
+        Returns:
+            None.
 
         Raises:
-            RuntimeError: If any @PreDestroy hook is async def.
+            _AsyncHookInSyncShutdown: The binding's ``@PreDestroy`` hook is
+                ``async def`` — sync ``shutdown()`` cannot await it. Caught
+                by :meth:`shutdown` and re-raised as a plain ``RuntimeError``
+                with the original message, deliberately NOT aggregated into
+                ``ShutdownError`` (see class docstring: it is a programmer
+                error, not a teardown failure).
+            Exception: Whatever the disposer / hook itself raises — caught
+                by the caller (:meth:`shutdown`) and aggregated.
+
+        Edge cases:
+            - Instance already evicted from cache → caller (`shutdown`) never
+              reaches here for that key — filtered by :meth:`_teardown_plan`.
         """
-        for binding in self._bindings:
-            if isinstance(binding, ProviderBinding):
-                if binding.disposer is not None and binding.scope == Scope.SINGLETON:
-                    key = self._get_cache_key(binding)
-                    instance = self._singleton_cache.get(key)
-                    if instance is not None:
-                        binding.disposer(instance)
-                continue
-            if not isinstance(binding, ClassBinding):
-                continue
-            if binding.pre_destroy is None:
-                continue
+        if isinstance(binding, ProviderBinding):
+            if binding.disposer is not None:
+                instance = self._singleton_cache[key]
+                binding.disposer(instance)
+            return
+        if not isinstance(binding, ClassBinding) or binding.pre_destroy is None:
+            return
+        instance = self._singleton_cache[key]
+        if binding.pre_destroy.is_async:
+            raise self._AsyncHookInSyncShutdown(
+                f"@PreDestroy method '{binding.pre_destroy.fn_name}' on "
+                f"'{binding.implementation.__name__}' is async — "
+                f"use await container.ashutdown() instead."
+            )
+        getattr(instance, binding.pre_destroy.fn_name)()
 
-            key = binding.implementation
-            instance = self._singleton_cache.get(key)
-            if instance is None:
-                continue
+    def _owner_label(self, binding: AnyBinding) -> str:
+        """Return the human-readable ``ShutdownFailure.owner`` label for *binding*.
 
-            if binding.pre_destroy.is_async:
-                raise RuntimeError(
-                    f"@PreDestroy method '{binding.pre_destroy.fn_name}' on "
-                    f"'{binding.implementation.__name__}' is async — "
-                    f"use await container.ashutdown() instead."
-                )
-            getattr(instance, binding.pre_destroy.fn_name)()
+        Args:
+            binding: The binding whose teardown hook/disposer just failed.
 
-        self._clear_caches()
+        Returns:
+            ``"ClassName.hook_name"`` for a ``ClassBinding``'s ``@PreDestroy``,
+            or ``"@Disposes(fn_name)"`` for a ``ProviderBinding``'s disposer.
+        """
+        if isinstance(binding, ProviderBinding):
+            disposer_name = binding.disposer.__name__ if binding.disposer else "?"
+            return f"@Disposes({disposer_name})"
+        hook_name = binding.pre_destroy.fn_name if binding.pre_destroy else "?"
+        return f"{binding.implementation.__name__}.{hook_name}"
+
+    def _module_pre_destroy_owner_label(self, cls: type, hook: LifecycleMarker) -> str:
+        """Return the ``ShutdownFailure.owner`` label for a module's ``@PreDestroy``.
+
+        Args:
+            cls:  The ``@Configuration`` module class whose hook failed.
+            hook: The ``@PreDestroy`` marker found on *cls*.
+
+        Returns:
+            ``"ModuleClassName.hook_name"`` — same shape as
+            :meth:`_owner_label`'s ``ClassName.hook_name`` for a singleton's
+            ``@PreDestroy``, so failures read consistently regardless of
+            which teardown phase produced them.
+        """
+        return f"{cls.__name__}.{hook.fn_name}"
+
+    def shutdown(self) -> None:
+        """Sync shutdown — tear down all cached singletons, then all installed
+        ``@Configuration`` modules, in that order.
+
+        Calls ``@PreDestroy`` hooks and ``@Disposes`` disposers on every
+        cached singleton, walking :meth:`_teardown_plan` — dependents are
+        torn down before the dependencies they may still reference, matching
+        the convention Spring/.NET/Quarkus establish (see
+        ``design/di-features-taxonomy/research/003-production-readiness-conventions.md``
+        §3) and closing the gap flagged there for the Python DI ecosystem.
+
+        Every hook runs even if an earlier one raises: failures are captured
+        as ``ShutdownFailure`` entries and aggregated into one ``ShutdownError``
+        at the end, rather than stopping at the first failure. Caches are
+        always cleared, even when hooks fail — see ``finally`` below.
+
+        Ordering: reverse **creation** order, which is a valid reverse
+        topological order of the singleton dependency graph *as actually
+        constructed* (including runtime-only edges like ``Lazy[T]``/
+        ``Live[T]``/``Provider[T]``). ⚠️ Limitation: a singleton resolved
+        late via ``Lazy[T]``/``Provider[T]`` — after some other singleton
+        that will go on to reference it — is created (and therefore torn
+        down) out of "true" dependency order; this is inherent to
+        reverse-creation-order tracking (the same limitation .NET's
+        ``IServiceProvider`` disposal has).
+
+        Ordering (Plan 008/F5): singletons first (reverse creation order via
+        :meth:`_teardown_plan`), THEN ``@Configuration`` modules (reverse
+        install order, via ``reversed(self._installed_modules.items())``).
+        Invariant: *nothing the container owns is alive when a module's
+        teardown runs* — a module's ``@PreDestroy`` typically releases a
+        resource (a pool, a client) that every singleton consumer of it has
+        already been torn down by the time phase 2 starts. Modules whose
+        record is ``owned=False`` (inherited by :meth:`copy`) or already
+        ``disposed=True`` (idempotency — a second ``shutdown()`` call) are
+        skipped.
+
+        Raises:
+            ShutdownError: One or more hooks/disposers raised (singleton
+                phase) OR one or more module ``@PreDestroy`` hooks raised
+                (module phase) — both phases feed the SAME failures list, so
+                one ``ShutdownError`` aggregates both. ``exc.failures`` holds
+                every captured :class:`~providify.exceptions.ShutdownFailure`
+                (not just the first, and in teardown order); ``exc.__cause__``
+                is the exception belonging to the earliest-*created* failing
+                component — see the DESIGN comment above ``raise ShutdownError``
+                below for why that (not the first one encountered during the
+                reversed teardown walk) is the more useful root cause to chain.
+            RuntimeError: A ``@PreDestroy`` hook (singleton OR module) is
+                ``async def`` — use ``await container.ashutdown()`` instead.
+                Raised immediately, NOT aggregated into ``ShutdownError``: it
+                signals the wrong shutdown method was called, not a teardown
+                failure. A module async-hook hit during the module phase
+                still runs every already-visited singleton's hook (phase 1
+                already completed) but stops the module phase at that point,
+                same "stop the loop, escape un-aggregated" contract as the
+                singleton phase.
+        """
+        failures: list[ShutdownFailure] = []
+        async_hook_error: RuntimeError | None = None
+        try:
+            for key, binding in self._teardown_plan():
+                has_hook = self._has_teardown_hook(binding)
+                started = perf_counter_ns() if (self._hooks and has_hook) else 0
+                try:
+                    self._dispose_sync(key, binding)
+                except self._AsyncHookInSyncShutdown as exc:
+                    # Programmer error, not a teardown failure — stop the loop
+                    # and let it escape un-aggregated (see docstring Raises).
+                    # Nothing was disposed — no InstanceDisposed for this key.
+                    async_hook_error = RuntimeError(str(exc))
+                    break
+                except (
+                    Exception
+                ) as exc:  # noqa: BLE001 — deliberately broad: aggregate ALL hook failures
+                    failures.append(
+                        ShutdownFailure(owner=self._owner_label(binding), exception=exc)
+                    )
+                    if self._hooks and has_hook:
+                        self._emit(
+                            InstanceDisposed(
+                                interface=binding.interface,
+                                implementation=self._instance_created_implementation(
+                                    binding
+                                ),
+                                scope=binding.scope,
+                                owner=self._owner_label(binding),
+                                duration_ns=perf_counter_ns() - started,
+                                error=exc,
+                            )
+                        )
+                    continue
+                if self._hooks and has_hook:
+                    self._emit(
+                        InstanceDisposed(
+                            interface=binding.interface,
+                            implementation=self._instance_created_implementation(
+                                binding
+                            ),
+                            scope=binding.scope,
+                            owner=self._owner_label(binding),
+                            duration_ns=perf_counter_ns() - started,
+                            error=None,
+                        )
+                    )
+
+            # ── Phase 2 (Plan 008/F5): @Configuration module teardown ──────
+            # Only runs if phase 1 did not already hit an async-hook bail-out
+            # — an async hook found in phase 1 is a programmer error that
+            # should surface immediately rather than let phase 2 run first.
+            if async_hook_error is None:
+                for cls, rec in reversed(list(self._installed_modules.items())):
+                    if not rec.owned or rec.disposed:
+                        continue  # copy()'d (not owned) or already torn down
+                    hook = _find_pre_destroy(cls)
+                    # Mark disposed BEFORE running the hook (not after) so a
+                    # hook that raises still counts as "attempted" — a second
+                    # shutdown() call must not retry a hook that already ran
+                    # and already failed once (idempotency contract).
+                    self._installed_modules[cls] = replace(rec, disposed=True)
+                    if hook is None:
+                        continue  # module with no @PreDestroy — skip, no error
+                    if hook.is_async:
+                        async_hook_error = RuntimeError(
+                            f"@PreDestroy method '{hook.fn_name}' on module "
+                            f"'{cls.__name__}' is async — "
+                            f"use await container.ashutdown() instead."
+                        )
+                        break
+                    try:
+                        getattr(rec.instance, hook.fn_name)()
+                    except (
+                        Exception
+                    ) as exc:  # noqa: BLE001 — aggregate ALL module hook failures too
+                        failures.append(
+                            ShutdownFailure(
+                                owner=self._module_pre_destroy_owner_label(cls, hook),
+                                exception=exc,
+                            )
+                        )
+        finally:
+            # Caches clear unconditionally — even on the async-hook bail-out
+            # or when every remaining hook already ran — closing the leak the
+            # old raise-on-first shutdown() had (see plan 004 Design).
+            # Deliberately does NOT touch _installed_modules — see that
+            # dict's DESIGN comment in __init__ for why (re-install after
+            # shutdown must stay a no-op, not a re-registration).
+            self._clear_caches()
+
+        if async_hook_error is not None:
+            raise async_hook_error
+        if failures:
+            # DESIGN: chain __cause__ to failures[-1], not failures[0].
+            # `failures` is appended in *teardown* order (reverse-dependency,
+            # i.e. dependents before dependencies) — so failures[-1] is the
+            # failure belonging to the EARLIEST-created (most foundational)
+            # component. That is deliberately the more useful root cause to
+            # surface: a foundational dependency failing to tear down cleanly
+            # (e.g. a DB connection that will not close) is often the actual
+            # root of trouble, while dependents failing afterwards can be a
+            # downstream symptom of the same resource still being unavailable.
+            raise ShutdownError(failures) from failures[-1].exception
+
+    async def _adispose(self, key: Any, binding: AnyBinding) -> None:
+        """Run the disposer / ``@PreDestroy`` hook for one teardown entry (async).
+
+        Async mirror of :meth:`_dispose_sync`: awaits async disposers/hooks,
+        calls sync ones inline (no await needed).
+
+        Args:
+            key:     The singleton cache key (from :meth:`_get_cache_key`).
+            binding: The binding whose instance is being torn down.
+
+        Returns:
+            None.
+
+        Raises:
+            Exception: Whatever the disposer / hook itself raises — caught by
+                the caller (:meth:`ashutdown`) and aggregated.
+        """
+        if isinstance(binding, ProviderBinding):
+            if binding.disposer is not None:
+                instance = self._singleton_cache[key]
+                if inspect.iscoroutinefunction(binding.disposer):
+                    await binding.disposer(instance)
+                else:
+                    binding.disposer(instance)
+            return
+        if not isinstance(binding, ClassBinding) or binding.pre_destroy is None:
+            return
+        instance = self._singleton_cache[key]
+        bound = getattr(instance, binding.pre_destroy.fn_name)
+        if binding.pre_destroy.is_async:
+            await bound()
+        else:
+            bound()
 
     async def ashutdown(self) -> None:
-        """Async shutdown — call ``@PreDestroy`` on all cached singleton instances.
+        """Async shutdown — tear down all cached singletons, then all
+        installed ``@Configuration`` modules, in that order.
 
-        Awaits async ``@PreDestroy`` methods, calls sync ones normally.
-        Clears all caches after teardown.
+        Async mirror of :meth:`shutdown`: awaits async ``@PreDestroy`` hooks
+        and async ``@Disposes`` disposers, calls sync ones inline. Same
+        reverse-dependency-order teardown (:meth:`_teardown_plan`), same
+        failure aggregation into ``ShutdownError``, same "caches always
+        clear" guarantee.
+
+        Ordering (Plan 008/F5): singletons first (reverse creation order),
+        THEN ``@Configuration`` modules (reverse install order via
+        ``reversed(self._installed_modules.items())``) — same invariant as
+        :meth:`shutdown`: nothing the container owns is alive when a
+        module's teardown runs. Modules with ``owned=False`` (copies) or
+        already ``disposed=True`` (idempotency) are skipped. Unlike the sync
+        path, an ``async def`` module ``@PreDestroy`` hook is simply
+        awaited — there is no "wrong shutdown() variant" error here since
+        this IS the async variant.
+
+        Raises:
+            ShutdownError: One or more hooks/disposers raised (singleton OR
+                module phase — both feed the same failures list).
+                ``exc.failures`` holds every captured
+                :class:`~providify.exceptions.ShutdownFailure`;
+                ``exc.__cause__`` is the earliest-created failing component's
+                exception (see :meth:`shutdown`'s matching DESIGN comment).
 
         Example:
             await container.ashutdown()
         """
-        for binding in self._bindings:
-            if isinstance(binding, ProviderBinding):
-                if binding.disposer is not None and binding.scope == Scope.SINGLETON:
-                    key = self._get_cache_key(binding)
-                    instance = self._singleton_cache.get(key)
-                    if instance is not None:
-                        if inspect.iscoroutinefunction(binding.disposer):
-                            await binding.disposer(instance)
-                        else:
-                            binding.disposer(instance)
-                continue
-            if not isinstance(binding, ClassBinding):
-                continue
-            if binding.pre_destroy is None:
-                continue
+        failures: list[ShutdownFailure] = []
+        try:
+            for key, binding in self._teardown_plan():
+                has_hook = self._has_teardown_hook(binding)
+                started = perf_counter_ns() if (self._hooks and has_hook) else 0
+                try:
+                    await self._adispose(key, binding)
+                except (
+                    Exception
+                ) as exc:  # noqa: BLE001 — deliberately broad: aggregate ALL hook failures
+                    failures.append(
+                        ShutdownFailure(owner=self._owner_label(binding), exception=exc)
+                    )
+                    if self._hooks and has_hook:
+                        self._emit(
+                            InstanceDisposed(
+                                interface=binding.interface,
+                                implementation=self._instance_created_implementation(
+                                    binding
+                                ),
+                                scope=binding.scope,
+                                owner=self._owner_label(binding),
+                                duration_ns=perf_counter_ns() - started,
+                                error=exc,
+                            )
+                        )
+                    continue
+                if self._hooks and has_hook:
+                    self._emit(
+                        InstanceDisposed(
+                            interface=binding.interface,
+                            implementation=self._instance_created_implementation(
+                                binding
+                            ),
+                            scope=binding.scope,
+                            owner=self._owner_label(binding),
+                            duration_ns=perf_counter_ns() - started,
+                            error=None,
+                        )
+                    )
 
-            key = binding.implementation
-            instance = self._singleton_cache.get(key)
-            if instance is None:
-                continue
+            # ── Phase 2 (Plan 008/F5): @Configuration module teardown ──────
+            for cls, rec in reversed(list(self._installed_modules.items())):
+                if not rec.owned or rec.disposed:
+                    continue  # copy()'d (not owned) or already torn down
+                hook = _find_pre_destroy(cls)
+                # Mark disposed BEFORE running the hook — see shutdown()'s
+                # matching comment for the idempotency rationale.
+                self._installed_modules[cls] = replace(rec, disposed=True)
+                if hook is None:
+                    continue  # module with no @PreDestroy — skip, no error
+                bound = getattr(rec.instance, hook.fn_name)
+                try:
+                    if hook.is_async:
+                        await bound()
+                    else:
+                        bound()
+                except (
+                    Exception
+                ) as exc:  # noqa: BLE001 — aggregate ALL module hook failures too
+                    failures.append(
+                        ShutdownFailure(
+                            owner=self._module_pre_destroy_owner_label(cls, hook),
+                            exception=exc,
+                        )
+                    )
+        finally:
+            # Caches clear unconditionally — see shutdown()'s docstring.
+            # Deliberately does NOT touch _installed_modules — see that
+            # dict's DESIGN comment in __init__.
+            self._clear_caches()
 
-            bound = getattr(instance, binding.pre_destroy.fn_name)
-            if binding.pre_destroy.is_async:
-                await bound()
-            else:
-                bound()
-
-        self._clear_caches()
+        if failures:
+            # failures[-1] = earliest-created component — see shutdown()'s
+            # matching DESIGN comment for the rationale.
+            raise ShutdownError(failures) from failures[-1].exception
 
     def _clear_caches(self) -> None:
         """Clear all instance caches — called at the end of shutdown."""
         self._singleton_cache.clear()
+        # Cleared alongside the cache it indexes so a second shutdown() call
+        # sees an empty plan (idempotent no-op) rather than re-running hooks
+        # for instances that no longer exist.
+        self._singleton_order.clear()
         self.scope_context.clear_caches()
 
     # ── Scoped @PreDestroy callbacks ──────────────────────────────
 
+    def _index_class_bindings_by_implementation(self) -> dict[Any, ClassBinding]:
+        """Build a ``{implementation: binding}`` index over ``_bindings``.
+
+        Shared by :meth:`_run_pre_destroy_for_scope` and
+        :meth:`_arun_pre_destroy_for_scope` so both build the lookup once per
+        scope-exit call instead of re-scanning ``_bindings`` per cached key
+        (the old per-key linear scan was O(bindings × cached keys); this is
+        O(bindings) once, then O(1) per cached key).
+
+        Returns:
+            ``{binding.implementation: binding}`` for every
+            :class:`~providify.binding.ClassBinding` in ``_bindings``.
+
+        Edge cases:
+            - Two interfaces bound to the same implementation class (aliases)
+              → both share one ``ClassBinding`` per distinct binding object;
+              "first binding wins" if ``_bindings`` somehow contained more
+              than one entry for the same implementation — they share the
+              same ``pre_destroy`` hook by construction (decorator metadata
+              lives on the class, not the binding), so which one wins is
+              immaterial.
+        """
+        index: dict[Any, ClassBinding] = {}
+        for binding in self._bindings:
+            if not isinstance(binding, ClassBinding):
+                continue
+            # First binding wins — see docstring Edge cases.
+            index.setdefault(binding.implementation, binding)
+        return index
+
     def _run_pre_destroy_for_scope(self, cache: dict[Any, object]) -> None:
-        """Run sync @PreDestroy hooks for all cached instances in *cache*.
+        """Run sync @PreDestroy hooks for all cached instances in *cache*, in
+        reverse-dependency order.
 
         Called by :class:`~providify.scope.ScopeContext` just before a
-        request or session scope cache is popped.  Iterates ``_bindings``,
-        finds each :class:`~providify.binding.ClassBinding` whose
-        implementation class is a key in *cache*, and calls its
+        request or session scope cache is popped. Builds a
+        ``{implementation: binding}`` index once, then walks
+        ``reversed(list(cache.items()))`` and calls each binding's
         ``pre_destroy`` hook if present.
+
+        Ordering: scope caches are insertion-ordered dicts populated by the
+        same "dependency before dependent" rule as the singleton cache (see
+        ``_instantiate_sync``, container.py ~line 1628-1629: a binding's
+        dependencies resolve inside ``binding.create(self)`` and are cached
+        before the binding itself is). Reversing the cache's insertion order
+        therefore yields reverse-dependency order — dependents torn down
+        before the dependencies they may still reference — with **zero new
+        state**: no separate order log is needed here (unlike
+        ``_singleton_order`` for the singleton scope) because request/session
+        caches are short-lived, single-owner dicts, not shared across a
+        creation/teardown lifetime spanning many scope frames.
 
         Async ``@PreDestroy`` hooks are skipped with a ``warnings.warn`` rather
         than raising — the sync context manager cannot await them.  Use the
@@ -3184,19 +4329,19 @@ class DIContainer:
         Example:
             # Called automatically by ScopeContext — do not call directly.
         """
-        for binding in self._bindings:
-            if not isinstance(binding, ClassBinding):
-                continue
-            if binding.pre_destroy is None:
-                continue
-            key = binding.implementation
-            instance = cache.get(key)
-            if instance is None:
+        index = self._index_class_bindings_by_implementation()
+        # reversed(): dependents were inserted after their dependencies (see
+        # docstring Ordering), so reversing the insertion order tears down
+        # dependents first — matching the singleton-scope guarantee.
+        for key, instance in reversed(list(cache.items())):
+            binding = index.get(key)
+            if binding is None or binding.pre_destroy is None:
                 continue
             if binding.pre_destroy.is_async:
                 # DESIGN: sync path cannot await — warn and skip rather than
                 # crash.  The async path (_arun_pre_destroy_for_scope) handles
                 # async hooks correctly; use arequest()/asession() when needed.
+                # Nothing was disposed — no InstanceDisposed for this key.
                 warnings.warn(
                     f"@PreDestroy method '{binding.pre_destroy.fn_name}' on "
                     f"'{binding.implementation.__name__}' is async — it will "
@@ -3206,15 +4351,32 @@ class DIContainer:
                     stacklevel=3,
                 )
                 continue
+            started = perf_counter_ns() if self._hooks else 0
             getattr(instance, binding.pre_destroy.fn_name)()
+            if self._hooks:
+                self._emit(
+                    InstanceDisposed(
+                        interface=binding.interface,
+                        implementation=binding.implementation,
+                        scope=binding.scope,
+                        owner=self._owner_label(binding),
+                        duration_ns=perf_counter_ns() - started,
+                        error=None,
+                    )
+                )
 
     async def _arun_pre_destroy_for_scope(self, cache: dict[Any, object]) -> None:
-        """Run all @PreDestroy hooks (sync + async) for *cache* instances.
+        """Run all @PreDestroy hooks (sync + async) for *cache* instances, in
+        reverse-dependency order.
 
         Async mirror of :meth:`_run_pre_destroy_for_scope`.  Called by
         :class:`~providify.scope.ScopeContext` before an async request or
         session scope cache is popped.  Unlike the sync version, this method
         awaits async ``@PreDestroy`` hooks and calls sync ones normally.
+
+        Ordering: same reverse-insertion-order guarantee as
+        :meth:`_run_pre_destroy_for_scope` — see its docstring's Ordering
+        paragraph.
 
         Args:
             cache: The scope cache dict that is about to be discarded.
@@ -3235,20 +4397,28 @@ class DIContainer:
         Example:
             # Called automatically by ScopeContext — do not call directly.
         """
-        for binding in self._bindings:
-            if not isinstance(binding, ClassBinding):
-                continue
-            if binding.pre_destroy is None:
-                continue
-            key = binding.implementation
-            instance = cache.get(key)
-            if instance is None:
+        index = self._index_class_bindings_by_implementation()
+        for key, instance in reversed(list(cache.items())):
+            binding = index.get(key)
+            if binding is None or binding.pre_destroy is None:
                 continue
             bound = getattr(instance, binding.pre_destroy.fn_name)
+            started = perf_counter_ns() if self._hooks else 0
             if binding.pre_destroy.is_async:
                 await bound()
             else:
                 bound()
+            if self._hooks:
+                self._emit(
+                    InstanceDisposed(
+                        interface=binding.interface,
+                        implementation=binding.implementation,
+                        scope=binding.scope,
+                        owner=self._owner_label(binding),
+                        duration_ns=perf_counter_ns() - started,
+                        error=None,
+                    )
+                )
 
     # ── Scope-leak validation ─────────────────────────────────────
 
@@ -3554,6 +4724,9 @@ class DIContainer:
         :meth:`get_all`, or :meth:`aget_all` call if not already validated.
         Can also be called explicitly for early error detection.
 
+        See also :meth:`validate` for full-graph checks (missing/ambiguous
+        bindings, circular dependencies) beyond this scope-only tier.
+
         Returns:
             None
 
@@ -3571,9 +4744,9 @@ class DIContainer:
         returns them as human-readable strings.  An empty list means the
         container is fully valid.
 
-        This is the recommended pre-startup validation call: it surfaces ALL
-        scope misconfigurations in one shot rather than stopping at the first
-        one, making it easier to fix the whole graph in one go.
+        This is the recommended pre-startup validation call for scope-tier
+        issues; see also :meth:`validate` for full-graph checks (missing/
+        ambiguous bindings, circular dependencies) beyond this scope-only tier.
 
         Sets ``_validated = True`` only when the returned list is empty,
         so the next ``get()`` call skips re-validation for valid containers.
@@ -3640,6 +4813,504 @@ class DIContainer:
             assert container.is_valid is False  # mutation resets the flag
         """
         return self._validated
+
+    def validate(self, *, raise_on_error: bool = True) -> ValidationReport:
+        """Walk the ENTIRE declared dependency graph once and report every wiring defect.
+
+        Unlike :meth:`validate_bindings` / :meth:`validate_all` (scope-leak
+        tier only — reused verbatim here via ``binding.validate()``), this
+        method additionally detects missing bindings, ambiguous bindings, and
+        static circular dependencies — the three checks documented in plan
+        003 §Design. Nothing is instantiated: no ``create()``, no cache
+        write, no ``@PostConstruct``. See also :meth:`warm_up`, which is the
+        "actually build it" counterpart.
+
+        Two passes over ``self._bindings``, O(V) + O(E):
+
+        1. **Scope tier** — ``binding.validate(self)`` is reused as-is; its
+           structured exceptions (``ScopeViolationDetectedError``,
+           ``LiveInjectionRequiredError``, ``AnnotationResolutionError``) are
+           unpacked into one :class:`~providify.validation.ValidationIssue`
+           per underlying violation, not one per exception, so a single
+           binding with three scope leaks reports three issues.
+        2. **Graph tier** — :meth:`_iter_injection_points` yields every
+           statically-classified injection point; each is resolved against a
+           call-local candidate memo (wrapping :meth:`_filter`) to detect
+           missing/ambiguous bindings and to record adjacency edges for
+           :meth:`_find_cycles`.
+
+        A binding whose annotations fail to resolve (``AnnotationResolutionError``)
+        contributes its ``UNRESOLVED_ANNOTATION`` issue and is **skipped**
+        for edge-building — a partial graph, never a false "no dependencies".
+
+        ⚠️ Profile-aware (plan 005): candidate resolution goes through
+        :meth:`_filter` / :meth:`_binding_is_active`, the same predicate
+        ``get()`` uses — so this method validates the graph **as it will
+        actually be wired under the container's current** ``active_profiles``,
+        not the graph you'd get by ignoring ``@Profile``. A binding whose only
+        provider of some interface is gated by ``@Profile("prod")`` is
+        reported as ``MISSING_BINDING`` when ``"prod"`` is not currently
+        active, even though the binding is registered — call
+        :meth:`activate_profile` (or construct with ``profiles=...``) before
+        validating each deployment configuration you care about.
+
+        Args:
+            raise_on_error: When ``True`` (default), raises
+                :class:`~providify.exceptions.ContainerValidationError` if
+                the report contains any ``ERROR``-severity issue. Warnings
+                never raise, regardless of this flag.
+
+        Returns:
+            The full :class:`~providify.validation.ValidationReport` —
+            always built and returned, whether or not it is also raised.
+
+        Raises:
+            ContainerValidationError: ``raise_on_error`` is ``True`` and
+                ``report.errors`` is non-empty.
+
+        Thread safety:  ⚠️ Not safe for concurrent binding mutation — call
+                        before the app goes multi-threaded, same caveat as
+                        :meth:`validate_all`.
+        Async safety:   ✅ No await points — pure introspection.
+
+        Edge cases:
+            - Empty container → ``ValidationReport(issues=(), checked_bindings=0)``.
+            - ``self._validated`` is set ``True`` only when the report has
+              **zero** issues (errors AND warnings), matching
+              :meth:`validate_all`'s conservative rule.
+            - Calling twice on an unchanged container yields two reports
+              whose ``to_dict()`` outputs compare equal — no accumulated state.
+            - REQUEST/SESSION-scoped bindings validate cleanly with no active
+              scope context — nothing is instantiated, so ``_get_cache`` is
+              never reached.
+
+        Example:
+            container.scan("myapp")
+            container.validate()                                # raises on any error
+            report = container.validate(raise_on_error=False)   # or inspect it
+            for issue in report.errors:
+                log.error("%s", issue.message)
+        """
+        # Local imports — validation.py never imports container.py (see its
+        # module docstring), but container.py importing it at call time
+        # here (rather than at module top) keeps the import graph obviously
+        # one-directional to a reader scanning this method in isolation.
+        from .exceptions import ContainerValidationError
+        from .validation import IssueKind, Severity, ValidationIssue, ValidationReport
+        from .validation import _unwrap_union as _validation_unwrap_union
+
+        issues: list[ValidationIssue] = []
+        binding_count = len(self._bindings)
+        # Adjacency keyed by INDEX into self._bindings, not binding objects —
+        # robust regardless of whether a binding type ever gains __eq__/__hash__
+        # (plan 003 §Design "why one flat pass is enough").
+        adjacency: dict[int, set[int]] = {i: set() for i in range(binding_count)}
+        binding_index: dict[int, int] = {id(b): i for i, b in enumerate(self._bindings)}
+
+        # Call-local memo — collapses repeated (type, qualifier, priority)
+        # lookups across injection points that request the same dependency
+        # (plan 003 §Risks "Performance"). Fresh every call: never shared
+        # across validate() invocations, so a binding mutation between two
+        # calls is always reflected.
+        candidate_memo: dict[tuple[Any, Any, Any], list[AnyBinding]] = {}
+
+        def memo_filter(
+            base_type: Any, qualifier: Any, priority: Any
+        ) -> list[AnyBinding]:
+            try:
+                key = (base_type, qualifier, priority)
+                cached = candidate_memo.get(key)
+            except TypeError:
+                # base_type can be an Annotated[...] type (e.g. one member of
+                # `Inject[T] | None`'s union re-unwrapped below) whose
+                # metadata is a non-frozen @dataclass (InjectMeta etc.) —
+                # Annotated.__hash__ hashes __metadata__, which raises for an
+                # unhashable dataclass instance. Skip memoization for this
+                # one lookup rather than crash the whole walk over a cache
+                # optimisation; _filter() itself is a plain, cheap list scan.
+                return self._filter(base_type, qualifier=qualifier, priority=priority)
+            if cached is None:
+                cached = self._filter(base_type, qualifier=qualifier, priority=priority)
+                candidate_memo[key] = cached
+            return cached
+
+        def owner_of(b: AnyBinding) -> str:
+            # Human-readable owner label — matches the vocabulary already
+            # used by __repr__ on both binding types.
+            if isinstance(b, ClassBinding):
+                return b.implementation.__name__
+            if isinstance(b, ProviderBinding):
+                return f"@Provider({b.fn.__name__})"
+            return _type_name(b.interface)  # pragma: no cover — exhaustive guard
+
+        def candidate_name(c: AnyBinding) -> str:
+            if isinstance(c, ClassBinding):
+                return c.implementation.__name__
+            if isinstance(c, ProviderBinding):
+                return c.fn.__name__
+            return _type_name(c.interface)  # pragma: no cover — exhaustive guard
+
+        for idx, binding in enumerate(self._bindings):
+            owner_name = owner_of(binding)
+
+            # ── Pass 1: scope tier — reuse Binding.validate() verbatim ────
+            unresolved = False
+            try:
+                binding.validate(self)
+            except ScopeViolationDetectedError as exc:
+                # One issue PER violating dependency, not one per exception —
+                # a binding with three scope leaks must report three issues.
+                for leak in exc.scope_violations:
+                    issues.append(
+                        ValidationIssue(
+                            kind=IssueKind.SCOPE_LEAK,
+                            severity=Severity.ERROR,
+                            owner=owner_name,
+                            message=(
+                                f"Scope leak: {_type_name(leak.binding[0])} "
+                                f"(scope={leak.binding[1].name}) holds a direct "
+                                f"reference to {_type_name(leak.reference[0])} "
+                                f"(scope={leak.reference[1].name}), which is "
+                                f"shorter-lived. Fix: narrow the holder's scope, "
+                                f"or wrap the dependency in Live[T]/Instance[T]."
+                            ),
+                            requested=_type_name(leak.reference[0]),
+                        )
+                    )
+            except LiveInjectionRequiredError as exc:
+                for v in exc.violations:
+                    issues.append(
+                        ValidationIssue(
+                            kind=IssueKind.LIVE_REQUIRED,
+                            severity=Severity.ERROR,
+                            owner=owner_name,
+                            message=(
+                                f"'{v.param_name}' in {v.binding[0].__name__} "
+                                f"(scope={v.binding[1].name}) injects "
+                                f"{v.dep[0].__name__} (scope={v.dep[1].name}) "
+                                f"without Live[T]. Fix: change "
+                                f"`{v.param_name}: Inject[{v.dep[0].__name__}]` "
+                                f"-> `{v.param_name}: Live[{v.dep[0].__name__}]`."
+                            ),
+                            param_name=v.param_name,
+                            requested=_type_name(v.dep[0]),
+                        )
+                    )
+            except AnnotationResolutionError as exc:
+                issues.append(
+                    ValidationIssue(
+                        kind=IssueKind.UNRESOLVED_ANNOTATION,
+                        severity=Severity.ERROR,
+                        owner=owner_name,
+                        message=str(exc),
+                        param_name=exc.param_name,
+                    )
+                )
+                # A validator that cannot read the annotations must not
+                # report "no dependencies" — skip edge-building for this
+                # binding entirely rather than silently under-reporting.
+                unresolved = True
+
+            if unresolved:
+                continue
+
+            # ── Pass 2: graph tier — missing / ambiguous / cycle edges ────
+            try:
+                points = list(self._iter_injection_points(binding))
+            except AnnotationResolutionError as exc:
+                # Defensive — _iter_injection_points shares the same
+                # _resolve_params/_collect_class_var_hints calls pass 1 just
+                # made, so this should already have surfaced above. Handled
+                # identically in case a future refactor decouples the two.
+                issues.append(
+                    ValidationIssue(
+                        kind=IssueKind.UNRESOLVED_ANNOTATION,
+                        severity=Severity.ERROR,
+                        owner=owner_name,
+                        message=str(exc),
+                        param_name=exc.param_name,
+                    )
+                )
+                continue
+
+            for point_owner, param_name, spec, has_default in points:
+                # ── InjectInstances[T] / all=True — get_all() semantics ──
+                # Missing is never reported ([] is a legal answer); every
+                # candidate becomes a cycle edge (get_all resolves them all).
+                if spec.multi:
+                    for c in memo_filter(spec.base_type, spec.qualifier, None):
+                        c_idx = binding_index.get(id(c))
+                        if c_idx is not None:
+                            adjacency[idx].add(c_idx)
+                    continue
+
+                # ── Instance[T] / Event[T] — caller-parameterised proxies ──
+                # Deferred to call time; "no binding today" is a legal
+                # design (InstanceProxy.resolvable() exists for this), so
+                # WARNING not ERROR, and never a cycle edge.
+                if spec.caller_parameterised:
+                    if not memo_filter(spec.base_type, None, None):
+                        issues.append(
+                            ValidationIssue(
+                                kind=IssueKind.MISSING_BINDING_DEFERRED,
+                                severity=Severity.WARNING,
+                                owner=point_owner,
+                                message=(
+                                    f"'{param_name}' requests "
+                                    f"{_type_name(spec.base_type)} with no "
+                                    f"matching binding today. Legal — "
+                                    f"Instance[T]/Event[T] resolve their "
+                                    f"qualifier at call time; use "
+                                    f".resolvable() to guard."
+                                ),
+                                param_name=param_name,
+                                requested=_type_name(spec.base_type),
+                            )
+                        )
+                    continue
+
+                # ── T1 | T2 / Optional[T] — eager union ──────────────────
+                # ERROR only when NO member resolves (NoneType-optional
+                # already short-circuited via spec.optional below). Edge
+                # points at the FIRST member with a candidate, mirroring
+                # the declaration-order rule at container.py:2342.
+                union_result = _validation_unwrap_union(spec.base_type)
+                if union_result is not None:
+                    union_members, _ = union_result
+                    first_matched: list[AnyBinding] | None = None
+                    any_matched = False
+                    for member in union_members:
+                        member_candidates = memo_filter(
+                            member, spec.qualifier, spec.priority
+                        )
+                        if member_candidates:
+                            any_matched = True
+                            if first_matched is None:
+                                first_matched = member_candidates
+                    if not any_matched:
+                        if not spec.optional:
+                            issues.append(
+                                ValidationIssue(
+                                    kind=IssueKind.MISSING_BINDING,
+                                    severity=Severity.ERROR,
+                                    owner=point_owner,
+                                    message=(
+                                        f"'{param_name}' requests "
+                                        f"{_type_name(spec.base_type)} but no "
+                                        f"member of the union has a matching "
+                                        f"binding. Fix: bind at least one "
+                                        f"member, or add a default value."
+                                    ),
+                                    param_name=param_name,
+                                    requested=_type_name(spec.base_type),
+                                )
+                            )
+                    elif not spec.deferred and first_matched:
+                        best = max(first_matched, key=lambda c: c.priority or 0)
+                        c_idx = binding_index.get(id(best))
+                        if c_idx is not None:
+                            adjacency[idx].add(c_idx)
+                    continue
+
+                # ── Plain eager single: Inject[T], bare T, NamedMeta, ────
+                # ── DelegateMeta, Lazy[T], Live[T] ───────────────────────
+                candidates = memo_filter(spec.base_type, spec.qualifier, spec.priority)
+                if spec.excludes_self:
+                    # Mirrors the self-exclusion in _resolve_hint_sync's
+                    # delegate branch (container.py:2316-2322) — otherwise
+                    # every @Decorator would report a bogus self-cycle.
+                    candidates = [
+                        c
+                        for c in candidates
+                        if not (
+                            isinstance(binding, ClassBinding)
+                            and isinstance(c, ClassBinding)
+                            and c.implementation is binding.implementation
+                        )
+                    ]
+
+                if not candidates:
+                    if spec.optional:
+                        pass  # T | None / InjectMeta(optional=True) — legal None
+                    elif has_default:
+                        issues.append(
+                            ValidationIssue(
+                                kind=IssueKind.MISSING_BINDING_DEFAULTED,
+                                severity=Severity.WARNING,
+                                owner=point_owner,
+                                message=(
+                                    f"'{param_name}' requests "
+                                    f"{_type_name(spec.base_type)} with no "
+                                    f"matching binding; falls back to its "
+                                    f"default value at runtime. Bind it "
+                                    f"explicitly to silence this warning."
+                                ),
+                                param_name=param_name,
+                                requested=_type_name(spec.base_type),
+                            )
+                        )
+                    else:
+                        issues.append(
+                            ValidationIssue(
+                                kind=IssueKind.MISSING_BINDING,
+                                severity=Severity.ERROR,
+                                owner=point_owner,
+                                message=(
+                                    f"'{param_name}' requests "
+                                    f"{_type_name(spec.base_type)} but no "
+                                    f"binding is registered and no default "
+                                    f"value exists. Fix: "
+                                    f"container.bind({_type_name(spec.base_type)}, "
+                                    f"...) or give the parameter a default."
+                                ),
+                                param_name=param_name,
+                                requested=_type_name(spec.base_type),
+                            )
+                        )
+                    continue
+
+                # ── Ambiguity — runtime picks max(candidates, key=priority);
+                # a tie at the max is a silent, arbitrary first-registered
+                # pick. Only single-valued points reach this line (multi/
+                # caller-parameterised already `continue`d above).
+                max_priority = max((c.priority or 0) for c in candidates)
+                ties = [c for c in candidates if (c.priority or 0) == max_priority]
+                if len(ties) > 1:
+                    issues.append(
+                        ValidationIssue(
+                            kind=IssueKind.AMBIGUOUS_BINDING,
+                            severity=Severity.ERROR,
+                            owner=point_owner,
+                            message=(
+                                f"'{param_name}' requests "
+                                f"{_type_name(spec.base_type)} which has "
+                                f"{len(ties)} candidates tied at priority "
+                                f"{max_priority}: "
+                                f"{', '.join(candidate_name(c) for c in ties)}. "
+                                f"The runtime pick is arbitrary (first "
+                                f"registered). Fix: give one candidate a "
+                                f"higher @Priority, or add a qualifier to "
+                                f"disambiguate."
+                            ),
+                            param_name=param_name,
+                            requested=_type_name(spec.base_type),
+                            candidates=tuple(candidate_name(c) for c in ties),
+                        )
+                    )
+
+                if not spec.deferred:
+                    # Edge points at the SAME max-priority candidate get()
+                    # will actually pick — exactly the one construction uses.
+                    best = max(candidates, key=lambda c: c.priority or 0)
+                    c_idx = binding_index.get(id(best))
+                    if c_idx is not None:
+                        adjacency[idx].add(c_idx)
+
+        # ── Cycle detection — colour-marked DFS over the adjacency map ────
+        for cycle in self._find_cycles(adjacency):
+            names = [_type_name(self._bindings[i].interface) for i in cycle]
+            path = " → ".join([*names, names[0]])
+            issues.append(
+                ValidationIssue(
+                    kind=IssueKind.CIRCULAR_DEPENDENCY,
+                    severity=Severity.ERROR,
+                    owner=names[0],
+                    message=(
+                        f"Circular dependency detected: {path}. Break the "
+                        f"cycle by introducing Lazy[T] on one edge, or by "
+                        f"restructuring the dependency."
+                    ),
+                )
+            )
+
+        report = ValidationReport(issues=tuple(issues), checked_bindings=binding_count)
+
+        # Conservative rule matching validate_all() (container.py:3613-3614):
+        # only mark validated when the report is COMPLETELY clean (errors
+        # AND warnings) — a warnings-only report still means the developer
+        # has something to look at before trusting the graph is final.
+        if not report.issues:
+            self._validated = True
+
+        if raise_on_error and report.errors:
+            raise ContainerValidationError(report)
+
+        return report
+
+    def _find_cycles(self, adjacency: dict[int, set[int]]) -> list[tuple[int, ...]]:
+        """Find every distinct cycle in *adjacency*, canonicalised and deduplicated.
+
+        Colour-marked (white/grey/black) depth-first search over binding
+        indices. A back-edge to a GREY node closes a cycle; the cycle is
+        canonicalised by rotating it to start at its lowest index so the
+        same cycle entered from any of its member nodes dedupes to one entry.
+
+        Args:
+            adjacency: ``dict[binding_index -> set[binding_index]]`` — the
+                out-edges built by :meth:`validate`'s graph-tier pass.
+
+        Returns:
+            A list of cycles, each a tuple of binding indices in traversal
+            order (NOT yet closed back to the start — callers append
+            ``cycle[0]`` themselves when rendering a path). A self-cycle
+            ``A -> A`` is a one-element tuple ``(idx_A,)``. Empty list when
+            the graph is acyclic.
+
+        Thread safety:  N/A — pure function of its argument, no shared state.
+        Async safety:   N/A — no awaits.
+
+        Edge cases:
+            - Empty adjacency              → ``[]``.
+            - Self-loop (``A`` depends on itself) → one 1-element cycle.
+            - Two disjoint cycles          → two entries, one per component.
+            - A 3+ node cycle entered from different start nodes during the
+              DFS  → reported exactly once (canonical-rotation dedupe).
+        """
+        # 0 = unvisited, 1 = on the current DFS path (grey), 2 = fully
+        # explored (black) — the standard cycle-detection colouring.
+        WHITE, GREY, BLACK = 0, 1, 2
+        color: dict[int, int] = dict.fromkeys(adjacency, WHITE)
+        # Explicit stack of nodes on the CURRENT DFS path — used to slice out
+        # the exact cycle when a back-edge to a grey node is found.
+        path_stack: list[int] = []
+        # node -> its position in path_stack, for O(1) cycle slicing.
+        position: dict[int, int] = {}
+        found: list[tuple[int, ...]] = []
+        seen_canonical: set[tuple[int, ...]] = set()
+
+        def canonicalize(cycle: list[int]) -> tuple[int, ...]:
+            # Rotate so the lowest index leads — makes A→B→A and B→A→B
+            # compare equal regardless of which node the DFS happened to
+            # visit first (plan 003 §Design "reported once, canonicalised").
+            start = cycle.index(min(cycle))
+            return tuple(cycle[start:] + cycle[:start])
+
+        def dfs(node: int) -> None:
+            color[node] = GREY
+            path_stack.append(node)
+            position[node] = len(path_stack) - 1
+            for neighbor in adjacency.get(node, ()):
+                if color.get(neighbor, WHITE) == WHITE:
+                    dfs(neighbor)
+                elif color.get(neighbor) == GREY:
+                    # Back-edge to a node still on the current path — the
+                    # slice from its first occurrence to here IS the cycle.
+                    cycle = path_stack[position[neighbor] :]
+                    canon = canonicalize(cycle)
+                    if canon not in seen_canonical:
+                        seen_canonical.add(canon)
+                        found.append(canon)
+                # BLACK neighbor: already fully explored via a non-cyclic
+                # path — no new cycle information (standard DFS colouring).
+            path_stack.pop()
+            del position[node]
+            color[node] = BLACK
+
+        for start_node in adjacency:
+            if color[start_node] == WHITE:
+                dfs(start_node)
+
+        return found
 
     # ── Dependency graph ──────────────────────────────────────────
 
@@ -3734,6 +5405,117 @@ class DIContainer:
 
         return [d for d in deps if d.interface not in _visited]
 
+    def _iter_injection_points(
+        self, binding: AnyBinding
+    ) -> Iterator[tuple[str, str, _HintSpec, bool]]:
+        """Yield every statically-classified injection point declared by *binding*.
+
+        The graph-tier counterpart to :meth:`_get_dependencies`: where that
+        method silently swallows unresolvable/unbound dependencies (a
+        reporting-tier helper tolerant by design), this one is STRICT — it
+        propagates :class:`~providify.exceptions.AnnotationResolutionError`
+        rather than downgrading it to a logged warning, because its only
+        caller (:meth:`validate`) must never report "no dependencies" for a
+        binding it could not actually read.
+
+        Covers both binding shapes:
+            - :class:`~providify.binding.ClassBinding`: ``__init__``
+              parameters (via :meth:`_resolve_params`, seeded with
+              ``owner=implementation`` for PEP-695 generics) PLUS class-level
+              annotated attributes (via :meth:`_collect_class_var_hints`).
+            - :class:`~providify.binding.ProviderBinding`: the provider
+              function's parameters.
+
+        Args:
+            binding: The binding whose injection points are enumerated.
+
+        Yields:
+            ``(owner_name, param_name, hint_spec, has_default)`` tuples:
+                - ``owner_name``: e.g. ``"OrderService.__init__"`` for a
+                  constructor parameter, ``"OrderService"`` for a class-var,
+                  or ``"@Provider(make_db)"`` for a provider parameter.
+                - ``param_name``: the parameter or class-attribute name.
+                - ``hint_spec``: the :class:`~providify.validation._HintSpec`
+                  returned by :func:`~providify.validation._classify_hint`
+                  — hints that are NOT injection points are never yielded.
+                - ``has_default``: whether the parameter has a default value
+                  (always ``False`` for class-var points — they have no
+                  default fallback at all, see :meth:`_inject_class_vars_sync`).
+
+        Raises:
+            AnnotationResolutionError: An annotation IS (or plausibly is) an
+                injection point but cannot be evaluated — see
+                :meth:`_resolve_params` / :meth:`_collect_class_var_hints`.
+            TypeError: *binding* is neither a ``ClassBinding`` nor a
+                ``ProviderBinding``.
+
+        Edge cases:
+            - ``*args: T`` / ``**kwargs: T`` → never yielded. Deliberate,
+              documented divergence from :meth:`_collect_kwargs_sync`'s
+              runtime behaviour is not needed here because
+              :func:`~providify._annotations.resolve_params` already
+              excludes ``VAR_POSITIONAL``/``VAR_KEYWORD`` parameters —
+              stated explicitly here since a reader of THIS method should
+              not have to trace into ``_annotations.py`` to confirm it.
+            - A parameter/class-attribute with no providify marker → not
+              yielded (``_classify_hint`` returns ``None`` for it).
+        """
+        # Import here (not at module top) to avoid a real circular import —
+        # validation.py never imports container.py, but container.py's
+        # module-level imports are already dense; keeping this one scoped to
+        # its only two callers (_iter_injection_points, validate) documents
+        # that the dependency is one-directional and narrow.
+        from .validation import _classify_hint
+
+        if isinstance(binding, ClassBinding):
+            impl = binding.implementation
+            init_owner = f"{impl.__name__}.__init__"
+            init_hints = self._resolve_params(impl.__init__, init_owner, owner=impl)
+            sig = inspect.signature(impl.__init__)
+            for param_name, hint in init_hints.items():
+                spec = _classify_hint(hint)
+                if spec is None:
+                    continue
+                param = sig.parameters.get(param_name)
+                has_default = bool(
+                    param is not None and param.default is not inspect.Parameter.empty
+                )
+                yield init_owner, param_name, spec, has_default
+
+            # Class-var injection points — invisible to __init__'s signature,
+            # so they need their own owner label (no ".__init__" suffix: an
+            # attribute is not a method parameter).
+            class_var_owner = impl.__name__
+            for attr_name, hint in self._collect_class_var_hints(impl).items():
+                spec = _classify_hint(hint)
+                if spec is None:
+                    continue
+                # Class vars have NO default fallback — _inject_class_vars_sync
+                # raises LookupError unconditionally for an unresolved one
+                # (container.py, _resolve_hint_sync -> self.get() -> raise).
+                yield class_var_owner, attr_name, spec, False
+
+        elif isinstance(binding, ProviderBinding):
+            provider_owner = f"@Provider({binding.fn.__name__})"
+            fn_hints = self._resolve_params(binding.fn, provider_owner)
+            sig = inspect.signature(binding.fn)
+            for param_name, hint in fn_hints.items():
+                spec = _classify_hint(hint)
+                if spec is None:
+                    continue
+                param = sig.parameters.get(param_name)
+                has_default = bool(
+                    param is not None and param.default is not inspect.Parameter.empty
+                )
+                yield provider_owner, param_name, spec, has_default
+
+        else:
+            raise TypeError(
+                f"No _iter_injection_points implementation found for binding "
+                f"type '{type(binding).__name__}'. Expected ClassBinding or "
+                f"ProviderBinding."
+            )
+
     # ── Scanning & module installation ────────────────────────────
 
     def scan(self, module: str | ModuleType, *, recursive: bool = False) -> None:
@@ -3755,60 +5537,157 @@ class DIContainer:
         self._scanner.scan(module, recursive=recursive)
 
     def install(self, module_cls: type) -> None:
-        """Install a ``@Configuration`` module synchronously.
+        """Install a ``@Configuration`` module synchronously — transitively.
 
-        Instantiates *module_cls* with its constructor dependencies injected
-        (Spring-style), then registers every ``@Provider``-decorated method on
-        the module as a bound-method binding.
+        Resolves ``module_cls``'s ``depends_on=`` closure into a deterministic
+        install order (deps first — :func:`providify.modules.resolve_install_order`)
+        and installs every not-yet-installed class in that order. Each newly
+        installed module is instantiated with its constructor dependencies
+        injected (Spring-style), has its ``@PostConstruct`` hook run (if any),
+        has every ``@Provider``-decorated method registered as a bound-method
+        binding, and is recorded in ``_installed_modules`` so its
+        ``@PreDestroy`` hook (if any) participates in :meth:`shutdown`.
+
+        Idempotent: a class already present in ``_installed_modules`` (from
+        an earlier ``install()``/``ainstall()``/``scan()``) is skipped — its
+        providers are NOT re-registered. This is the container's dedup
+        authority (plan 008 §Design, fixing the historical
+        ``install()`` + ``scan()`` double-registration bug); the scanner's
+        own dedup set is now only a same-session fast-path shortcut.
 
         Args:
-            module_cls: A class decorated with ``@Configuration``.
+            module_cls: A class decorated with ``@Configuration``. Its
+                transitive ``depends_on`` closure is installed first.
 
         Returns:
             None
 
         Raises:
-            TypeError:    If *module_cls* is not decorated with ``@Configuration``.
-            LookupError:  If any constructor dependency of *module_cls* has no binding.
-            RuntimeError: If any constructor dependency is async-only —
-                          use :meth:`ainstall` instead.
+            TypeError:        If *module_cls* is not decorated with
+                               ``@Configuration``, OR if a class reachable via
+                               ``depends_on=`` is not itself ``@Configuration``
+                               (naming it).
+            ModuleCycleError: The ``depends_on`` graph contains a cycle.
+                               Detected by :func:`resolve_install_order`
+                               **before** any instantiation, so a cycle
+                               leaves the container completely untouched —
+                               no partial installation.
+            LookupError:      If any constructor dependency of a module being
+                               installed has no binding.
+            RuntimeError:      If any constructor dependency is async-only —
+                               use :meth:`ainstall` instead.
+
+        Edge cases:
+            - ``shutdown()`` then ``install(M)`` again → ``M`` is still in
+              ``_installed_modules`` (with ``disposed=True``) → skipped, NOT
+              re-installed. A container is not fully reusable for module
+              re-installation after ``shutdown()`` — use :meth:`copy` or a
+              fresh ``DIContainer`` instead.
 
         Example:
             container.bind(Settings, AppSettings)
-            container.install(InfraModule)
+            container.install(RepoModule)   # installs InfraModule first
         """
         if not _has_configuration_module(module_cls):
             raise TypeError(
                 f"{module_cls.__name__} must be decorated with @Configuration."
             )
-        instance = self._resolve_constructor(module_cls)
-        self._register_module_providers(module_cls, instance)
+        # Cycle/type-error detection happens for the WHOLE closure before any
+        # instantiation — resolve_install_order raises before we touch the
+        # loop below, so a cycle leaves _installed_modules (and _bindings)
+        # completely unchanged (plan 008 §Design "Install pipeline").
+        for cls in resolve_install_order([module_cls]):
+            if cls in self._installed_modules:
+                continue  # already installed — dedup authority, see docstring
+            self._install_one(cls)
 
     async def ainstall(self, module_cls: type) -> None:
-        """Install a ``@Configuration`` module asynchronously.
+        """Install a ``@Configuration`` module asynchronously — transitively.
 
-        Async mirror of :meth:`install`. Use when the module's constructor
-        has async-only dependencies (i.e. deps that require ``aget()``).
+        Async mirror of :meth:`install`: same transitive ``depends_on``
+        ordering, same dedup, same ``@PostConstruct``/``@PreDestroy``
+        participation — but resolves constructor dependencies and runs an
+        ``async def`` ``@PostConstruct`` hook via the async resolution path.
+        Use when a module (or one of its dependencies)'s constructor has
+        async-only dependencies (i.e. deps that require ``aget()``).
 
         Args:
-            module_cls: A class decorated with ``@Configuration``.
+            module_cls: A class decorated with ``@Configuration``. Its
+                transitive ``depends_on`` closure is installed first.
 
         Returns:
             None
 
         Raises:
-            TypeError:   If *module_cls* is not decorated with ``@Configuration``.
-            LookupError: If any constructor dependency of *module_cls* has no binding.
+            TypeError:        If *module_cls* is not decorated with
+                               ``@Configuration``, OR a ``depends_on`` class
+                               is not itself ``@Configuration`` (naming it).
+            ModuleCycleError: The ``depends_on`` graph contains a cycle —
+                               detected before any instantiation.
+            LookupError:      If any constructor dependency of a module being
+                               installed has no binding.
 
         Example:
-            await container.ainstall(InfraModule)
+            await container.ainstall(RepoModule)
         """
         if not _has_configuration_module(module_cls):
             raise TypeError(
                 f"{module_cls.__name__} must be decorated with @Configuration."
             )
-        instance = await self._resolve_constructor_async(module_cls)
-        self._register_module_providers(module_cls, instance)
+        for cls in resolve_install_order([module_cls]):
+            if cls in self._installed_modules:
+                continue
+            await self._ainstall_one(cls)
+
+    def _install_one(self, cls: type) -> None:
+        """Instantiate, ``@PostConstruct``, register providers, and record ONE
+        already-order-resolved ``@Configuration`` class (sync path).
+
+        Shared tail of :meth:`install`'s per-class loop — factored out so the
+        ordering/dedup logic in ``install()`` stays readable and this single
+        class's install steps are unit-testable in isolation if needed.
+
+        Args:
+            cls: A ``@Configuration`` class, not yet in ``_installed_modules``.
+
+        Returns:
+            None
+
+        Raises:
+            LookupError:  If any constructor dependency of *cls* has no binding.
+            RuntimeError: If any constructor dependency, or the
+                          ``@PostConstruct`` hook, is async-only.
+        """
+        instance = self._resolve_constructor(cls)
+        self._run_post_construct_sync(instance, _find_post_construct(cls))
+        self._register_module_providers(cls, instance)
+        # Recorded AFTER providers are registered — matches the "install
+        # order == dict insertion order" contract other code relies on
+        # (_installed_modules docstring, role 2/3); registration itself
+        # cannot fail once construction/PostConstruct succeeded, so ordering
+        # here vs. before registration is not otherwise observable.
+        self._installed_modules[cls] = _ModuleRecord(
+            instance=instance, owned=True, disposed=False
+        )
+
+    async def _ainstall_one(self, cls: type) -> None:
+        """Async mirror of :meth:`_install_one`.
+
+        Args:
+            cls: A ``@Configuration`` class, not yet in ``_installed_modules``.
+
+        Returns:
+            None
+
+        Raises:
+            LookupError: If any constructor dependency of *cls* has no binding.
+        """
+        instance = await self._resolve_constructor_async(cls)
+        await self._run_post_construct_async(instance, _find_post_construct(cls))
+        self._register_module_providers(cls, instance)
+        self._installed_modules[cls] = _ModuleRecord(
+            instance=instance, owned=True, disposed=False
+        )
 
     def _register_module_providers(self, module_cls: type, instance: object) -> None:
         """Register every ``@Provider``-decorated method from a module instance.
@@ -3972,6 +5851,127 @@ class DIContainer:
         """
         return self._filter(interface, qualifier=qualifier)
 
+    # ── Observability hooks (F6) ────────────────────────────────────
+
+    def add_hook(
+        self, event_type: type, callback: Callable[[Any], None]
+    ) -> Callable[[], None]:
+        """Register *callback* to run whenever an event of exactly *event_type* is emitted.
+
+        Dispatch is by exact type (``type(event) is event_type``), never
+        ``isinstance`` — a hook registered for a supertype (e.g. ``object``)
+        never receives ``InstanceCreated``/``InstanceDisposed``/``ScopeEntered``/
+        ``ScopeExited`` events. Registering the same callback twice makes it
+        fire twice per matching event.
+
+        Contract (see ``providify/observability.py`` and this class's
+        ``_emit`` for the enforcement):
+            - Callbacks are **sync-only** and called **inline**, in the
+              caller's thread/task — they must not block.
+            - Callbacks run **outside** every container lock (the per-key
+              singleton lock, the async per-key lock) — never inside one.
+            - A callback that raises is caught, logged at WARNING through
+              this module's logger, and does NOT interrupt resolution or
+              shutdown; other hooks for the same event still run.
+            - A callback must NOT call back into ``container.get()``/
+              ``aget()`` for a DIFFERENT container, or resolve across
+              threads — that re-entrancy is the caller's problem to avoid
+              (re-resolving the SAME already-cached singleton from within
+              its own ``InstanceCreated`` hook is safe: emission happens
+              after the cache write and outside the per-key lock).
+
+        Args:
+            event_type: One of ``InstanceCreated``, ``InstanceDisposed``,
+                ``ScopeEntered``, ``ScopeExited`` (or any type — unmatched
+                types simply never fire).
+            callback: A callable taking one positional argument (the event
+                instance).
+
+        Returns:
+            A zero-argument callable that unsubscribes this exact
+            registration when called — equivalent to (but more convenient
+            than) a matching :meth:`remove_hook` call.
+
+        Thread safety:  ⚠️ ``self._hooks`` is a plain dict/list, not
+                        lock-protected. Registering hooks concurrently with
+                        resolution is a data race on the list `add_hook`
+                        appends to; register hooks during startup, before
+                        the container serves concurrent traffic (same
+                        caveat as other container-mutation methods, e.g.
+                        :meth:`bind`).
+        Async safety:   ✅ No await points.
+
+        Example:
+            unsubscribe = container.add_hook(InstanceCreated, on_created)
+            ...
+            unsubscribe()  # stop observing
+        """
+        self._hooks.setdefault(event_type, []).append(callback)
+
+        def _unsubscribe() -> None:
+            self.remove_hook(event_type, callback)
+
+        return _unsubscribe
+
+    def remove_hook(self, event_type: type, callback: Callable[[Any], None]) -> bool:
+        """Remove one registration of *callback* for *event_type*.
+
+        Args:
+            event_type: The exact event type the callback was registered under.
+            callback: The callback object to remove (identity/equality match,
+                same semantics as ``list.remove``).
+
+        Returns:
+            ``True`` if a registration was found and removed, ``False`` if
+            *callback* was not registered for *event_type* (never raises).
+
+        Thread safety:  ⚠️ Same caveat as :meth:`add_hook`.
+        Async safety:   ✅ No await points.
+        """
+        callbacks = self._hooks.get(event_type)
+        if not callbacks or callback not in callbacks:
+            return False
+        callbacks.remove(callback)
+        return True
+
+    def _emit(self, event: object) -> None:
+        """Dispatch *event* to every hook registered for its exact type.
+
+        Iterates a **tuple snapshot** of the registered callback list —
+        not the live list — so a hook that itself calls ``add_hook`` (or
+        `remove_hook`) during emission never mutates the sequence this
+        loop is iterating (edge case documented in plan 009 §Edge cases).
+
+        A raising callback is swallowed and logged at WARNING; it never
+        breaks resolution or shutdown, and other callbacks for the same
+        event still run. This is a deliberate divergence from SQLAlchemy/
+        Django (which propagate listener exceptions) — a broken telemetry
+        hook must never abort teardown (see plan 009 §Design, "Decision").
+
+        Args:
+            event: One of the four ``providify.observability`` event
+                instances.
+
+        Returns:
+            None
+
+        Thread safety:  ✅ Read-only over `self._hooks` other than the
+                        tuple-snapshot copy; safe alongside concurrent
+                        resolution (though not alongside concurrent
+                        `add_hook`/`remove_hook` — see those methods).
+        Async safety:   ✅ No await points — callbacks are sync by contract.
+        """
+        for cb in tuple(self._hooks.get(type(event), ())):
+            try:
+                cb(event)
+            except Exception:  # noqa: BLE001 — telemetry must never break the caller
+                logger.warning(
+                    "[DIContainer] telemetry hook %r raised for %r",
+                    cb,
+                    event,
+                    exc_info=True,
+                )
+
     # ── Override (Feature 5) ──────────────────────────────────────
 
     def override(self, interface: Any, implementation: type) -> None:
@@ -4035,6 +6035,17 @@ class DIContainer:
             self._singleton_cache.pop(key, None)
             self._singleton_locks.pop(key, None)
             self._async_singleton_locks.pop(key, None)
+
+        # Drop evicted keys from the creation log too — otherwise a later
+        # shutdown() would find them in _singleton_order's fallback-free main
+        # walk... except _teardown_plan already filters on `key not in
+        # _singleton_cache`, so this is defense-in-depth: it keeps the log's
+        # size bounded (no unbounded growth across repeated override() calls
+        # in a long-lived test session) rather than changing shutdown() semantics.
+        evicted = set(to_evict)
+        self._singleton_order = [
+            e for e in self._singleton_order if e[0] not in evicted
+        ]
 
         # Register the replacement via the public bind() API — which also
         # resets _validated and _localns_cache.
@@ -4108,6 +6119,14 @@ class DIContainer:
             self._singleton_locks.pop(key, None)
             self._async_singleton_locks.pop(key, None)
 
+        # Drop evicted keys from the creation log too — see override()'s
+        # matching comment; _teardown_plan already filters these out via the
+        # `_singleton_cache` membership check, this just bounds log growth.
+        evicted = set(to_evict)
+        self._singleton_order = [
+            e for e in self._singleton_order if e[0] not in evicted
+        ]
+
         # Reset validation so scope checks run again
         self._validated = False
         self._invalidate_type_caches()
@@ -4171,6 +6190,12 @@ class DIContainer:
         new._bindings = list(self._bindings)
         # Fresh caches — no state bleeds from source to copy
         new._singleton_cache = {}
+        # Fresh (empty) creation log — the copy has never instantiated
+        # anything, so its teardown order must start blank too; sharing the
+        # source's log would make the copy's shutdown() replay the source's
+        # (possibly already-cleared) history against instances it never
+        # created.
+        new._singleton_order = []
         new._singleton_locks = {}
         new._singleton_lock_guard = threading.Lock()
         new._async_singleton_locks = {}
@@ -4194,12 +6219,162 @@ class DIContainer:
         # clear.
         new._localns_cache = None
         new._hints_cache = {}
-        # Copy runtime state introduced in v0.3.0
+        # Copy runtime state introduced in v0.3.0 (+ v1.2.0's _active_profiles)
         new._enabled_alternatives = set(self._enabled_alternatives)
+        # @Profile — inherited by value; the copy owns an independent
+        # frozenset reference, so activate_profile()/deactivate_profile()
+        # on either container never affects the other (plan 005 §Design).
+        new._active_profiles = self._active_profiles
         new._interceptor_classes = list(self._interceptor_classes)
         new._observers = {}  # observers are re-registered as instances are created
         new._tracked_dependents = []
+        # Observability hooks (Plan 009/F6): telemetry is CONFIGURATION, not
+        # instance state — a copy() made for test overrides should keep
+        # observing the same callbacks the source container does, unlike
+        # caches/locks/tracked-dependents above which are all instance state
+        # reset to empty. Copies the per-type lists (not just the outer
+        # dict) so appending to one container's hook list never mutates the
+        # other's. `_clear_caches()` must NOT touch `_hooks` — hooks are not
+        # a cache.
+        new._hooks = {k: list(v) for k, v in self._hooks.items()}
+        # DESIGN (Plan 008/F5): dedup/install-order HISTORY is inherited —
+        # replace(r, owned=False) for every record — so the copy never
+        # re-registers a module's providers it already holds bindings for
+        # (its _bindings list was shallow-copied above, providers and all).
+        # OWNERSHIP is not inherited: owned=False means the copy's
+        # shutdown()/ashutdown() will skip every module's @PreDestroy hook —
+        # the copy never created these instances, so it must never dispose
+        # them (mirrors _singleton_order's ownership reasoning above: a
+        # shared history, but only the source disposes what it created).
+        new._installed_modules = {
+            cls: replace(rec, owned=False)
+            for cls, rec in self._installed_modules.items()
+        }
         return new
+
+    # ── snapshot() / restore() (Feature: pytest integration, plan 007) ──
+
+    def snapshot(self) -> ContainerSnapshot:
+        """Capture the container's current mutable state for later ``restore()``.
+
+        Companion to :meth:`copy` — where ``copy()`` clones bindings into a
+        *new*, independent container, ``snapshot()``/``restore()`` round-trip
+        state on the *same* container, which is what test overrides need
+        when the system under test resolves via ``DIContainer.current()`` or
+        holds a reference to this exact instance (``copy()`` cannot help
+        there — see plan 007 §Alternatives).
+
+        Cross-reference: this method shares ``copy()``'s *"fragile if
+        __init__ adds new attributes — must be kept in sync"* caveat
+        (:meth:`copy`, above). If a future ``__init__`` adds a new mutable
+        attribute, it must be captured here AND restored in
+        :meth:`restore` — three call sites (``__init__``, this method,
+        ``restore()``) now need to agree.
+
+        Returns:
+            A :class:`ContainerSnapshot` — an opaque value object. Only
+            supported use is passing it back to :meth:`restore` on this
+            same container.
+
+        Thread safety:  ⚠️ Not safe under concurrent resolution — reads
+                        ``_bindings``/``_singleton_cache``/etc. without a
+                        lock, mirroring ``copy()``.
+        Async safety:   ✅ No await points.
+
+        Example:
+            snap = container.snapshot()
+            container.override(Clock, FakeClock)
+            ...
+            container.restore(snap)  # Clock override undone
+        """
+        return ContainerSnapshot(
+            bindings=tuple(self._bindings),
+            singleton_cache=dict(self._singleton_cache),
+            singleton_order=tuple(self._singleton_order),
+            enabled_alternatives=frozenset(self._enabled_alternatives),
+            active_profiles=self._active_profiles,
+            interceptor_classes=tuple(self._interceptor_classes),
+        )
+
+    def restore(self, snapshot: ContainerSnapshot) -> None:
+        """Write a previously captured :class:`ContainerSnapshot` back onto this container.
+
+        Restores bindings, the singleton cache/order, enabled alternatives,
+        active profiles, and registered interceptor classes verbatim, then
+        invalidates the derived type caches (``_invalidate_type_caches()``)
+        and resets ``_validated = False`` so ``_localns_cache``/
+        ``_hints_cache`` are rebuilt from the restored binding list on the
+        next resolution.
+
+        Cross-reference: shares ``copy()``'s *"fragile if __init__ adds new
+        attributes — must be kept in sync"* caveat (:meth:`copy`) — this
+        method, :meth:`snapshot`, and ``__init__`` must all agree on which
+        attributes are part of a container's mutable state.
+
+        Instances created **after** the snapshot was taken are dropped
+        without teardown — ``restore()`` writes ``_singleton_cache`` back
+        wholesale, so any singleton instantiated in the override window
+        simply vanishes; no ``@PreDestroy``/``@Disposes`` runs for it. This
+        is by design for configuration-level test overrides (see plan 007
+        §Risks) — use a per-test container with ``shutdown()`` for lifecycle
+        correctness.
+
+        ``_singleton_locks`` is not part of the snapshot (it is pure derived
+        state — stale entries are harmless, lazily recreated on next
+        resolution) but entries whose key is absent from the restored cache
+        are dropped here to bound growth.
+
+        Args:
+            snapshot: A value previously returned by :meth:`snapshot`,
+                **on this same container** — restoring a snapshot captured
+                from a different container is not supported (no guard is
+                installed; it is a private-ish escape hatch, not a public
+                contract).
+
+        Returns:
+            None
+
+        Thread safety:  ⚠️ Not safe under concurrent resolution — mutates
+                        ``_bindings``/``_singleton_cache``/etc. without a
+                        lock, mirroring ``copy()``.
+        Async safety:   ✅ No await points.
+
+        Edge cases:
+            - Restoring the same snapshot twice is idempotent — no error.
+            - A snapshot taken from container A restored into container B
+              is not guarded against — documented only.
+
+        Example:
+            snap = container.snapshot()
+            container.bind(Greeter, Greeter)
+            container.restore(snap)
+            assert not container.is_resolvable(Greeter)
+        """
+        self._bindings = list(snapshot.bindings)
+        self._singleton_cache = dict(snapshot.singleton_cache)
+        self._singleton_order = list(snapshot.singleton_order)
+        self._enabled_alternatives = set(snapshot.enabled_alternatives)
+        self._active_profiles = snapshot.active_profiles
+        self._interceptor_classes = list(snapshot.interceptor_classes)
+
+        # Drop lock entries for cache keys no longer present after restore —
+        # bounds growth. Stale locks for still-present keys are harmless
+        # (same lock protects the same key either way).
+        stale_keys = [
+            key for key in self._singleton_locks if key not in self._singleton_cache
+        ]
+        for key in stale_keys:
+            del self._singleton_locks[key]
+        stale_async_keys = [
+            key
+            for key in self._async_singleton_locks
+            if key not in self._singleton_cache
+        ]
+        for key in stale_async_keys:
+            del self._async_singleton_locks[key]
+
+        self._invalidate_type_caches()
+        self._validated = False
 
     # ── __repr__ (Feature 14) ─────────────────────────────────────
 

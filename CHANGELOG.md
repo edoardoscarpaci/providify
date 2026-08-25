@@ -9,6 +9,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.2.0
 
+### Added
+
+#### Pytest integration — `di_container` / `di_overrides` / `di_global` fixtures
+- Installing providify now registers a `pytest11` entry-point plugin
+  (`providify/pytest_plugin.py`) exposing four function-scoped, `yield`-based
+  fixtures — no conftest boilerplate required: `di_container` (a fresh
+  `DIContainer()`, `shutdown()` at teardown), `di_acontainer` (async mirror,
+  `ashutdown()`), `di_overrides` (a `ContainerOverrides` bound to
+  `di_container`, undone at teardown), and `di_global` (installs
+  `di_container` as `DIContainer.current()` for the test). None are
+  autouse — the plugin has zero effect until a fixture is explicitly
+  requested, and a consumer conftest redefining `di_container` wins over the
+  plugin's default.
+  ```python
+  def test_checkout(di_container, di_overrides):
+      di_container.scan("myapp")
+      di_overrides.instance(Clock, FrozenClock("2026-01-01"))
+      di_overrides.bind(Notifier, FakeNotifier)
+      di_overrides.remove(PaymentGateway)
+      assert di_container.get(Checkout).run() == "ok"
+      # every override undone automatically at teardown
+  ```
+- New class `ContainerOverrides` (`providify/testing.py`, exported from
+  `providify`) — usable without pytest, as a context manager, from
+  `unittest`/scripts/REPL: `instance(iface, obj)`, `bind(iface, impl)`,
+  `factory(iface, fn)`, `remove(iface, *, qualifier=None)`,
+  `profiles(*names)`, `alternative(cls)`, and explicit `reset()`. Undo is
+  snapshot/restore (via the new `container.snapshot()`/`restore()`), taken
+  lazily on the first mutation, not an inverse-operation log.
+- New `DIContainer.snapshot() -> ContainerSnapshot` and
+  `DIContainer.restore(snapshot)` — capture and roundtrip a container's
+  bindings, singleton cache/order, enabled alternatives, active profiles, and
+  registered interceptor classes. `ContainerSnapshot` is exported from
+  `providify`. ⚠️ Instances created after the snapshot are dropped without
+  teardown on `restore()` — configuration is restored, not lifecycle.
+- `DIContainer.scoped()` gains an optional `container: DIContainer | None`
+  parameter — `DIContainer.scoped(existing)` installs `existing` as the
+  global for the block instead of always creating a fresh one, and does
+  **not** shut it down on exit. Backward compatible — `scoped()` with no
+  argument is unchanged.
+- No new runtime dependency: `import providify` still never imports
+  `pytest` — the plugin lives entirely in `providify/pytest_plugin.py`,
+  which is not imported by `providify/__init__.py`.
+
+#### `container.validate()` — startup-time full graph validation
+- New method `container.validate(*, raise_on_error: bool = True) -> ValidationReport`
+  walks the **entire declared dependency graph** once, without instantiating
+  anything, and reports every wiring defect in one shot: missing bindings,
+  ambiguous bindings, dependency cycles, scope leaks, `Live[T]` violations, and
+  unresolvable annotations. By default it raises a single aggregate
+  `ContainerValidationError` when the report contains any `ERROR`-severity
+  issue, so a misconfigured app fails at boot instead of on the first
+  production request; pass `raise_on_error=False` to inspect the report
+  instead.
+  ```python
+  container.scan("myapp")
+  container.validate()                                # raises on any error
+  report = container.validate(raise_on_error=False)   # or inspect it
+  for issue in report.errors:
+      log.error("%s", issue.message)
+  ```
+- New module `providify/validation.py` with the report/issue types, all
+  exported from `providify` and added to `__all__`:
+  `ValidationReport` (`.issues`, `.checked_bindings`, `.errors`, `.warnings`,
+  `.ok`, `.to_dict()`), `ValidationIssue` (`.kind`, `.severity`, `.owner`,
+  `.message`, `.param_name`, `.requested`, `.qualifier`, `.candidates`),
+  `IssueKind` (`MISSING_BINDING`, `MISSING_BINDING_DEFAULTED`,
+  `MISSING_BINDING_DEFERRED`, `AMBIGUOUS_BINDING`, `CIRCULAR_DEPENDENCY`,
+  `SCOPE_LEAK`, `LIVE_REQUIRED`, `UNRESOLVED_ANNOTATION`), and `Severity`
+  (`ERROR`, `WARNING`).
+- New exception `ContainerValidationError` (a `ValidationError` subclass, so
+  existing `except ValidationError` handlers still catch it), exported from
+  `providify`. Carries `.report`, the full `ValidationReport` that triggered
+  the raise; its message is a grouped, multi-line, one-line-per-issue block.
+- **`validate_bindings()` and `validate_all()` are unchanged** — they keep
+  their exact current behaviour (scope-leak tier only: `Binding.validate()`
+  reused verbatim, still auto-triggered on the first `get()`/`aget()`/
+  `get_all()`/`aget_all()`). `validate()` is purely additive on top of them
+  and never instantiates anything, so it is safe to call at any point after
+  registration without side effects (no `create()`, no cache write, no
+  `@PostConstruct`).
+
 ### Changed
 
 #### Annotations are now resolved per parameter / per class attribute
@@ -168,6 +250,218 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `AnnotationResolutionError` (a `ValidationError` subclass), exported from `providify`. Raised by the scope-leak validators when a binding's annotations cannot be resolved — names the exact binding, the original exception, and how to fix it.
+
+### Added
+
+#### Graceful shutdown — reverse-dependency-order teardown
+- `container.shutdown()` / `await container.ashutdown()` now tear down cached
+  singletons in **reverse dependency (creation) order** — every dependent's
+  `@PreDestroy` hook / `@Disposes` disposer runs before the dependencies it may
+  still reference — matching Spring, .NET's `IServiceProvider`, and
+  Quarkus/CDI. `@RequestScoped` / `@SessionScoped` teardown on scope exit gets
+  the same guarantee.
+- New `ShutdownError(providifyError)`, raised when one or more teardown hooks
+  fail, and `ShutdownFailure` (frozen dataclass: `owner: str`,
+  `exception: BaseException`), both exported from `providify`. Every failure is
+  captured and reported together via `exc.failures: list[ShutdownFailure]`;
+  `exc.__cause__` is chained to the exception of the *earliest-created* failing
+  component (typically the most foundational one, e.g. a DB pool), not simply
+  the first hook encountered during the reversed teardown walk.
+  ```python
+  try:
+      container.shutdown()
+  except ShutdownError as exc:
+      for failure in exc.failures:
+          log.error("teardown failed: %s", failure.owner, exc_info=failure.exception)
+  ```
+
+### Changed
+
+#### ⚠️ `shutdown()` / `ashutdown()` now aggregate ALL teardown failures instead of raising on the first one
+- Previously, the first `@PreDestroy` hook or `@Disposes` disposer to raise
+  aborted `shutdown()` immediately: every remaining hook was skipped and the
+  singleton caches were **never cleared**, leaking every still-cached instance.
+  `shutdown()` / `ashutdown()` now run every hook regardless of earlier
+  failures, **always** clear caches (even when hooks fail), and raise a single
+  aggregated `ShutdownError` at the end instead of propagating the first raw
+  exception.
+  Migration: callers doing `try: container.shutdown() except MyDbError: ...`
+  must now catch `ShutdownError` and inspect `exc.failures` (or rely on
+  `exc.__cause__`, which is still chained to a root-cause exception) to find
+  the original error.
+- An async `@PreDestroy` hook reached from sync `shutdown()` is unaffected by
+  this change: it still raises `RuntimeError` immediately (unchanged message)
+  and is **not** aggregated into `ShutdownError`.
+
+### Added
+
+#### `@Profile` — deployment-time bean activation (env-driven `@Alternative`)
+- New decorator `@Profile(*expressions: str)`, usable on classes **and**
+  `@Provider` functions (including `@Configuration` bound methods and
+  `@Provider @property`), gates a bean on the container's active profile
+  set. Multiple expressions are OR'd (`@Profile("dev", "test")`); a leading
+  `"!"` negates a single literal (`@Profile("!prod")`). Profile names are
+  normalised (stripped, lower-cased) on both sides of the match. Raises
+  `ValueError` at decoration time for an empty argument list or an
+  empty/whitespace-only/bare-`"!"` literal.
+  ```python
+  @Profile("prod")
+  @Singleton
+  class RealMailer(Mailer): ...
+
+  @Profile("dev", "test")
+  @Singleton
+  class ConsoleMailer(Mailer): ...
+  ```
+- The container's active profile set is resolved from an explicit
+  `DIContainer(profiles=...)` argument, the `PROVIDIFY_PROFILES`
+  environment variable (comma-separated, parsed via the new
+  `providify.profiles` module), or imperative calls — in that precedence
+  order (an explicit argument, even `()`, always wins over the environment
+  variable):
+  ```python
+  container = DIContainer(profiles=("prod",))
+  container = DIContainer()                    # reads PROVIDIFY_PROFILES
+  container.activate_profile("debug")
+  container.deactivate_profile("debug")
+  container.active_profiles                    # frozenset[str], read-only snapshot
+  ```
+- `@Profile` composes with `@Alternative`: an `@Alternative` bean that also
+  carries `@Profile` is governed by its profile instead of requiring an
+  imperative `enable_alternative()` call — the "env-driven `@Alternative`"
+  half of this feature. The profile is a hard AND-gate; `enable_alternative()`
+  cannot activate a bean whose profile does not match.
+- A profile-gated binding is invisible to `get()`, `get_all()`,
+  `is_resolvable()`, and `validate()` when its profile doesn't match —
+  `validate()` reports `MISSING_BINDING` for an interface whose only
+  provider is gated by a currently-inactive profile. This is intentional
+  (the graph is validated as it will actually be wired) but is worth
+  calling out explicitly; see `docs/agents/usage-rules.md`.
+- New `ProfileMetadata` (frozen dataclass, `.expressions: tuple[str, ...]`)
+  and `Profile`, both exported from `providify`.
+
+### Changed
+
+#### ⚠️ `@Alternative` on a `@Provider` function is now genuinely disabled by default
+- Previously, `@Alternative` stamped on a `@Provider` **function** was
+  silently ignored: the activation check only inspected `ClassBinding`, so
+  such a provider was *always* active — the exact opposite of what the
+  decorator's own docstring promises ("disabled by default"). This is now
+  fixed: `@Alternative` on a provider function behaves the same as on a
+  class, and requires `enable_alternative(fn)` (or a matching `@Profile`) to
+  become resolvable. Anything that stamped `@Alternative` on a provider
+  function and relied on it doing nothing will now see `LookupError` until
+  the provider is explicitly enabled or given a matching `@Profile`.
+
+### Added
+
+#### `@ConfigProperties` — typed configuration binding (env / YAML / JSON / TOML)
+- New decorator `@ConfigProperties(*, prefix=None, sources=None)` marks a class
+  (a dataclass, a plain class with an annotated `__init__`, or a pydantic
+  `BaseModel`) as a typed settings target, and `container.bind_config(cls, *,
+  sources=None)` binds it into a singleton — no hand-written `@Provider` that
+  reads `os.environ` needed.
+  ```python
+  from dataclasses import dataclass
+  from providify import DIContainer, ConfigProperties, EnvSource, YamlSource
+
+  @ConfigProperties(prefix="db", sources=(EnvSource(), YamlSource("config.yaml", required=False)))
+  @dataclass(frozen=True)
+  class DbSettings:
+      url: str
+      pool_size: int = 5
+
+  container = DIContainer()
+  container.bind_config(DbSettings)   # …or container.scan("myapp") discovers it
+  container.get(DbSettings)           # DB__URL / DB__POOL_SIZE / config.yaml's db: section
+  ```
+- New sources, all exported from `providify`: `EnvSource` (`PREFIX__FIELD` env
+  nesting), `JsonSource`, `TomlSource` (stdlib `tomllib`), `YamlSource`
+  (requires the new `providify[yaml]` extra), and `DictSource` (in-memory, the
+  test seam) — plus the `ConfigSource` `Protocol` for third-party sources.
+  Sources are loaded in order and deep-merged (later wins, keys normalised
+  case-insensitively); `prefix` selects a subtree of the merged mapping.
+- If the target class exposes `model_validate` (pydantic v2 or anything
+  API-compatible), providify hands it the merged mapping verbatim and performs
+  **no** coercion of its own — full pydantic validation without providify
+  depending on pydantic. Otherwise, declared fields are coerced per a bounded
+  stdlib coercion table (`str`, `int`, `float`, `bool`, `Path`, sequences,
+  `dict`, `X | None`, `Enum`, `Literal`, nested dataclasses).
+- Every field failure is aggregated into a single `ConfigBindingError`
+  (`.target`, `.issues: list[ConfigIssue]`) rather than failing on the first
+  bad field. Binding is **lazy**: sources are read and errors surface on the
+  first `get(cls)`, not at `bind_config()` registration time — call
+  `container.warm_up()` to catch a bad config value at startup (`validate()`
+  does not instantiate anything, so it will not catch this).
+- New optional install extra: `pip install providify[yaml]` (`PyYAML>=6.0`)
+  for `YamlSource`. The core install remains dependency-free; pydantic, if
+  used as a `@ConfigProperties` target, is never a providify dependency
+  (`model_validate` is duck-typed by attribute name only).
+
+### Added
+
+#### Multi-module startup/shutdown ordering — `@Configuration(depends_on=...)` (F5)
+- `@Configuration` is now dual-form: `@Configuration` (bare), `@Configuration()`
+  (empty parens), and `@Configuration(depends_on=[OtherModule])` all work, matching
+  the shape of `@Provider`/`@Component`. `depends_on` accepts a single class, a
+  list, or a tuple — all normalise to `tuple[type, ...]`.
+  ```python
+  @Configuration
+  class InfraModule:
+      @Provider(singleton=True)
+      def pool(self) -> DatabasePool: ...
+
+  @Configuration(depends_on=[InfraModule])
+  class RepoModule:
+      def __init__(self, pool: DatabasePool) -> None: ...   # resolvable
+  ```
+- `container.install()` / `ainstall()` now install a module's `depends_on`
+  closure **transitively**, in a deterministic order (deps before dependents,
+  shared dependencies installed exactly once) — new pure module
+  `providify/modules.py` (`resolve_install_order()`, `module_dependencies()`)
+  does the DFS post-order sort, imports nothing from `container.py`.
+- New `ModuleCycleError` (exported from `providify`) — raised when
+  `depends_on` edges form a cycle, naming every class in the cycle in order
+  (`A → B → C → A`). Raised **before** any module is instantiated, so a
+  cycle leaves the container completely untouched — no partial installation.
+- A module's `@PostConstruct` hook now runs once, at install time, after
+  `__init__` and before its `@Provider` methods are registered.
+- A module's `@PreDestroy` hook now runs at `shutdown()`/`ashutdown()`, in
+  **exact reverse install order**, strictly *after* every singleton has
+  already been torn down (a second, later teardown phase — plan 004's
+  singleton teardown is completely unchanged and still runs first). Failures
+  are aggregated into the same `ShutdownError` as singleton teardown
+  failures, with `owner == "ModuleClassName.hook_name"`. An `async def`
+  module `@PreDestroy` reached from sync `shutdown()` raises `RuntimeError`
+  pointing at `ashutdown()`, matching the existing singleton-hook guard.
+  `container.copy()` inherits install-order/dedup history but never the
+  original's module instances' ownership — a copy's `shutdown()` runs no
+  module `@PreDestroy` hooks.
+
+### Fixed
+
+#### `scan()` after an explicit `install()` no longer double-registers a module
+- Dedup authority for `@Configuration` modules moved from the scanner (a
+  same-session-only `set[type]`) to the container's new
+  `_installed_modules` dict. Previously, `container.install(M)` followed by
+  `container.scan(...)` covering `M` registered every `@Provider` on `M`
+  **twice** — the scanner's dedup set had no visibility into the earlier
+  explicit `install()` call. `install()`/`ainstall()`/`scan()` now all check
+  the same container-level record, so installing (or discovering) a module
+  more than once is a no-op past the first time.
+
+### Changed
+
+#### ⚠️ Module `@PostConstruct`/`@PreDestroy` hooks now actually run
+- Previously, a `@Configuration` module's `@PostConstruct` and `@PreDestroy`
+  hooks were silently never invoked — `install()` never called
+  `_run_post_construct_sync`, and the container kept no reference to the
+  module instance after registering its providers, so `shutdown()` could
+  not find it to run `@PreDestroy` either. Both now run (see Added above).
+  Any module that already carried one of these hooks — written in the
+  expectation it would run, or copy-pasted from a class that has one — will
+  now execute it. This is the intended fix, but it is a runtime behaviour
+  change on existing code.
 
 ---
 

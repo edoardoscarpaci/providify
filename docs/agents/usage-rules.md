@@ -35,6 +35,9 @@ A bare `@Provider` function discovered by `scan()` is just as valid as one insid
 configuration or belong together. **Jakarta CDI has no `@Configuration`** — do not
 treat it as "where all beans are defined."
 
+If one `@Configuration` module needs a type produced by another, see **R16** —
+declare it with `depends_on=`, don't rely on scan order.
+
 ---
 
 ## R3 — Inject producer dependencies as parameters; never call sibling producers
@@ -179,3 +182,265 @@ with DIContainer() as container:        # async: `async with` → ashutdown()
 `@PreDestroy` fires for cached singletons on shutdown, and for `@RequestScoped` /
 `@SessionScoped` instances when their scope block exits. `DEPENDENT` instances are
 never tracked, so their `@PreDestroy` never fires.
+
+**Ordering guarantee**: `shutdown()` / `ashutdown()` tear down cached singletons in
+**reverse creation order** — every dependent is destroyed before the dependencies it
+may still reference, matching Spring/.NET/Quarkus. Creation order is a valid reverse
+topological order of the graph *as actually constructed* (including runtime-only
+edges like `Lazy[T]`/`Live[T]`/`Provider[T]`), so no instance is disposed before
+something created after it. The same guarantee applies to `@RequestScoped` /
+`@SessionScoped` teardown on scope exit. ⚠️ A singleton resolved late via
+`Lazy[T]`/`Provider[T]` — after some other singleton that will go on to reference
+it — is created (and therefore torn down) out of "true" dependency order; this is
+inherent to reverse-creation-order tracking.
+
+Every `@PreDestroy` hook / `@Disposes` disposer runs even if an earlier one raises,
+and caches are **always** cleared, even on failure. Failures are aggregated into one
+`ShutdownError` (raised after every hook has run) instead of stopping at the first
+failure:
+
+```python
+from providify import ShutdownError
+
+try:
+    container.shutdown()
+except ShutdownError as exc:
+    for failure in exc.failures:          # list[ShutdownFailure]: .owner, .exception
+        log.error("teardown failed: %s", failure.owner, exc_info=failure.exception)
+```
+
+`exc.__cause__` is chained to the exception of the earliest-*created* (most
+foundational) failing component, not simply the first hook encountered during the
+reversed teardown walk — a foundational dependency (e.g. a DB pool) failing to close
+is typically the root cause of failures in components created after it. An async
+`@PreDestroy` hook reached from sync `shutdown()` still raises `RuntimeError`
+immediately (use `ashutdown()` instead) and is **not** aggregated into
+`ShutdownError` — it signals the wrong shutdown method was called, not a teardown
+failure.
+
+---
+
+## R12 — Call `container.validate()` once, after registration, before serving traffic
+
+```python
+container.scan("myapp")
+container.validate()   # raises ContainerValidationError on any missing/ambiguous
+                        # binding, cycle, scope leak, or unresolvable annotation
+```
+
+This is a superset of `validate_bindings()` (R8): it walks the *entire* declared
+graph without instantiating anything and additionally catches missing bindings,
+ambiguous bindings (two candidates tied at max priority), and static circular
+dependencies — defects that only surface at first-`get()` time otherwise.
+`validate_bindings()` / `validate_all()` are unchanged and still run
+automatically on first `get()`/`aget()`; `validate()` is the explicit,
+opt-in, whole-graph startup gate on top of them.
+
+---
+
+## R13 — `@Profile` gates activation; `validate()` sees the graph *per profile*, not the whole thing
+
+`@Profile("prod")` / `@Profile("dev", "test")` / `@Profile("!prod")` restricts a class
+or `@Provider` function to specific deployments. The active set comes from
+`DIContainer(profiles=(...))`, the `PROVIDIFY_PROFILES` env var (comma-separated), or
+`container.activate_profile(name)` / `deactivate_profile(name)` — an explicit
+`profiles=` argument (even `()`) always beats the env var:
+
+```python
+from providify import Profile, Singleton, DIContainer
+
+@Profile("prod")
+@Singleton
+class RealMailer(Mailer): ...
+
+@Profile("dev", "test")            # OR — active in either
+@Singleton
+class ConsoleMailer(Mailer): ...
+
+container = DIContainer(profiles=("dev",))
+container.get(Mailer)              # -> ConsoleMailer; RealMailer is invisible
+```
+
+A binding whose profile does not match the active set is **invisible**, not merely
+deprioritized — to `get()`, `get_all()`, `is_resolvable()`, **and** `validate()`.
+
+⚠️ **The gotcha**: `container.validate()` reports `MISSING_BINDING` for an interface
+whose *only* provider is gated by a profile that is not currently active — even though
+the binding is registered. This is intentional (`validate()` reports the graph as it
+will actually be wired under the container's *current* `active_profiles`), but it means
+a single `validate()` call does not prove every deployment configuration is wired
+correctly — validate once per profile combination you actually ship:
+
+```python
+for active in (("dev",), ("prod",)):
+    c = DIContainer(profiles=active)
+    c.scan("myapp")
+    c.validate()   # each profile's graph must be independently complete
+```
+
+`@Profile` also composes with `@Alternative`: an `@Alternative` bean that also carries
+`@Profile` no longer needs an imperative `enable_alternative()` call — the profile
+itself is the activator, and it is a hard AND-gate (`enable_alternative()` cannot
+override a non-matching profile).
+
+⚠️ **Behaviour change**: `@Alternative` on a `@Provider` **function** (not a class) is
+now genuinely disabled by default, matching the decorator's documented promise. Code
+that previously relied on `@Alternative` doing nothing on a provider function will now
+see `LookupError` until the provider is enabled (or given a matching `@Profile`).
+
+---
+
+## R14 — Declare settings with `@ConfigProperties`; never hand-write a `@Provider` that reads `os.environ`
+
+```python
+from dataclasses import dataclass
+from providify import ConfigProperties, EnvSource, YamlSource
+
+@ConfigProperties(prefix="db", sources=(EnvSource(), YamlSource("config.yaml", required=False)))
+@dataclass(frozen=True)
+class DbSettings:
+    url: str
+    pool_size: int = 5
+
+container.bind_config(DbSettings)   # …or container.scan("myapp") discovers it
+container.get(DbSettings)
+```
+
+**Don't** do this instead:
+
+```python
+@Provider(singleton=True)
+def make_db_settings() -> DbSettings:                       # ❌ anti-pattern
+    return DbSettings(
+        url=os.environ["DB_URL"],
+        pool_size=int(os.environ.get("DB_POOL_SIZE", "5")),
+    )
+```
+
+`@ConfigProperties` gives you multi-source merging (env + YAML/JSON/TOML,
+later source wins), type coercion (or a full pydantic `model_validate`
+hand-off if the target exposes it), and **aggregated** error reporting — a
+config file with four typos raises one `ConfigBindingError` naming all four,
+instead of a `KeyError`/`ValueError` on the first bad field. A hand-rolled
+`@Provider` gets none of this for free.
+
+⚠️ **`@ConfigProperties` is NOT `@Configuration`** (R2 above). They are
+unrelated decorators with unrelated jobs: `@Configuration` is a *grouping
+namespace* for `@Provider` methods (Jakarta CDI has no such concept at all);
+`@ConfigProperties` is a *typed settings binder* — it marks a plain data
+class (dataclass, annotated `__init__`, or pydantic `BaseModel`) as bound
+from env/YAML/JSON/TOML. Putting `@Provider` methods inside a
+`@ConfigProperties` class, or expecting `@Configuration` to read `os.environ`
+for you, are both category errors. If a class carries both markers, the
+scanner treats it as `@ConfigProperties` — this combination is
+unsupported/ambiguous, not a supported dual-role class.
+
+⚠️ **Config errors surface at the first `get()`, not at `bind_config()`.**
+Binding is lazy and singleton: sources are read and fields are
+coerced/validated the first time `container.get(cls)` (or `aget()`) resolves
+it — a missing required env var or a malformed YAML value will not be caught
+by `container.scan()` or `container.bind_config()` alone. To fail at startup
+instead of on first use, call `container.warm_up()` (or `awarm_up()`), which
+fully instantiates every singleton, including config bindings.
+`container.validate()` (R12) does **not** catch a bad config *value* — by
+design it never instantiates anything, so it can confirm a `DbSettings`
+binding exists but cannot prove `DB__POOL_SIZE="not-a-number"` will fail
+until something actually calls `get(DbSettings)` or `warm_up()` runs.
+
+## R15 — Use the `di_container` / `di_overrides` fixtures; do not hand-roll `override()` + `reset_binding()` pairs
+
+Installing providify registers a `pytest11` plugin that exposes
+`di_container` / `di_overrides` / `di_global` / `di_acontainer` fixtures —
+no conftest boilerplate required:
+
+```python
+def test_checkout(di_container, di_overrides):
+    di_container.scan("myapp")
+    di_overrides.instance(Clock, FrozenClock("2026-01-01"))   # instance, not class
+    di_overrides.bind(Notifier, FakeNotifier)                 # class swap
+    di_overrides.remove(PaymentGateway)                       # unregister
+
+    assert di_container.get(Checkout).run() == "ok"
+    # every override is undone automatically at teardown — no reset_binding() calls
+```
+
+**Don't** do this instead:
+
+```python
+def test_checkout(container):
+    container.override(Notifier, FakeNotifier)                 # ❌ anti-pattern
+    ...
+    container.reset_binding(Notifier)                           # easy to forget,
+    container.bind(Notifier, RealNotifier)                      # easy to get wrong
+                                                                 # under a failing assert
+```
+
+A manual `override()`/`reset_binding()` pair never runs if the test fails
+before reaching it — `di_overrides` is a `yield`-based fixture, so undo
+always runs, exception or not.
+
+⚠️ **Override your own `di_container` in your own conftest if you have an
+app container** — the plugin cannot know how you build yours; the shipped
+default is a bare `DIContainer()`:
+
+```python
+@pytest.fixture
+def di_container(app_container):
+    return app_container.copy()   # isolated per test, no re-scan
+```
+
+⚠️ **Instances created *during* an override window are dropped without
+teardown.** `ContainerOverrides`/`di_overrides` restore **configuration**
+(bindings, profiles, alternatives), not **lifecycle** — anything
+instantiated after the snapshot vanishes with no `@PreDestroy`/`@Disposes`
+running. The default `di_container` fixture sidesteps this by being
+fresh-per-test with `shutdown()` in its own teardown; only a consumer who
+points `di_container` at a long-lived app container is exposed.
+
+`ContainerOverrides` also works without pytest at all (unittest, scripts,
+a REPL):
+
+```python
+from providify import ContainerOverrides
+
+with ContainerOverrides(container) as ov:
+    ov.instance(Clock, FrozenClock(...))
+```
+
+---
+
+## R16 — Declare cross-module ordering with `depends_on=`; never rely on scan order
+
+If module `B`'s `__init__` or an `@Provider` method needs a type produced by module
+`A`, write `@Configuration(depends_on=[A])` on `B` — **do not** rely on `scan()`'s
+alphabetical `inspect.getmembers()` walk to happen to install `A` first:
+
+```python
+@Configuration
+class InfraModule:
+    @Provider(singleton=True)
+    def pool(self) -> DatabasePool: ...
+
+@Configuration(depends_on=[InfraModule])   # ✅ explicit — installs InfraModule first
+class RepoModule:
+    def __init__(self, pool: DatabasePool) -> None: ...   # resolvable
+```
+
+`container.install(RepoModule)` (or `scan()` discovering it) then transitively
+installs `InfraModule` first, regardless of declaration or scan order. A cycle in
+`depends_on` raises `ModuleCycleError` naming every class in the cycle — detected
+**before** any module is instantiated, so a cycle leaves the container untouched
+(no partial installation).
+
+Two lifecycle guarantees that ship with `depends_on=`:
+- A module's `@PostConstruct` runs once, at install time, after `__init__` and
+  before its `@Provider` methods are registered.
+- A module's `@PreDestroy` runs at `shutdown()`/`ashutdown()`, in **exact reverse
+  install order**, strictly **after** every singleton has already been torn down —
+  a module's `@PreDestroy` typically releases a resource (a pool, a client) that
+  every singleton consumer of it is already gone by the time it runs.
+
+`install()`/`ainstall()` are idempotent per container: installing the same module
+twice (explicitly, or via `install()` followed by `scan()` covering it) registers
+its providers exactly once — the container is the dedup authority, keyed on the
+module class.

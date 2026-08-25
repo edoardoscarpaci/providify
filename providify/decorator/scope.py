@@ -15,15 +15,18 @@ from ..metadata import (
     Scope,
     StereotypeMetadata,
     _get_own_metadata,
+    _get_profile_expressions,
     _get_provider_metadata,
     _is_decorated,
     _set_alternative_marker,
     _set_decorator_marker,
     _set_metadata,
+    _set_profile_marker,
     _set_provider_metadata,
     _set_qualifier_marker,
     _set_stereotype,
 )
+from ..profiles import _normalise
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -681,6 +684,118 @@ def Alternative(cls: type) -> type:
     """
     _set_alternative_marker(cls)
     return cls
+
+
+# ─────────────────────────────────────────────────────────────────
+#  @Profile — deployment-time profile activation (Spring @Profile parity)
+# ─────────────────────────────────────────────────────────────────
+
+
+def Profile(*expressions: str) -> Callable[[Any], Any]:
+    """Gate a class or ``@Provider`` function on the container's active profiles.
+
+    Equivalent to Spring's ``@Profile`` (research 001 §Differentiators #7,
+    via ``BACKLOG.md:37``) restricted to OR-of-literals with a leading ``!``
+    for negation — no boolean expression language (plan 005 §Non-goals).
+    A binding whose profile expression does not match the container's
+    ``active_profiles`` is invisible to ``get()``, ``get_all()``,
+    ``is_resolvable()``, and ``validate()`` — the same visibility rule an
+    un-enabled ``@Alternative`` already has (see ``container.py``'s
+    ``_binding_is_active``).
+
+    Semantics:
+        - Multiple expressions are OR'd: ``@Profile("dev", "test")`` is
+          active when *either* ``"dev"`` or ``"test"`` is active.
+        - A leading ``"!"`` negates a single literal:
+          ``@Profile("!prod")`` is active whenever ``"prod"`` is **not**
+          active — including when no profile at all is active.
+        - Profile names are normalised (stripped, lower-cased) here and
+          again in ``resolve_active_profiles``, so ``"PROD"`` and ``"prod"``
+          always compare equal.
+        - Composition with ``@Alternative``: an ``@Alternative`` class that
+          also carries ``@Profile`` is governed by its profile instead of
+          requiring an imperative ``container.enable_alternative()`` call —
+          the "env-driven ``@Alternative``" half of this feature. Profile
+          and alternative rules are AND'd (a matching profile does not
+          bypass a *non*-matching one; there is only one gate here, the
+          profile, once ``@Profile`` is present).
+        - Applying ``@Profile`` more than once merges the expression tuples
+          (union, order-preserving, de-duplicated) rather than overwriting —
+          consistent with how repeated qualifier-style decorators compose
+          elsewhere in this module.
+        - Usable on classes **and** ``@Provider`` functions (including
+          ``@Configuration`` bound methods and ``@Provider @property``) —
+          unlike ``@Alternative``, which (before this plan) only took effect
+          on classes; see plan 005 §Design "asymmetry fix".
+
+    Args:
+        *expressions: One or more profile literals, e.g. ``"prod"``,
+            ``"!prod"``. At least one is required.
+
+    Returns:
+        A decorator that stamps the normalised, merged expression tuple
+        onto the target's own ``__dict__`` and returns the target
+        unchanged (same object identity).
+
+    Raises:
+        ValueError: If called with no arguments, or if any literal is empty,
+            all-whitespace, or is a bare ``"!"`` with nothing to negate.
+            Raised at decoration time (import time), not at resolution time,
+            so a malformed profile expression fails fast.
+
+    Thread safety: Decoration happens at import time on a single thread in
+        every documented usage — see ``_set_profile_marker``'s note.
+    Async safety:  No await points; pure marker stamping.
+
+    Edge cases:
+        - ``@Profile()`` (no args) -> ``ValueError``.
+        - ``@Profile("")`` / ``@Profile("!")`` / ``@Profile("  ")`` ->
+          ``ValueError``.
+        - A subclass of a ``@Profile``d class does **not** inherit the
+          expressions (``__dict__``-only lookup, matching ``@Alternative``).
+
+    Example:
+        @Profile("prod")
+        @Singleton
+        class RealMailer(Mailer): ...
+
+        @Profile("dev", "test")            # OR — active in either
+        @Singleton
+        class ConsoleMailer(Mailer): ...
+
+        @Profile("!prod")                  # negation
+        @Provider(singleton=True)
+        def fake_clock() -> Clock: ...
+
+        container = DIContainer(profiles=("prod",))
+        container.get(Mailer)              # -> RealMailer
+    """
+    if not expressions:
+        raise ValueError("@Profile requires at least one profile expression.")
+
+    normalised: list[str] = []
+    for raw in expressions:
+        expr = _normalise(raw)
+        # A bare "!" negates nothing; an empty/whitespace-only literal is
+        # never a valid profile name either — both are decoration-time
+        # mistakes, so fail fast rather than silently matching nothing.
+        if expr in ("", "!"):
+            raise ValueError(f"Invalid @Profile expression: {raw!r}")
+        normalised.append(expr)
+
+    def decorator(target: Any) -> Any:
+        existing = _get_profile_expressions(target)
+        # Union, order-preserving, de-duplicated — repeated application
+        # composes rather than overwrites (mirrors the merge semantics
+        # documented above).
+        merged = list(existing)
+        for expr in normalised:
+            if expr not in merged:
+                merged.append(expr)
+        _set_profile_marker(target, tuple(merged))
+        return target
+
+    return decorator
 
 
 # ─────────────────────────────────────────────────────────────────
