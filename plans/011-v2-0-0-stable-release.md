@@ -807,15 +807,17 @@ string shaped like an AWS key and try to push — it must be refused.
 badge renders green rather than "no status"; the PyPI badge shows `2.0.0` only after
 Phase 7 publishes (it will show `1.1.1` until then — expected, not a bug).
 
+**Verified by Human: Done(V)**
+
 ### Phase 7 — R8: tag and release (last)
 
 Preconditions: Phases 1–6 all committed and pushed; CI green on the release branch;
 Phase 5c human steps complete. **Phase 8b must NOT have been done yet** — a `v*` tag
 ruleset would refuse the tag push below (see 8b's opening).
 
-30. [ ] Merge/land everything on the release branch (`dev` → `main` if that is the
+30. [X] Merge/land everything on the release branch (`dev` → `main` if that is the
         release branch) and confirm CI is green on the exact commit to be tagged.
-31. [ ] Re-check the version triple matches before tagging: `pyproject.toml:3` says
+31. [X] Re-check the version triple matches before tagging: `pyproject.toml:3` says
         `2.0.0`, `uv.lock` root entry says `2.0.0`, `CHANGELOG.md` top released
         section is `## [2.0.0]`. Research 001 §6: "Version tag `v2.0.0` must match
         `version = "2.0.0"` in pyproject.toml".
