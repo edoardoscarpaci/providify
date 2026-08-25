@@ -95,3 +95,9 @@ third-party actions, kept short so every dependency is easy to reason about:
 `ossf/scorecard-action`, `github/codeql-action`. Adding a new action to any
 workflow should be treated as adding a new trusted party to this list, not
 just a YAML edit.
+
+All of them are pinned by **full commit SHA**, with the human-readable
+version in a trailing comment (`uses: actions/checkout@3d3c42e... # v7`).
+A mutable tag can be repointed by whoever owns the action; a SHA cannot.
+Dependabot reads the trailing comment and keeps the pins current, so bump
+actions by merging its PRs rather than by hand-editing a tag back in.

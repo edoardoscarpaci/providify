@@ -5,6 +5,7 @@ Supports sync and async resolution, multiple scopes, lifecycle hooks, and config
 
 [![CI](https://github.com/edoardoscarpaci/providify/actions/workflows/ci.yml/badge.svg)](https://github.com/edoardoscarpaci/providify/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/providify.svg)](https://pypi.org/project/providify/)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/edoardoscarpaci/providify/badge)](https://securityscorecards.dev/viewer?uri=github.com/edoardoscarpaci/providify)
 
 ---
 
