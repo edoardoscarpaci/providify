@@ -821,7 +821,7 @@ ruleset would refuse the tag push below (see 8b's opening).
         `2.0.0`, `uv.lock` root entry says `2.0.0`, `CHANGELOG.md` top released
         section is `## [2.0.0]`. Research 001 §6: "Version tag `v2.0.0` must match
         `version = "2.0.0"` in pyproject.toml".
-32. [ ] Create the **annotated** tag (research 001 §6, research 002 §5 — annotated,
+32. [X] Create the **annotated** tag (research 001 §6, research 002 §5 — annotated,
         not lightweight, so tagger/date/message are stored):
     ```bash
     git tag -a v2.0.0 -m "Release 2.0.0 — first stable release"
@@ -829,17 +829,17 @@ ruleset would refuse the tag push below (see 8b's opening).
     ```
     With Phase 0's `tag.gpgSign true` this tag is also signed; confirm with
     `git tag -v v2.0.0`.
-33. [ ] Watch the `Release` workflow: `test` → `build` → `publish`. If `publish` fails
+33. [X] Watch the `Release` workflow: `test` → `build` → `publish`. If `publish` fails
         OIDC exchange, the cause is almost always a mismatch between the PyPI
         registration (owner/repo/workflow filename/environment) and the workflow —
         fix the PyPI side and re-run the failed job; **do not** re-cut the tag.
-34. [ ] Create the GitHub Release from the tag (research 001 §6 §Create GitHub Release):
+34. [X] Create the GitHub Release from the tag (research 001 §6 §Create GitHub Release):
     ```bash
     gh release create v2.0.0 --title "v2.0.0 — first stable release" \
       --notes-file <(sed -n '/^## \[2.0.0\]/,/^## \[0.1.7\]/p' CHANGELOG.md)
     ```
     or paste the `[2.0.0]` changelog section into the web UI. Mark it "Latest release".
-35. [ ] Post-release sanity: `pip install providify==2.0.0` in a clean venv (or
+35. [X] Post-release sanity: `pip install providify==2.0.0` in a clean venv (or
         `uv run --with providify==2.0.0 --no-project python -c "import providify"`).
 
 **Verify:** https://pypi.org/project/providify/ shows 2.0.0, the "Development Status ::
@@ -905,7 +905,7 @@ Three independent reasons, each a real failure mode:
       authentication key only (P0.2) — fix that first, or this rule locks you out of
       your own default branch.
 
-8b.6 [ ] (row 35, optional, **file edit not a click**) If Phase 5d's Scorecard workflow
+8b.6 [X] (row 35, optional, **file edit not a click**) If Phase 5d's Scorecard workflow
       is in place and has produced a result, add the badge to the Phase 6 block in
       `README.md` and commit it normally:
       ```markdown
