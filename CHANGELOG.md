@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased] — v0.2.0
+## [Unreleased]
+
+_Nothing yet._
+
+---
+
+## [2.0.0] — 2026-08-25
+
+First stable release. The version jumps 1.1.1 → 2.0.0 because PyPI requires a
+monotonically increasing version and 1.x was already published under an Alpha
+classifier — **this release contains no breaking API changes**. Interim
+releases 1.0.x–1.1.1 were unannounced; their contents are consolidated into
+this entry. From here the public API is committed; see the versioning and
+deprecation policy in [CONTRIBUTING.md](CONTRIBUTING.md#versioning-and-deprecation-policy).
 
 ### Added
 
@@ -553,6 +566,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is now shared across every bean it advises instead of being reset per bean
   — audit any interceptor that assigns to `self` outside `__init__`.
 
+#### Packaging
+- PyPI classifier upgraded from `Development Status :: 3 - Alpha` to
+  `Development Status :: 5 - Production/Stable`.
+
 ### Fixed
 
 #### `_InterceptorProxy` now supports attribute writes and deletes
@@ -616,7 +633,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/edoardoscarpaci/providify/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/edoardoscarpaci/providify/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/edoardoscarpaci/providify/releases/tag/v2.0.0
 [0.1.7]: https://github.com/edoardoscarpaci/providify/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/edoardoscarpaci/providify/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/edoardoscarpaci/providify/compare/v0.1.4a2...v0.1.5
