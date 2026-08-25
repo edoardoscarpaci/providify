@@ -1,6 +1,6 @@
 [project]
 name = "providify"
-version = "1.1.1"
+version = "2.0.0"
 description = "A Python dependency injection container inspired by Jakarta CDI and Spring. Supports sync and async resolution, multiple scopes, lifecycle hooks, and configuration modules."
 authors = [
     {name = "edoardo.scarpaci", email = "edoardo.scarpaci@gmail.com"},
@@ -19,7 +19,7 @@ keywords = [
     "spring",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
@@ -32,7 +32,11 @@ classifiers = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/edoardoscarpaci/providify"
 Repository = "https://github.com/edoardoscarpaci/providify"
+Documentation = "https://github.com/edoardoscarpaci/providify#readme"
+Changelog = "https://github.com/edoardoscarpaci/providify/blob/main/CHANGELOG.md"
+Issues = "https://github.com/edoardoscarpaci/providify/issues"
 
 [project.optional-dependencies]
 yaml = ["PyYAML>=6.0"]
