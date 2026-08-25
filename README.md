@@ -8,7 +8,8 @@ Supports sync and async resolution, multiple scopes, lifecycle hooks, and config
 ## Installation
 
 ```bash
-poetry install
+pip install providify
+# or: uv add providify
 ```
 
 Requires Python 3.12+.
@@ -2262,3 +2263,15 @@ with container.request():
 | `@Singleton` / `@ApplicationScoped` | One instance per container — shared for the container's lifetime |
 | `@RequestScoped` | One instance per `container.request()` block |
 | `@SessionScoped` | One instance per `container.session(id)` — survives across requests |
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, coding standards, and
+the versioning/deprecation policy.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for the supported-versions table and how to
+report a vulnerability.
