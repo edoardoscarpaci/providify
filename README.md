@@ -553,6 +553,59 @@ class CloudFanout:
         self.senders = senders
 ```
 
+### Multibinding — `multibind()` / `@Multibound` / bare `list[T]`
+
+Inject every registered implementation of an interface using a plain `list[T]`
+annotation — no wrapper type needed. Unlike `InjectInstances[T]`, this requires
+the interface to be **explicitly declared a collection point** first, either
+via `container.multibind()` or the `@Multibound` class decorator:
+
+```python
+from providify import Component, Multibound
+
+@Multibound                       # declares Handler a collection point
+class Handler(ABC):
+    @abstractmethod
+    def handle(self) -> str: ...
+
+class HandlerA(Handler): ...      # contributions need no marker of their own —
+class HandlerB(Handler): ...      # register normally with @Component/bind()/provide()
+
+@Component
+class Dispatcher:
+    def __init__(self, handlers: list[Handler]) -> None:   # every active impl, priority-ascending
+        self.handlers = handlers
+```
+
+Or declare the collection point on the container instead of the class (useful
+for third-party interfaces you can't decorate):
+
+```python
+container.multibind(Handler)      # equivalent to @Multibound on Handler
+container.bind(Handler, HandlerA)
+container.bind(Handler, HandlerB)
+handlers = container.get(list[Handler])   # [HandlerA(), HandlerB()]
+```
+
+- **A declared collection point with zero contributions injects `[]`**, not a
+  `LookupError` — declaring the collection point *is* the statement that zero
+  is a legal count.
+- A `list[T]` annotation where `T` was **not** declared a collection point
+  (and no literal `list[T]` binding exists) resolves to `_UNRESOLVED` — same
+  as any other unbound type, unchanged from before this feature.
+- If a literal binding for `list[T]` itself exists (e.g.
+  `container.provide(fn, returns=list[Handler])`), that binding always wins
+  over collection behaviour — `validate_bindings()` flags the ambiguity if
+  both exist on the same type.
+
+**Relationship to `InjectInstances[T]`:** `InjectInstances[T]` (see above)
+needs no collection-point declaration — the injection site itself already
+says "give me all of them" — but it keeps `get_all()`'s behaviour of raising
+`LookupError` on zero matches. Use `list[T]` after declaring a collection
+point as the default; keep `InjectInstances[T]` as the escape hatch for types
+you cannot decorate and did not `multibind()`, or where the raise-on-empty
+behaviour is what you want.
+
 ### Class-level attributes
 
 Injection annotations can be placed directly on class-level attributes instead of (or alongside) constructor parameters. They are resolved and set on the instance **after** the constructor runs, and **before** `@PostConstruct` fires — so lifecycle hooks can access them.
@@ -1642,6 +1695,70 @@ svc.place_order(order)
 | `ctx.proceed()` | `Any` | Continue the invocation chain |
 
 > **Note**: `isinstance(proxy, TargetClass)` returns `False` on the wrapped proxy. Use `type(proxy._target)` if you need the real class.
+
+### Field interceptors — `Advised` / `@AroundGet` / `@AroundSet`
+
+> ⚠️ **This goes beyond Jakarta CDI, which is method-only.** Jakarta
+> Interceptors 2.1 defines exactly five interception types (`@AroundInvoke`,
+> `@AroundTimeout`, `@PostConstruct`, `@PreDestroy`, `@AroundConstruct`) —
+> **none field-level**, in either the Lite or Full profile. This is **not** a
+> CDI-parity feature. The reference model is AspectJ's `get`/`set` pointcuts,
+> implemented here with Python's data-descriptor protocol (the same technique
+> Django ORM fields, SQLAlchemy columns and Traitlets use) rather than
+> AspectJ's compile-time bytecode weaving.
+
+Only fields whose class body assigns `Advised(...)` are join points — every
+other attribute costs nothing and is invisible to the interceptor chain:
+
+```python
+from providify import Advised, AroundGet, AroundSet, FieldAccessContext, InterceptorBinding, Interceptor, Component
+
+@InterceptorBinding
+class Audited: ...
+
+@Audited
+@Interceptor
+class AuditInterceptor:
+    @AroundSet
+    def on_set(self, ctx: FieldAccessContext) -> None:
+        print(f"{type(ctx.target).__name__}.{ctx.field} = {ctx.value!r}")
+        ctx.proceed()          # let the write land; skip this call to veto it
+
+    @AroundGet
+    def on_get(self, ctx: FieldAccessContext) -> object:
+        return ctx.proceed()   # can transform the returned value
+
+@Audited
+@Component
+class Account:
+    balance: float = Advised(0.0)   # declared join point
+    owner: str = "anon"             # NOT advised — plain attribute
+
+container.register(Account)
+container.add_interceptor(AuditInterceptor)
+
+acct = container.get(Account)
+acct.balance = 10.0   # fires on_set
+acct.balance          # fires on_get
+```
+
+- **Only fields declared `Advised(...)` are advised** — there is no
+  `__getattribute__`/`__setattr__` override on the target class.
+- **Advice is armed only for container-managed instances.** `Account()`
+  built directly (outside the container) behaves like a plain attribute.
+- **Advice is not armed during construction.** Writes performed by
+  `__init__`, class-var injection, and `@PostConstruct` are never advised —
+  the chain is attached only after `binding.create()` returns.
+- **No `__delete__` advice** — `del obj.field` always passes through
+  unadvised, matching AspectJ's `get`/`set`-only pointcuts.
+- **`self.balance` inside the bean's own methods is advised** — unlike the
+  method-interceptor `_InterceptorProxy`, which can only see calls made from
+  *outside* the bean, `Advised` is a descriptor on the class itself.
+- **Unsupported targets are rejected loudly.** A `dataclasses.is_dataclass()`
+  class, a pydantic `BaseModel`, or an `attrs` class with an `Advised` field
+  raises `TypeError` naming the class and field — a frozen dataclass's
+  `object.__setattr__`-based `__init__` would otherwise silently bypass the
+  descriptor and corrupt reads.
 
 ---
 

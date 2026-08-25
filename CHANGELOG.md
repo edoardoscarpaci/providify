@@ -463,6 +463,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now execute it. This is the intended fix, but it is a runtime behaviour
   change on existing code.
 
+### Added
+
+#### Multibinding — `container.multibind()` / `@Multibound` / bare `list[T]` (F7)
+- A bare `list[T]` annotation now injects every active binding for `T`,
+  priority-ascending, once `T` has been explicitly declared a collection
+  point via `container.multibind(T)` or the new `@Multibound` class
+  decorator. Contributions need no marker of their own — register them
+  normally with `bind()`, `register()`, or `provide()`.
+  ```python
+  container.multibind(Handler)          # or: @Multibound on class Handler
+  container.bind(Handler, HandlerA)
+  container.bind(Handler, HandlerB)
+
+  @Component
+  class Dispatcher:
+      def __init__(self, handlers: list[Handler]) -> None: ...   # all impls
+  ```
+- A declared collection point with zero contributions resolves to `[]`
+  instead of raising — deliberately different from `get_all()`/
+  `InjectInstances[T]`, which keep raising `LookupError` on zero matches;
+  declaring the collection point is itself the statement that zero is a
+  legal count.
+- `list[T]` where `T` is undeclared still resolves to `_UNRESOLVED`
+  (unchanged v1 behaviour) unless a literal binding for `list[T]` exists
+  (e.g. `provide(fn, returns=list[T])`), which always takes precedence over
+  collection behaviour. `validate_bindings()` now flags the case where both
+  a collection point and a literal `list[T]` binding exist for the same
+  type.
+- `InjectInstances[T]` is unchanged and still the form to use when you
+  cannot decorate `T` and did not call `multibind()`.
+- New export: `Multibound` (`providify/decorator/multibinding.py`).
+
+#### Field-level interceptors — `Advised` / `@AroundGet` / `@AroundSet` (F8)
+- Interceptors can now advise field reads and writes, not just method calls.
+  This is a **deliberate extension beyond Jakarta CDI**, not a gap being
+  closed — Jakarta Interceptors 2.1 defines exactly five interception types
+  (`@AroundInvoke`, `@AroundTimeout`, `@PostConstruct`, `@PreDestroy`,
+  `@AroundConstruct`), none field-level, in either the Lite or Full profile.
+  The reference model is AspectJ's `get`/`set` pointcuts, implemented here
+  via Python's data-descriptor protocol — the same technique Django ORM
+  fields, SQLAlchemy columns, and Traitlets use — rather than AspectJ's
+  compile-time bytecode weaving.
+  ```python
+  @Interceptor
+  @Audited
+  class AuditInterceptor:
+      @AroundSet
+      def on_set(self, ctx: FieldAccessContext) -> None:
+          log.info("%s.%s = %r", type(ctx.target).__name__, ctx.field, ctx.value)
+          ctx.proceed()
+
+  @Component
+  @Audited
+  class Account:
+      balance: float = Advised(0.0)      # declared join point
+  ```
+- Only fields whose class body assigns `Advised(...)` are join points — no
+  `__getattribute__`/`__setattr__` override is installed on the target
+  class, so every other attribute costs nothing.
+- Advice is armed only for container-managed instances, and only after
+  `binding.create()` returns — writes performed by `__init__`, class-var
+  injection, and `@PostConstruct` are never advised. An instance built
+  directly (`Account()`, outside the container) behaves like a plain
+  attribute.
+- `dataclasses`, frozen `dataclasses`, pydantic `BaseModel`s, and `attrs`
+  classes are rejected as `Advised` targets with a `TypeError` naming the
+  class and field — a frozen dataclass's `object.__setattr__`-based
+  `__init__` would otherwise bypass the descriptor and silently corrupt
+  reads.
+- No `__delete__` advice — `del obj.field` always passes through unadvised,
+  matching AspectJ's `get`/`set`-only pointcuts.
+- New exports: `Advised`, `FieldAccessContext` (`providify/field.py`),
+  `AroundGet`, `AroundSet` (`providify/decorator/interceptor.py`).
+
+### Changed
+
+#### ⚠️ Interceptor instances are now shared, container-scoped singletons
+- `_apply_interceptors()` previously constructed a **fresh instance of each
+  matching `@Interceptor` class for every bean it wrapped**. It now resolves
+  each interceptor class **once per container** (via the new
+  `_resolve_interceptor_instance()` / `self._interceptor_instances` cache)
+  and reuses that same instance across every bean it advises — needed so
+  that a bean's method advice (`@AroundInvoke`) and its field advice
+  (`@AroundGet`/`@AroundSet`, both introduced in this release) observe a
+  consistent interceptor object, and so a `container.get(InterceptorClass)`
+  caller sees the same instance the chain uses. If an existing interceptor
+  keeps mutable per-bean state on `self` (uncommon, but possible), that state
+  is now shared across every bean it advises instead of being reset per bean
+  — audit any interceptor that assigns to `self` outside `__init__`.
+
+### Fixed
+
+#### `_InterceptorProxy` now supports attribute writes and deletes
+- A bean wrapped by `_InterceptorProxy` (i.e. carrying an `@AroundInvoke`
+  interceptor) previously raised `AttributeError` on `proxy.attr = value` or
+  `del proxy.attr` — the proxy's `__slots__` had no `__setattr__`/
+  `__delattr__`, so writes never reached the wrapped target. Both now
+  delegate through to `_target`. Pre-existing bug, exposed while wiring up
+  field interceptors (F8) — writes to any intercepted bean's attributes now
+  work as expected instead of raising.
+
 ---
 
 ## [0.1.7] — 2026-04-26

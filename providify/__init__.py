@@ -106,6 +106,14 @@ __all__ = [
     "Interceptor",
     "InterceptorBinding",
     "AroundInvoke",
+    # Field-level interceptors (plan 010, F8) — AspectJ get/set pointcut
+    # analogues via the descriptor protocol; NOT a Jakarta CDI feature.
+    "AroundGet",
+    "AroundSet",
+    "Advised",
+    "FieldAccessContext",
+    # Multibinding collection injection (plan 010, F7)
+    "Multibound",
 ]
 import logging
 
@@ -120,7 +128,13 @@ from .config import (
 )
 from .container import ContainerSnapshot, DIContainer, ScopeContext
 from .decorator.config import ConfigProperties
-from .decorator.interceptor import AroundInvoke, Interceptor, InterceptorBinding
+from .decorator.interceptor import (
+    AroundGet,
+    AroundInvoke,
+    AroundSet,
+    Interceptor,
+    InterceptorBinding,
+)
 from .decorator.lifecycle import (
     Disposes,
     DisposesMarker,
@@ -130,6 +144,7 @@ from .decorator.lifecycle import (
     PreDestroy,
 )
 from .decorator.module import Configuration
+from .decorator.multibinding import Multibound
 from .decorator.scope import (
     Alternative,
     ApplicationScoped,
@@ -167,6 +182,7 @@ from .exceptions import (
     ShutdownFailure,
     providifyError,
 )
+from .field import Advised, FieldAccessContext
 from .metadata import (
     ConfigPropertiesMetadata,
     ProfileMetadata,

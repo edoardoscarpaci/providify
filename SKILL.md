@@ -77,6 +77,7 @@ container.provide(provider_fn)                  # register a @Provider factory f
 container.scan("my.module", recursive=True)     # auto-discover decorated members
 container.install(MyConfigModule)               # install a @Configuration class (sync)
 await container.ainstall(MyConfigModule)        # install async
+container.multibind(Interface)                  # declare Interface a collection point — REQUIRED before `list[Interface]` injects anything
 
 # ── Mutation (useful in tests) ────────────────────────────────────
 container.override(Interface, MockImpl)         # replace all bindings for Interface in-place; evicts singleton cache
@@ -658,3 +659,5 @@ poetry run pytest
 - **`ClassVar[Instance[T]]` / `ClassVar[Live[T]]` / `ClassVar[Lazy[T]]` / `ClassVar[Inject[T]]` are all valid** → the container calls `_unwrap_classvar()` at every injection boundary before dispatching. All four injection types work identically in the `ClassVar[...]` form. Scope-violation detection and dependency-graph construction also see the unwrapped hint.
 - **`@Provider` scope leaks are now validated** → `@Provider(singleton=True)` functions whose parameters include a `@RequestScoped` or `@SessionScoped` dep without `Live[T]` wrapping now raise `LiveInjectionRequiredError` during `validate_bindings()`, the same as `ClassBinding`. Wrap the parameter in `Live[T]` to fix it.
 - **`Lazy[T | None]` and `Live[T | None]`** → the pipe-union form is supported as shorthand for `optional=True`. `proxy.get()` returns `None` when T is not bound instead of raising `LookupError`. Equivalent to `Annotated[T, LazyMeta(optional=True)]` / `Annotated[T, LiveMeta(optional=True)]`.
+- **Bare `list[T]` needs a declared collection point first** → `container.multibind(T)` or `@Multibound` on `T`. Without it, `list[T]` is `_UNRESOLVED` — it does not silently collect. Once declared, `[]` is a valid empty result (unlike `InjectInstances[T]`, which keeps raising `LookupError` on zero matches).
+- **`Advised` fields are the only field-interceptor join points** → `@AroundGet`/`@AroundSet` advice never fires on undeclared attributes, never fires during `__init__`/class-var injection/`@PostConstruct`, and is rejected outright (`TypeError`) on dataclasses/pydantic/attrs targets. This is **not** a Jakarta CDI feature (CDI interception is method-only in both profiles) — it is modelled on AspectJ `get`/`set` pointcuts via Python's descriptor protocol. Do not frame it as CDI parity.

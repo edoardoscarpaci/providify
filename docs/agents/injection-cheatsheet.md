@@ -30,6 +30,7 @@ bad2: Inject(Service, qualifier="x")   # ❌ runs, but type checkers report "Unk
 |------------|----------|-------------|
 | `Inject[T]` | one binding, **eagerly at construction** | the normal case |
 | `InjectInstances[T]` | `list[T]` of **all** matching bindings | plugin lists, handler sets |
+| `list[T]` (bare) | `list[T]` of **all** matching bindings — **requires `T` to be a declared collection point first** (`container.multibind(T)` or `@Multibound`) | same as `InjectInstances[T]`, but `[]` instead of `LookupError` on zero matches |
 | `Lazy[T]` | one binding, **once on first `.get()`**, then cached | break circular deps; defer expensive construction |
 | `Live[T]` | one binding, **re-resolved every `.get()`** | inject narrow scope into wider scope (R5) |
 | `Instance[T]` | a programmatic handle; nothing resolved until you call it | choose qualifier/priority at call time |
@@ -46,6 +47,27 @@ fast:     Annotated[list[Notifier], InjectMeta(all=True, qualifier="fast")]
 ```
 
 `InjectMeta` fields: `qualifier`, `priority`, `all`, `optional`.
+
+```python
+container.multibind(Notifier)                        # declare the collection point once
+list_n: list[Notifier]                                # then a bare list[T] works — same as InjectInstances[T]
+```
+
+### `Advised` — field-level interceptors (NOT a CDI feature)
+
+```python
+from providify import Advised, AroundGet, AroundSet, FieldAccessContext
+
+class Account:
+    balance: float = Advised(0.0)   # declared join point — only advised fields cost anything
+```
+
+Fires `@AroundGet`/`@AroundSet` advice on read/write, but **only** for
+container-managed instances, **only** after construction completes (never
+during `__init__`/class-var injection/`@PostConstruct`), and **never** for
+dataclasses/pydantic/attrs targets (rejected with `TypeError`). This goes
+beyond Jakarta CDI (method-only interception) — modelled on AspectJ `get`/
+`set` pointcuts, implemented via Python's descriptor protocol.
 
 ### `Lazy[T]` — break cycles / defer
 

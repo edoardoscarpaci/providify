@@ -16,6 +16,7 @@ from here.
 from __future__ import annotations
 
 import types
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Annotated, Any, Union, get_args, get_origin
@@ -388,7 +389,9 @@ def _unwrap_union(hint: Any) -> tuple[list[Any], bool] | None:
     return candidates, is_optional
 
 
-def _classify_hint(hint: Any) -> _HintSpec | None:
+def _classify_hint(
+    hint: Any, is_collection_point: Callable[[Any], bool] | None = None
+) -> _HintSpec | None:
     """Statically classify a type hint as an injection point (or not).
 
     Pure function — mirrors `DIContainer._resolve_hint_sync`'s branch
@@ -400,6 +403,21 @@ def _classify_hint(hint: Any) -> _HintSpec | None:
         hint: Any evaluated (non-string) type hint — bare type, generic
               alias, `Annotated[...]`, `Union[...]`/`X | Y`,
               `ClassVar[...]`-wrapped, or `InjectionPoint`.
+        is_collection_point: Plan 010 (F7) — optional predicate answering
+              "is T a declared multibinding collection point?" (the
+              container's `_is_collection_point`, passed in because this
+              module never touches the container itself — see the module
+              docstring's one-way import rule). When given and `hint` is
+              `list[T]`/`typing.List[T]` with a truthy predicate result, the
+              hint is classified exactly like `InjectInstances[T]` (missing
+              is never reported, every candidate for T becomes a cycle edge).
+              This classifier is purely static and has no notion of "a
+              literal `list[T]` binding also exists" — that ambiguity is a
+              separate, binding-registry-level check
+              (`DIContainer.validate_bindings()`, plan 010 step 12), not a
+              per-hint classification concern. `None` (the default) preserves
+              pre-plan-010 behaviour exactly — bare `list[T]` is classified
+              like any other bare generic alias (the final branch below).
 
     Returns:
         A `_HintSpec` describing how the hint should be validated, or
@@ -600,6 +618,26 @@ def _classify_hint(hint: Any) -> _HintSpec | None:
             caller_parameterised=False,
             excludes_self=False,
         )
+
+    # ── F7 (plan 010 §Design F7.3): bare list[T], T a collection point ────
+    # Must run BEFORE the generic bare-type branch below — a collection
+    # point's list[T] is a "resolve every candidate" edge, not a single
+    # missing-or-not lookup for the literal type list[T]. See the
+    # is_collection_point Arg's docstring above for what this deliberately
+    # does NOT model (a coexisting literal list[T] binding).
+    if is_collection_point is not None and get_origin(hint) is list:
+        list_args = get_args(hint)
+        if len(list_args) == 1 and is_collection_point(list_args[0]):
+            return _HintSpec(
+                base_type=list_args[0],
+                qualifier=None,
+                priority=None,
+                optional=True,  # [] is a legal, unreported answer (F7.4)
+                deferred=False,
+                multi=True,
+                caller_parameterised=False,
+                excludes_self=False,
+            )
 
     if isinstance(hint, type) or get_origin(hint) is not None:
         # Bare type / generic alias with no Annotated wrapper — same runtime

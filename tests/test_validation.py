@@ -1106,3 +1106,75 @@ def test_classify_hint_agrees_with_runtime_behaviour(
         consumer = container.get(Consumer)
         assert consumer.dep is None
         assert spec.optional is True
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Plan 010 step 11 — multibound list[T] and startup graph validation
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestMultiboundCollectionValidation:
+    """`validate()` must not report a multibound `list[T]` as a missing
+    binding (plan 010 §Design F7.3 / step 10-11), while still reporting a
+    contribution's OWN missing dependencies.
+    """
+
+    def test_multibound_list_t_is_not_reported_as_missing_binding(
+        self, container: DIContainer
+    ) -> None:
+        from providify.validation import IssueKind
+
+        class Handler:
+            pass
+
+        @Singleton
+        class HandlerImpl(Handler):
+            pass
+
+        @Singleton
+        class Dispatcher:
+            def __init__(self, handlers: list[Handler]) -> None:
+                self.handlers = handlers
+
+        container.multibind(Handler)
+        container.bind(Handler, HandlerImpl)
+        container.register(Dispatcher)
+
+        report = container.validate(raise_on_error=False)
+
+        missing = [i for i in report.issues if i.kind == IssueKind.MISSING_BINDING]
+        assert not any("Handler" in i.message for i in missing)
+
+    def test_contribution_own_missing_dependency_is_still_reported(
+        self, container: DIContainer
+    ) -> None:
+        """A collection point's contribution can itself have unmet deps —
+        multibinding does not silence errors inside the contributed classes.
+        """
+        from providify.validation import IssueKind
+
+        class Handler:
+            pass
+
+        @Singleton
+        class HandlerImpl(Handler):
+            def __init__(self, dep: _MissingDep) -> None:
+                self.dep = dep
+
+        @Singleton
+        class Dispatcher:
+            def __init__(self, handlers: list[Handler]) -> None:
+                self.handlers = handlers
+
+        container.multibind(Handler)
+        container.bind(Handler, HandlerImpl)
+        container.register(Dispatcher)
+
+        report = container.validate(raise_on_error=False)
+
+        missing = [i for i in report.issues if i.kind == IssueKind.MISSING_BINDING]
+        assert any("_MissingDep" in i.message for i in missing)
+
+
+class _MissingDep:
+    """Deliberately never bound — used by TestMultiboundCollectionValidation."""

@@ -444,3 +444,46 @@ Two lifecycle guarantees that ship with `depends_on=`:
 twice (explicitly, or via `install()` followed by `scan()` covering it) registers
 its providers exactly once — the container is the dedup authority, keyed on the
 module class.
+
+## R17 — Declare the collection point before injecting `list[T]`
+
+A bare `list[T]` annotation only collects every registered implementation of
+`T` if `T` was explicitly declared a collection point first — via
+`container.multibind(T)` or `@Multibound` on `T` itself:
+
+```python
+@Multibound                             # ✅ declare first
+class Handler(ABC): ...
+
+@Component
+class Dispatcher:
+    def __init__(self, handlers: list[Handler]) -> None: ...   # now resolves
+```
+
+Without the declaration, `list[Handler]` is `_UNRESOLVED` like any other
+unbound type — it does **not** silently collect everything. If you cannot
+decorate `T` and did not call `multibind()`, use `InjectInstances[T]`
+instead, which needs no declaration but keeps `LookupError` on zero matches
+(a declared collection point injects `[]` instead).
+
+## R18 — Field interceptors: only `Advised` fields are join points, and never during construction
+
+`@AroundGet`/`@AroundSet` advice only fires for fields declared
+`balance: T = Advised(...)` in the class body — there is no
+`__getattribute__`/`__setattr__` override, so every other attribute is
+invisible to the interceptor chain. Three more rules that trip people up:
+
+- **No advice during construction.** Writes performed by `__init__`,
+  class-var injection, and `@PostConstruct` are never advised — the chain is
+  attached only after the bean is fully built. If an interceptor needs to see
+  the initial value, read it explicitly after `container.get()` returns.
+- **`Advised` fields are unsupported on dataclasses, frozen dataclasses,
+  pydantic `BaseModel`s, and `attrs` classes** — rejected with `TypeError` at
+  weave time, not silently broken. A frozen dataclass's generated `__init__`
+  writes via `object.__setattr__`, which a data descriptor cannot intercept,
+  so reads would silently return stale/default data instead of what was
+  written — this is rejected outright rather than shipped as a footgun.
+- **This is not a CDI feature.** Jakarta Interceptors 2.1 has no field-level
+  interception in either profile — do not describe `Advised` as "closing a
+  CDI gap" in code, comments, or commit messages. It is modelled on AspectJ's
+  `get`/`set` pointcuts, implemented via Python's descriptor protocol.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import dataclasses
 import functools
 import inspect
 import logging
@@ -35,7 +36,9 @@ from ._annotations import (
 from .binding import AnyBinding, ClassBinding, ProviderBinding
 from .config import bind_config_object
 from .decorator.interceptor import (
+    _get_around_get_method,
     _get_around_invoke_method,
+    _get_around_set_method,
     _is_interceptor,
     _is_interceptor_binding,
 )
@@ -46,6 +49,7 @@ from .decorator.lifecycle import (
     _get_disposes_marker,
     _get_observes_marker,
 )
+from .decorator.multibinding import _is_multibound
 from .decorator.scope import Provider
 from .descriptor import DIContainerDescriptor
 from .exceptions import (
@@ -56,6 +60,7 @@ from .exceptions import (
     ShutdownError,
     ShutdownFailure,
 )
+from .field import Advised
 from .metadata import (
     LiveInjectionViolation,
     Scope,
@@ -367,9 +372,75 @@ class _InterceptorProxy:
 
         return _intercepted
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Bug fix (plan 010, F8.7): __slots__ = ("_target", "_chain") with no
+        # __setattr__ override meant Python fell back to `object.__setattr__`,
+        # which raises for any name outside those two slots — so
+        # `proxy.attr = value` on ANY intercepted bean raised AttributeError
+        # instead of writing through, independent of field advice (it also
+        # made set-advice unreachable through the proxy once F8 landed).
+        # Route straight to the wrapped target via setattr() — the target may
+        # itself be an `Advised` field, in which case this correctly re-enters
+        # the descriptor's own (separately advised) __set__.
+        target = object.__getattribute__(self, "_target")
+        setattr(target, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        # Same slots trap as __setattr__ above — see its comment.
+        target = object.__getattribute__(self, "_target")
+        delattr(target, name)
+
     def __repr__(self) -> str:
         target = object.__getattribute__(self, "_target")
         return f"_InterceptorProxy({target!r})"
+
+
+def _find_advised_fields(cls: type) -> list[str]:
+    """Return the names of every ``Advised`` field declared on *cls* (plan 010, F8.6).
+
+    Used by :meth:`DIContainer._apply_interceptors` to decide whether the
+    unsupported-target rejection check (§Design F8.6) even applies — a class
+    with no ``Advised`` field is never checked.
+
+    Two lookup paths are needed:
+
+    - **Normal classes** (including dataclasses — see §Design F8.6's
+      rationale for why they're still rejected despite this working):
+      ``Advised(...)`` remains a genuine class attribute, found by walking
+      ``vars(klass)`` over the MRO — ``__set_name__`` already ran at class
+      creation, but the descriptor object itself is untouched.
+    - **pydantic ``BaseModel`` subclasses**: pydantic's metaclass STRIPS
+      descriptor-valued class attributes out of the class ``__dict__``
+      entirely and stores them as ``FieldInfo.default`` on
+      ``cls.__pydantic_fields__`` instead — so ``vars(cls)`` alone would
+      never see an ``Advised`` field on a pydantic model, and the rejection
+      in :meth:`DIContainer._check_advised_target_supported` would never
+      fire. Checked as a second, explicit pass.
+
+    Args:
+        cls: The class to scan (its full MRO is walked for the first path).
+
+    Returns:
+        Field names, first-seen order, deduplicated. ``[]`` if *cls*
+        declares no ``Advised`` field at all.
+    """
+    found: list[str] = []
+    for klass in cls.__mro__:
+        for name, val in vars(klass).items():
+            if isinstance(val, Advised) and name not in found:
+                found.append(name)
+
+    # pydantic BaseModel — see docstring's second bullet.
+    pydantic_fields = getattr(cls, "__pydantic_fields__", None)
+    if pydantic_fields:
+        for name, info in pydantic_fields.items():
+            if (
+                isinstance(getattr(info, "default", None), Advised)
+                and name not in found
+            ):
+                found.append(name)
+
+    return found
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -530,6 +601,18 @@ class DIContainer:
               is ``frozenset()``.
         """
         self._bindings: list[AnyBinding] = []
+        # F7 (plan 010) — types declared as multibinding collection points via
+        # multibind() (the @Multibound decorator marker is checked separately,
+        # via _is_multibound() — see _is_collection_point()). A plain set: a
+        # collection point creates no instances of its own and owns no scope/
+        # qualifier/lifecycle, so it needs no Binding subclass (plan 010
+        # §Design F7 alternatives).
+        self._collection_points: set[Any] = set()
+        # F8 (plan 010) — classes already checked for unsupported Advised
+        # targets (dataclass / pydantic BaseModel / attrs), memoised so the
+        # check (§Design F8.6) runs once per class rather than once per
+        # instance.
+        self._advised_checked_classes: set[type] = set()
         self._singleton_cache: dict[Any, object] = {}
         # DESIGN: append-only creation log for singletons; reversed at
         # shutdown to obtain reverse-dependency order — valid because
@@ -621,6 +704,15 @@ class DIContainer:
         self._active_profiles: frozenset[str] = resolve_active_profiles(profiles)
         # @Interceptor — registered interceptor classes applied to all resolved instances
         self._interceptor_classes: list[type] = []
+        # Interceptor instances are effectively container-scoped singletons —
+        # one instance per interceptor class, shared by every bean's chain
+        # AND returned by container.get(InterceptorClass) (plan 010, F8:
+        # field-advice tests inspect interceptor state directly via get(),
+        # which only makes sense if it's the SAME instance that fired).
+        # Interceptor classes need no @Component/@Singleton decoration (only
+        # @Interceptor), so this cannot be a normal ClassBinding — a plain
+        # dict is the whole mechanism required.
+        self._interceptor_instances: dict[type, object] = {}
         # Event[T] / @Observes — maps event type → [(weakref, method_name)]
         self._observers: dict[type, list] = {}
         # @Component(track=True) — tracked DEPENDENT instances for flush_dependents()
@@ -939,6 +1031,50 @@ class DIContainer:
         self._invalidate_type_caches()  # new binding — localns/hints must be rebuilt
         self._bindings.append(ProviderBinding(fn, returns=returns))
 
+    def multibind(self, cls: type, *, qualifier: str | type | None = None) -> None:
+        """Declare *cls* as a multibinding collection point (plan 010 §Design F7).
+
+        Mirrors Guice's ``Multibinder.newSetBinder(binder(), Snack.class)``
+        (research-F7 §Guice): declaring the collection point is the explicit
+        enablement step; contributions need no marker of their own — register
+        them normally with ``bind()``, ``register()`` or ``provide()`` and
+        they are collected automatically. Once declared, a bare
+        ``list[cls]`` annotation at any injection site resolves to every
+        active binding for *cls*, priority-ascending (see
+        ``container.get()``/``aget()`` and ``_collect_sync()``/
+        ``_collect_async()``).
+
+        Equivalent to (and interchangeable with) applying ``@Multibound``
+        directly to *cls* — use the decorator instead when *cls* is defined
+        in a module you don't control the container-construction call site
+        for (plan 010 §Design F7.2).
+
+        Idempotent: calling this twice for the same *cls* is a no-op, not an
+        error — a plain ``set.add()``.
+
+        Args:
+            cls: The interface (or base class) to declare a collection point.
+            qualifier: Reserved for future per-qualifier collection points;
+                accepted for API symmetry with ``bind()``/``get()`` but not
+                yet consulted by resolution — a collection injection point's
+                qualifier is supplied at the *injection* site
+                (``container.get(list[cls], qualifier=...)``), not here.
+
+        Returns:
+            None
+
+        Example:
+            container.multibind(Handler)
+            container.bind(Handler, HandlerA)
+            container.bind(Handler, HandlerB)
+            handlers = container.get(list[Handler])  # [HandlerA(), HandlerB()]
+        """
+        del qualifier  # see docstring — reserved, not yet consulted
+        self._collection_points.add(cls)
+        # Resolvability of list[cls] changes the instant this is declared —
+        # any cached "unresolvable" verdict for list[cls] must be discarded.
+        self._invalidate_type_caches()
+
     def bind_config(self, cls: type, *, sources: Sequence[Any] | None = None) -> None:
         """Register a ``@ConfigProperties`` class as a singleton binding.
 
@@ -1146,6 +1282,34 @@ class DIContainer:
             RuntimeError:  If the best matching binding is an async provider —
                            use :meth:`aget` instead.
         """
+        # F7 (plan 010 §Design F7.3) — precedence rule: a binding that
+        # LITERALLY matches list[T] (e.g. container.provide(fn,
+        # returns=list[T])) always wins over collection-point resolution;
+        # `_filter(cls)` (no qualifier/priority — existence only) answers
+        # "does any such literal binding exist at all". Only when none does,
+        # AND cls is a declared collection point's list[T], do we collect.
+        inner = self._multibound_inner(cls)
+        if inner is not None and not self._filter(cls):
+            if not self._validated:
+                self.validate_bindings()
+                self._validated = True
+            return self._collect_sync(inner, qualifier)  # type: ignore[return-value]
+
+        # F8 (plan 010) — an @Interceptor class needs no @Component/
+        # @Singleton and is never bind()/register()'d, so it has no normal
+        # ClassBinding; without this, container.get(SomeInterceptor) would
+        # always raise LookupError even though the container is perfectly
+        # capable of constructing (and, since F8, caching) one. Only takes
+        # over when *cls* is a registered interceptor AND no real binding
+        # exists for it — a project that also binds its interceptor class
+        # normally keeps that binding's behaviour untouched.
+        if (
+            isinstance(cls, type)
+            and cls in self._interceptor_classes
+            and not self._filter(cls, qualifier=qualifier, priority=priority)
+        ):
+            return self._resolve_interceptor_instance(cls)  # type: ignore[return-value]
+
         best = self._get_best_candidate(cls, qualifier=qualifier, priority=priority)
         # Guard — async providers cannot be resolved synchronously
         if isinstance(best, ProviderBinding) and best.is_async:
@@ -1200,6 +1364,121 @@ class DIContainer:
             for b in sorted(candidates, key=lambda b: b.priority)
         ]
 
+    # ── F7: multibinding collection injection (plan 010) ───────────
+
+    def _is_collection_point(self, cls: Any) -> bool:
+        """Return True if *cls* was declared a multibinding collection point.
+
+        Checks both spellings (plan 010 §Design F7.2): an explicit
+        ``container.multibind(cls)`` call, and the ``@Multibound`` class
+        decorator (checked via ``_is_multibound``, which travels with the
+        type across modules).
+
+        Args:
+            cls: The interface (or base class) to check.
+
+        Returns:
+            True if either declaration form applies to *cls*.
+        """
+        return cls in self._collection_points or _is_multibound(cls)
+
+    def _multibound_inner(self, hint: Any) -> Any | None:
+        """Return T if *hint* is ``list[T]``/``typing.List[T]`` with T a collection point.
+
+        The single gate both :meth:`_is_resolvable` and :meth:`get`/:meth:`aget`
+        consult to decide whether a bare ``list[T]`` hint should collect every
+        active binding for T, rather than look for a literal ``list[T]``
+        binding (plan 010 §Design F7.3).
+
+        Args:
+            hint: Any type hint — only ``list[T]``-shaped generic aliases can
+                match; everything else (including bare ``list`` with no type
+                argument) returns ``None``.
+
+        Returns:
+            T when *hint* is ``list[T]`` and T is a declared collection
+            point; ``None`` otherwise.
+        """
+        if get_origin(hint) is not list:
+            return None
+        args = get_args(hint)
+        if len(args) != 1:
+            return None
+        inner = args[0]
+        return inner if self._is_collection_point(inner) else None
+
+    def _collect_sync(
+        self, inner: Any, qualifier: str | type | None = None
+    ) -> list[Any]:
+        """Resolve every active binding for *inner*, synchronously — the list[T] terminal.
+
+        Thin wrapper around ``_filter`` + the same async-provider guard
+        :meth:`get_all` uses, but — unlike :meth:`get_all` — tolerates zero
+        matches by returning ``[]`` rather than raising ``LookupError``
+        (plan 010 §Design F7.4): declaring the collection point IS the
+        statement that zero is a legal count (research-F7 §Autofac:
+        *"Returns empty enumerable... if no implementations are
+        registered."*). :meth:`get_all` itself is untouched — this is a
+        deliberately separate, more permissive terminal reached only via a
+        declared collection point.
+
+        Args:
+            inner: The collection point's type T (already unwrapped from
+                ``list[T]`` by the caller).
+            qualifier: Optional qualifier narrowing which contributions are
+                collected — mirrors ``get_all(inner, qualifier=...)``.
+
+        Returns:
+            Every active, fully-injected instance for *inner*, sorted by
+            ascending priority. ``[]`` when there are no contributions.
+
+        Raises:
+            RuntimeError: Any matching contribution is an async provider —
+                use :meth:`aget`/``_collect_async`` instead. Same wording as
+                :meth:`get_all`'s guard (plan 010 edge cases).
+        """
+        candidates = self._filter(inner, qualifier=qualifier)
+
+        async_providers = [
+            b for b in candidates if isinstance(b, ProviderBinding) and b.is_async
+        ]
+        if async_providers:
+            names = ", ".join(b.fn.__name__ for b in async_providers)
+            raise RuntimeError(
+                f"Async providers [{names}] cannot be resolved with get_all(). "
+                f"Use await container.aget_all() instead."
+            )
+        if not self._validated:
+            self.validate_bindings()
+            self._validated = True
+        return [
+            self._instantiate_sync(b)  # type: ignore[misc]
+            for b in sorted(candidates, key=lambda b: b.priority)
+        ]
+
+    async def _collect_async(
+        self, inner: Any, qualifier: str | type | None = None
+    ) -> list[Any]:
+        """Async mirror of :meth:`_collect_sync` — see its docstring for the full rationale.
+
+        Args:
+            inner: The collection point's type T.
+            qualifier: Optional qualifier narrowing the collected contributions.
+
+        Returns:
+            Every active, fully-injected instance for *inner*, sorted by
+            ascending priority, awaiting async providers transparently.
+            ``[]`` when there are no contributions.
+        """
+        candidates = self._filter(inner, qualifier=qualifier)
+        if not self._validated:
+            self.validate_bindings()
+            self._validated = True
+        return [
+            await self._instantiate_async(b)  # type: ignore[misc]
+            for b in sorted(candidates, key=lambda b: b.priority)
+        ]
+
     # ── Async resolution ──────────────────────────────────────────
 
     async def aget(
@@ -1227,6 +1506,14 @@ class DIContainer:
         Example:
             svc = await container.aget(NotificationService)
         """
+        # F7 (plan 010 §Design F7.3) — mirrors get()'s precedence check; see
+        # its comment for the full rule.
+        inner = self._multibound_inner(cls)
+        if inner is not None and not self._filter(cls):
+            if not self._validated:
+                self.validate_bindings()
+                self._validated = True
+            return await self._collect_async(inner, qualifier)  # type: ignore[return-value]
         best = self._get_best_candidate(cls, qualifier=qualifier, priority=priority)
         if not self._validated:
             self.validate_bindings()
@@ -1592,21 +1879,145 @@ class DIContainer:
         if cls not in self._interceptor_classes:
             self._interceptor_classes.append(cls)
 
+    def _resolve_interceptor_instance(self, interceptor_cls: type) -> object:
+        """Return the single shared instance of *interceptor_cls*, creating it on first use.
+
+        Interceptor classes carry no ``@Component``/``@Singleton`` scope
+        decoration (only ``@Interceptor``), so they cannot be a normal
+        ``ClassBinding`` — ``self._interceptor_instances`` is the entire
+        caching mechanism. Constructed via ``_resolve_constructor`` (plain
+        constructor-injection, no scope machinery) exactly as before this
+        cache existed; the only change is that the result is now kept and
+        reused rather than rebuilt on every ``_apply_interceptors`` call.
+
+        Args:
+            interceptor_cls: An ``@Interceptor``-decorated class, already
+                registered via :meth:`add_interceptor`.
+
+        Returns:
+            The cached instance, or a freshly constructed one on first call.
+        """
+        if interceptor_cls not in self._interceptor_instances:
+            self._interceptor_instances[interceptor_cls] = self._resolve_constructor(
+                interceptor_cls
+            )
+        return self._interceptor_instances[interceptor_cls]
+
+    def _check_advised_target_supported(self, cls: type, fields: list[str]) -> None:
+        """Reject *cls* as an ``Advised`` target if it's a dataclass / pydantic / attrs class.
+
+        Plan 010 §Design F8.6: a frozen dataclass's generated ``__init__``
+        writes via ``object.__setattr__``, bypassing ``Advised.__set__``
+        entirely — but ``Advised`` is a DATA descriptor, so
+        ``Advised.__get__`` still wins over the instance ``__dict__``
+        (research-F8 §Python descriptor protocol). Reads would silently
+        return the descriptor's own (never-written) storage: silent data
+        corruption, the worst failure mode this project ships. Non-frozen
+        dataclasses, pydantic ``BaseModel`` (its own ``__setattr__`` bypasses
+        descriptor precedence the same way) and ``attrs`` classes are
+        rejected for the same underlying reason.
+
+        Memoised in ``self._advised_checked_classes`` — runs at most once
+        per class, regardless of how many instances are built or how many
+        interceptors are registered (this check fires even with ZERO
+        interceptors — see :meth:`_apply_interceptors`'s docstring).
+
+        Args:
+            cls:    The class being checked.
+            fields: Every ``Advised`` field name found on *cls* (from
+                    :func:`_find_advised_fields`) — non-empty, guaranteed by
+                    the caller.
+
+        Raises:
+            TypeError: *cls* is a dataclass, a pydantic ``BaseModel``, or an
+                ``attrs`` class.
+        """
+        if cls in self._advised_checked_classes:
+            return
+        self._advised_checked_classes.add(cls)
+
+        field_name = fields[0]
+        if dataclasses.is_dataclass(cls):
+            raise TypeError(
+                f"{cls.__name__}.{field_name} is Advised(...), but {cls.__name__} "
+                f"is a dataclass — Advised field advice is unsupported on "
+                f"dataclasses, frozen or not (plan 010 §Design F8.6). A frozen "
+                f"dataclass's generated __init__ uses object.__setattr__, "
+                f"bypassing Advised.__set__ while Advised.__get__ (a data "
+                f"descriptor) still wins over the instance dict — silent stale "
+                f"reads. Remove @dataclass or stop using Advised on this class."
+            )
+        if hasattr(cls, "__pydantic_fields__"):
+            raise TypeError(
+                f"{cls.__name__}.{field_name} is Advised(...), but {cls.__name__} "
+                f"is a pydantic BaseModel — Advised field advice is unsupported "
+                f"on pydantic models (plan 010 §Design F8.6): pydantic's own "
+                f"__setattr__ and metaclass field processing bypass the "
+                f"descriptor protocol's normal precedence, and pydantic strips "
+                f"the descriptor out of the class __dict__ entirely at class-"
+                f"creation time. Remove Advised on this class."
+            )
+        if hasattr(cls, "__attrs_attrs__"):
+            raise TypeError(
+                f"{cls.__name__}.{field_name} is Advised(...), but {cls.__name__} "
+                f"is an attrs class — Advised field advice is unsupported on "
+                f"attrs classes for the same descriptor-shadowing reason as "
+                f"dataclasses (plan 010 §Design F8.6). Remove @attr.s/@attrs.define "
+                f"or stop using Advised on this class."
+            )
+
     def _apply_interceptors(self, instance: object, cls: type) -> object:
-        """Wrap *instance* with an interceptor proxy if any interceptors apply.
+        """Wrap/arm *instance* with method AND field advice, if any interceptors apply.
 
         Finds interceptors whose ``@InterceptorBinding`` annotations overlap with
-        those on *cls*, resolves interceptor instances, and returns an
-        ``_InterceptorProxy`` wrapping the original. If no interceptors apply,
-        returns *instance* unchanged.
+        those on *cls*, resolves interceptor instances (once per bean, as
+        before), and builds THREE chains from that single walk (plan 010,
+        F8 — extended from the original method-only, one-chain version):
+
+        - ``invoke`` — ``@AroundInvoke`` methods, wrapped in an
+          ``_InterceptorProxy`` exactly as before F8.
+        - ``get`` / ``set`` — ``@AroundGet``/``@AroundSet`` methods (AspectJ
+          get/set pointcut analogues, research-F8 §AspectJ — never a CDI
+          concept), attached directly to *instance* as
+          ``__di_field_chain__`` so ``Advised.__get__``/``__set__`` can find
+          them. This attaches to the REAL target, never the proxy — a field
+          access from inside the bean's own methods (``self.balance``) never
+          goes through ``_InterceptorProxy`` at all, so the chain must live
+          where that access actually looks: the instance itself (plan 010
+          §Design F8.3).
+
+        Called after ``binding.create()`` returns, i.e. after ``__init__``,
+        class-var injection and ``@PostConstruct`` — so writes performed
+        during construction are never advised (plan 010 §Design F8.4); this
+        is a property of the call site, not a flag checked here.
 
         Args:
             instance: The fully constructed bean instance.
             cls:      The bean's implementation class.
 
         Returns:
-            The original instance, or an ``_InterceptorProxy`` wrapping it.
+            The original instance (only the ``get``/``set`` chains applied,
+            if any), or an ``_InterceptorProxy`` wrapping it (only when the
+            ``invoke`` chain is non-empty) — identical return contract to
+            the pre-F8 version when no field advice is involved.
+
+        Raises:
+            TypeError: *cls* declares an ``Advised`` field but is a
+                dataclass / pydantic ``BaseModel`` / ``attrs`` class
+                (plan 010 §Design F8.6) — checked once per class regardless
+                of whether any interceptor is even registered, because the
+                hazard (silent data corruption via descriptor/instance-dict
+                shadowing) exists independent of advice.
         """
+        # F8.6 — checked unconditionally (before the "any interceptors at
+        # all?" early-return below): the rejection is about *cls* being an
+        # unsafe Advised TARGET, not about whether advice happens to be
+        # armed today. A dataclass with an Advised field is broken the
+        # moment it's instantiated, interceptors or not.
+        advised_fields = _find_advised_fields(cls)
+        if advised_fields:
+            self._check_advised_target_supported(cls, advised_fields)
+
         if not self._interceptor_classes:
             return instance
 
@@ -1620,24 +2031,56 @@ class DIContainer:
         if not target_bindings:
             return instance
 
-        # Find interceptors that share at least one binding annotation
-        chain: list[tuple[object, str]] = []
+        # Find interceptors that share at least one binding annotation —
+        # single walk, three chains (plan 010 step 21).
+        invoke_chain: list[tuple[object, str]] = []
+        get_chain: list[tuple[object, str]] = []
+        set_chain: list[tuple[object, str]] = []
         for interceptor_cls in self._interceptor_classes:
+            matched = False
             for name in dir(interceptor_cls):
                 val = getattr(interceptor_cls, name, None)
                 if isinstance(val, type) and val in target_bindings:
-                    around_invoke = _get_around_invoke_method(interceptor_cls)
-                    if around_invoke is not None:
-                        interceptor_instance = self._resolve_constructor(
-                            interceptor_cls
-                        )
-                        chain.append((interceptor_instance, around_invoke))
+                    matched = True
                     break
+            if not matched:
+                continue
 
-        if not chain:
+            around_invoke = _get_around_invoke_method(interceptor_cls)
+            around_get_fn = _get_around_get_method(interceptor_cls)
+            around_set_fn = _get_around_set_method(interceptor_cls)
+            if (
+                around_invoke is None
+                and around_get_fn is None
+                and around_set_fn is None
+            ):
+                continue
+
+            # Shared, container-scoped singleton (see
+            # _resolve_interceptor_instance) — resolved once total, not once
+            # per bean, so a container.get(InterceptorClass) caller and this
+            # chain observe the exact same object.
+            interceptor_instance = self._resolve_interceptor_instance(interceptor_cls)
+            if around_invoke is not None:
+                invoke_chain.append((interceptor_instance, around_invoke))
+            if around_get_fn is not None:
+                get_chain.append((interceptor_instance, around_get_fn.__name__))
+            if around_set_fn is not None:
+                set_chain.append((interceptor_instance, around_set_fn.__name__))
+
+        if get_chain or set_chain:
+            # Real target, NEVER the proxy — see docstring. object.__setattr__
+            # bypasses any __setattr__ the target class defines (e.g. pydantic
+            # models), matching how _InterceptorProxy itself stores _target/
+            # _chain.
+            object.__setattr__(
+                instance, "__di_field_chain__", {"get": get_chain, "set": set_chain}
+            )
+
+        if not invoke_chain:
             return instance
 
-        return _InterceptorProxy(instance, chain)
+        return _InterceptorProxy(instance, invoke_chain)
 
     # ── Event dispatch (F7) ──────────────────────────────────────
 
@@ -2351,7 +2794,13 @@ class DIContainer:
             ``True`` if a matching binding exists, ``False`` otherwise.
         """
         # _interface_matches replaces issubclass — handles generic aliases safely
-        return any(_interface_matches(b.interface, hint) for b in self._bindings)
+        if any(_interface_matches(b.interface, hint) for b in self._bindings):
+            return True
+        # F7 (plan 010 §Design F7.3, rule 2) — deliberately checked AFTER the
+        # literal-binding scan above so a literal list[T] binding still wins
+        # (rule 1) and the hot path (the overwhelmingly common non-collection
+        # hint) pays no extra cost beyond one _multibound_inner() call.
+        return self._multibound_inner(hint) is not None
 
     def _invalidate_type_caches(self) -> None:
         """Discard every cache whose contents depend on the current binding set.
@@ -4736,6 +5185,32 @@ class DIContainer:
         for binding in self._bindings:
             binding.validate(self)
 
+        # F7 (plan 010 §Design F7.3 / research-F7 §Risks #2) — a type that is
+        # BOTH a declared collection point and has a literal list[T] binding
+        # is a real, silent ambiguity: get()/aget() always pick the literal
+        # binding (rule 1), so the collection-point contributions registered
+        # for T are never returned via list[T]. Warn (not raise — the
+        # precedence is well-defined and deterministic, just easy to miss).
+        for binding in self._bindings:
+            origin = get_origin(binding.interface)
+            if origin is not list:
+                continue
+            args = get_args(binding.interface)
+            if len(args) != 1:
+                continue
+            inner = args[0]
+            if self._is_collection_point(inner):
+                warnings.warn(
+                    f"'{_type_name(inner)}' is both a declared multibinding "
+                    f"collection point (multibind()/@Multibound) and has a "
+                    f"literal binding for '{_type_name(binding.interface)}'. "
+                    f"The literal binding always wins — "
+                    f"container.get(list[{_type_name(inner)}]) will never "
+                    f"return the collection point's contributions. "
+                    f"See DIContainer.multibind()'s docstring.",
+                    stacklevel=2,
+                )
+
     def validate_all(self) -> list[str]:
         """Validate all bindings and return a list of violation messages.
 
@@ -5473,7 +5948,7 @@ class DIContainer:
             init_hints = self._resolve_params(impl.__init__, init_owner, owner=impl)
             sig = inspect.signature(impl.__init__)
             for param_name, hint in init_hints.items():
-                spec = _classify_hint(hint)
+                spec = _classify_hint(hint, self._is_collection_point)
                 if spec is None:
                     continue
                 param = sig.parameters.get(param_name)
@@ -5487,7 +5962,7 @@ class DIContainer:
             # attribute is not a method parameter).
             class_var_owner = impl.__name__
             for attr_name, hint in self._collect_class_var_hints(impl).items():
-                spec = _classify_hint(hint)
+                spec = _classify_hint(hint, self._is_collection_point)
                 if spec is None:
                     continue
                 # Class vars have NO default fallback — _inject_class_vars_sync
@@ -5500,7 +5975,7 @@ class DIContainer:
             fn_hints = self._resolve_params(binding.fn, provider_owner)
             sig = inspect.signature(binding.fn)
             for param_name, hint in fn_hints.items():
-                spec = _classify_hint(hint)
+                spec = _classify_hint(hint, self._is_collection_point)
                 if spec is None:
                     continue
                 param = sig.parameters.get(param_name)

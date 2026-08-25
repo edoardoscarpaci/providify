@@ -119,11 +119,37 @@ def test_invocation_context_chain():
 
 def test_interceptor_markers():
     from providify.decorator.interceptor import (
+        _get_around_invoke_method,
         _is_interceptor,
         _is_interceptor_binding,
-        _get_around_invoke_method,
     )
 
     assert _is_interceptor(LoggingInterceptor)
     assert _is_interceptor_binding(Logged)
     assert _get_around_invoke_method(LoggingInterceptor) == "intercept"
+
+
+def test_intercepted_proxy_supports_attribute_write_through(container: DIContainer):
+    """Regression test for the F8.7 pre-existing _InterceptorProxy bug (plan
+    010): __slots__ = ("_target", "_chain") with no __setattr__/__delattr__
+    meant proxy.attr = value raised AttributeError instead of writing
+    through to the target — independent of field advice, exposed by it.
+    """
+    container.register(OrderService)
+    container.add_interceptor(LoggingInterceptor)
+    svc = container.get(OrderService)
+
+    svc.processed = 99  # must write through to the real target, not raise
+
+    assert svc.processed == 99
+
+
+def test_intercepted_proxy_supports_attribute_delete_through(container: DIContainer):
+    container.register(OrderService)
+    container.add_interceptor(LoggingInterceptor)
+    svc = container.get(OrderService)
+    svc.processed = 5
+
+    del svc.processed  # must delete through to the real target, not raise
+
+    assert not hasattr(svc, "processed")
