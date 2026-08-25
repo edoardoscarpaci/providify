@@ -277,13 +277,17 @@ The tree contains **more than F7/F8**. Per the session `git status`: modified
 `tests/test_field_interceptor.py`, `plans/010-multibinding-and-field-interceptors.md`,
 and three `design/**/research/*.md` briefs. Do **not** `git add -A` blindly.
 
-1. [ ] Run `git status --porcelain` and `git diff HEAD --stat` — read the list, confirm
+1. [X] Run `git status --porcelain` and `git diff HEAD --stat` — read the list, confirm
        nothing unintended (no `.venv/`, no `dist/`, no local scratch files) is staged.
        `.gitignore` already covers `.venv`, `dist/`, `.ruff_cache/`, `.pytest_cache/`
        and `CLAUDE.md` (`.gitignore:208`), so the list should be exactly the files above.
-2. [ ] Run `uv run pytest` and `uv run ruff check .` on the dirty tree **before**
+2. [X] Run `uv run pytest` and `uv run ruff check .` on the dirty tree **before**
        committing. If either fails, fix before proceeding — do not commit red.
-3. [ ] Commit as **three** commits, not one, so the history stays readable:
+       (Drift: F7/F8 was already committed as e2c3ebf; only 3 untracked docs remained.
+       `uv run pytest` was green. `uv run ruff check .` had 49 pre-existing errors
+       in already-committed code, unrelated to the 3 files being committed here —
+       handled separately, see Change Summary.)
+3. [X] Commit as **three** commits, not one, so the history stays readable:
    - a. `feat: multibinding (F7) and field interceptors (F8)` —
         `providify/decorator/multibinding.py`, `providify/field.py`,
         `providify/__init__.py`, `providify/container.py`,
@@ -303,11 +307,11 @@ With Phase 0 done, `git log --show-signature -3` shows all three commits signed.
 
 ### Phase 2 — R5 + R6: version, classifier, metadata (`pyproject.toml`)
 
-4. [ ] `pyproject.toml:3` — `version = "1.1.1"` → `version = "2.0.0"`.
-5. [ ] `pyproject.toml:22` — `"Development Status :: 3 - Alpha"` →
+4. [X] `pyproject.toml:3` — `version = "1.1.1"` → `version = "2.0.0"`.
+5. [X] `pyproject.toml:22` — `"Development Status :: 3 - Alpha"` →
        `"Development Status :: 5 - Production/Stable"` (research 001 §2, canonical
        trove classifier for a stable release).
-6. [ ] `pyproject.toml:34–35` — expand `[project.urls]`; today it has only
+6. [X] `pyproject.toml:34–35` — expand `[project.urls]`; today it has only
        `Repository`. Research 001 §2 asks for repository, documentation and bug
        tracker links:
    ```toml
@@ -318,15 +322,15 @@ With Phase 0 done, `git log --show-signature -3` shows all three commits signed.
    Changelog = "https://github.com/edoardoscarpaci/providify/blob/main/CHANGELOG.md"
    Issues = "https://github.com/edoardoscarpaci/providify/issues"
    ```
-7. [ ] `pyproject.toml:11–20` — keywords: leave as-is. Scout confirmed the existing
+7. [X] `pyproject.toml:11–20` — keywords: leave as-is. Scout confirmed the existing
        eight (`dependency injection`, `di`, `ioc`, `inversion of control`,
        `container`, `async`, `jakarta`, `spring`) are adequate; R6 is satisfied by
        the URLs. Optional single addition if desired: `"injection"`.
-8. [ ] **`uv lock`** — `uv.lock:51–52` pins `name = "providify" / version = "1.1.1"`
+8. [X] **`uv lock`** — `uv.lock:51–52` pins `name = "providify" / version = "1.1.1"`
        for the editable root package. If the lock is not regenerated, CI's
        `uv sync --locked` will **fail** with an out-of-date-lockfile error on every
        job. Run `uv lock` and commit the changed `uv.lock`.
-9. [ ] Commit: `chore(release): bump version to 2.0.0, mark Production/Stable, expand project URLs`.
+9. [X] Commit: `chore(release): bump version to 2.0.0, mark Production/Stable, expand project URLs`.
 
 **Verify:** `uv sync --locked` succeeds (proves the lock matches). `uv build` produces
 `dist/providify-2.0.0-py3-none-any.whl` and `dist/providify-2.0.0.tar.gz`.
@@ -339,10 +343,11 @@ line 10 reads `## [Unreleased] — v0.2.0` while PyPI has 1.1.1. Lines 11–566 
 large body documenting the F1–F9 work; lines 569–625 hold `[0.1.7]` down to `[0.1.3]`
 plus link refs.
 
-10. [ ] Run `git tag --list` first. The result decides the compare links below:
-        if `v1.1.1` exists use `v1.1.1...v2.0.0`, otherwise `v0.1.7...v2.0.0`
-        (existing refs stop at `v0.1.7`, `CHANGELOG.md:619–620`).
-11. [ ] Replace line 10 `## [Unreleased] — v0.2.0` with, in order:
+10. [X] Run `git tag --list` first. Result: no tags exist at all (not `v1.1.1`, not
+        `v0.1.7`). Both plan-offered options would produce broken links, so the
+        `[2.0.0]` link ref uses the releases/tag URL instead of a `compare/` URL
+        against a nonexistent tag (see step 14).
+11. [X] Replace line 10 `## [Unreleased] — v0.2.0` with, in order:
     ```markdown
     ## [Unreleased]
 
@@ -361,22 +366,21 @@ plus link refs.
     ```
     Keep the existing `### Added` / `### Changed` / `### Fixed` body (lines 11–566)
     underneath the new `## [2.0.0]` heading unchanged.
-12. [ ] Skim the body for F7/F8 coverage. The `### Fixed` entry at
-        `CHANGELOG.md:558–565` (`_InterceptorProxy` attribute writes) references F8,
-        but confirm there are `### Added` entries for `Multibound` (F7) and
-        `Advised` / `FieldAccessContext` / `AroundGet` / `AroundSet` (F8) — those
-        symbols are exported from `providify/__init__.py:111–116`, so a user-visible
-        changelog entry is mandatory. Add them if missing, using
-        `plans/010-multibinding-and-field-interceptors.md` as the source.
-13. [ ] Add a `### Changed` bullet in `[2.0.0]`: "PyPI classifier upgraded from
+12. [X] Skim the body for F7/F8 coverage. The `### Fixed` entry
+        (`_InterceptorProxy` attribute writes) references F8, and `### Added`
+        entries for `Multibound` (F7) and `Advised` / `FieldAccessContext` /
+        `AroundGet` / `AroundSet` (F8) were already present in the body — no
+        additions needed.
+13. [X] Add a `### Changed` bullet in `[2.0.0]`: "PyPI classifier upgraded from
         `3 - Alpha` to `5 - Production/Stable`."
-14. [ ] `CHANGELOG.md:619` — replace the link-ref block tail:
+14. [X] Replace the link-ref block tail:
     ```markdown
     [Unreleased]: https://github.com/edoardoscarpaci/providify/compare/v2.0.0...HEAD
-    [2.0.0]: https://github.com/edoardoscarpaci/providify/compare/v0.1.7...v2.0.0
+    [2.0.0]: https://github.com/edoardoscarpaci/providify/releases/tag/v2.0.0
     ```
-    (second URL adjusted per step 10) and leave `[0.1.7]`…`[0.1.3]` untouched.
-15. [ ] Commit: `docs(changelog): consolidate stale Unreleased section into [2.0.0]`.
+    (no tags exist at all — see step 10 — so `[2.0.0]` uses the releases/tag URL,
+    not a `compare/` URL) and leave `[0.1.7]`…`[0.1.3]` untouched.
+15. [X] Commit: `docs(changelog): consolidate stale Unreleased section into [2.0.0]`.
 
 **Verify:** `grep -n "^## \[" CHANGELOG.md` shows `[Unreleased]`, `[2.0.0]`, `[0.1.7]`, …
 in descending order; `grep -n "v0.2.0" CHANGELOG.md` returns nothing; every `## [x]`
@@ -387,7 +391,7 @@ heading has a matching `[x]:` link ref at the bottom.
 Research 001 §4 treats both as table-stakes per the OpenSSF Project Security
 Baseline 2025-10-10. Both are new files (scout: neither exists).
 
-16. [ ] Create `CONTRIBUTING.md` with these sections:
+16. [X] Create `CONTRIBUTING.md` with these sections:
     - `## Getting set up` — `uv sync`, `make install`; requires Python 3.12+.
     - `## Running the checks` — `make test` (`uv run pytest`, `Makefile:6–7`),
       `make lint` (`uv run ruff check .`, `Makefile:9–10`), `make format-check`.
@@ -415,7 +419,7 @@ Baseline 2025-10-10. Both are new files (scout: neither exists).
       `astral-sh/setup-uv`, `pypa/gh-action-pypi-publish`, `actions/upload-artifact`,
       `actions/download-artifact`, `ossf/scorecard-action`, `github/codeql-action`).
       Skip if you want strict R7-only scope.
-17. [ ] Create `SECURITY.md` with (research 001 §4):
+17. [X] Create `SECURITY.md` with (research 001 §4):
     - `## Supported versions` — a small table: `2.x` ✅ supported, `< 2.0` ❌ not.
     - `## Reporting a vulnerability` — **primary channel: GitHub private
       vulnerability reporting** (Security tab → "Report a vulnerability");
@@ -427,10 +431,11 @@ Baseline 2025-10-10. Both are new files (scout: neither exists).
     - `## Scope` — providify is a library with no network/IO surface of its own;
       report issues in resolution/scanning that could execute unintended code or
       leak configuration values.
-18. [ ] `README.md` — add two links near the bottom (or in an existing "Contributing"
+18. [X] `README.md` — add two links near the bottom (or in an existing "Contributing"
         area if one exists) pointing at `CONTRIBUTING.md` and `SECURITY.md`, so they
-        are discoverable from the landing page.
-19. [ ] Commit: `docs: add CONTRIBUTING.md and SECURITY.md`.
+        are discoverable from the landing page. (Also applied the optional Phase 6
+        step 28 `pip install` / `uv add` fix here since it touches the same file.)
+19. [X] Commit: `docs: add CONTRIBUTING.md and SECURITY.md`.
 
 **Verify:** `ls CONTRIBUTING.md SECURITY.md`; GitHub renders both in the repo's
 Insights → Community Standards checklist (CODE_OF_CONDUCT will show as missing —
@@ -441,7 +446,7 @@ that is expected and parked).
 `.github/` does not exist at all — create it. Action versions and the uv matrix
 config come from research 002 §1 and §2.
 
-20. [ ] Create `.github/workflows/ci.yml`:
+20. [X] Create `.github/workflows/ci.yml` (format-check step dropped — see step 21 note):
     ```yaml
     name: CI
 
@@ -494,7 +499,11 @@ config come from research 002 §1 and §2.
     - ⚠️ **The job name here becomes the required-status-check name in Phase 8b.**
       With this matrix the check runs are `test (3.12)` and `test (3.13)`. If you
       rename the job, Appendix A row 3 changes with it.
-21. [ ] Commit: `ci: add GitHub Actions test matrix (3.12, 3.13) with ruff gating`.
+21. [X] Commit: `ci: add GitHub Actions test matrix (3.12, 3.13) with ruff gating`.
+    (Deviation: dropped the "Format check" step — `ruff format --check .` flags 55
+    of 83 files on this never-format-gated tree, the repo actually uses black via
+    pre-commit. Per the Edge Cases guidance, ci.yml ships without that step rather
+    than bundling a sprawling reformat into the release.)
 
 **Verify:** push the branch; the `CI / test (3.12)` and `CI / test (3.13)` checks both
 pass on GitHub. Locally, the same commands must pass first:
@@ -505,7 +514,7 @@ it block the release.
 
 ### Phase 5b — R3: release workflow (repo side)
 
-22. [ ] Create `.github/workflows/release.yml`:
+22. [X] Create `.github/workflows/release.yml`:
     ```yaml
     name: Release
 
@@ -578,7 +587,7 @@ it block the release.
     attestations are on by default, do **not** pass `attestations: false` —
     research 002 §6. `fetch-tags: true` is safe on `actions/checkout@v7`
     (fixed in v6.0.2+, research 002 §5 §Fetch-tags fix).
-23. [ ] Commit: `ci: add tag-triggered PyPI release workflow via OIDC trusted publishing`.
+23. [X] Commit: `ci: add tag-triggered PyPI release workflow via OIDC trusted publishing`.
         **This commit must exist before the `v2.0.0` tag is created** — a tag-triggered
         workflow only runs if the workflow file is present in the tagged commit.
 
@@ -627,7 +636,7 @@ These are the **only two** hardening items from 003 that are files. Everything e
 that brief is a UI toggle and lives in Phase 8a/8b. Do this in the same working pass as
 5a and 5b — it is all `.github/` work — and treat 5c as the separate browser session.
 
-P5d.1 [ ] Create `.github/dependabot.yml` (003 §6C, Appendix A row 22):
+P5d.1 [X] Create `.github/dependabot.yml` (003 §6C, Appendix A row 22):
 ```yaml
 version: 2
 updates:
@@ -658,7 +667,7 @@ Three deliberate deviations from the brief's template, all defensible:
   Scorecard's `Dependency-Update-Tool` check looks for (003 §8). See Risks for the
   uv/`[dependency-groups]` caveat.
 
-P5d.2 [ ] Create `.github/workflows/scorecard.yml` (003 §8, Appendix A row 34) —
+P5d.2 [X] Create `.github/workflows/scorecard.yml` (003 §8, Appendix A row 34) —
 this is a **corrected** version of the brief's template:
 ```yaml
 name: OpenSSF Scorecard
@@ -699,12 +708,13 @@ is superseded by `@v3`; `persist-credentials: false` follows the action's own RE
 The `@v2.4.0` pin is a **guess** — check the releases page before committing, same
 discipline as the Phase 5a/5b action pins.
 
-P5d.3 [ ] *Decision point:* skipping Scorecard entirely is legitimate. It is SHOULD,
+P5d.3 [X] *Decision point:* skipping Scorecard entirely is legitimate. It is SHOULD,
 not MUST (Appendix A row 34). Skipping costs the badge and the weekly security-tab
 report; it does not affect the release, PyPI, or any other phase. If you skip, delete
 this step and rows 34–35 from Appendix A so the checklist stays honest.
+(Decision: do NOT skip — per task instructions, Scorecard workflow was created.)
 
-P5d.4 [ ] Commit: `ci: add Dependabot config and OpenSSF Scorecard workflow`.
+P5d.4 [X] Commit: `ci: add Dependabot config and OpenSSF Scorecard workflow`.
 
 **Verify:** `ls .github/dependabot.yml .github/workflows/scorecard.yml`. After pushing,
 Insights → Dependency graph → Dependabot lists both ecosystems with a "last checked"
@@ -728,12 +738,12 @@ trip. Row numbers refer to **Appendix A**.
       here is what turns Phase 8b's "Require linear history" rule into a no-op rather
       than a trap — the UI will simply not offer the forbidden button (003 §7B).
 
-8a.3 [ ] **Repo home → About → ⚙** (row 33): one-line description (reuse
+8a.3 [X] **Repo home → About → ⚙** (row 33): one-line description (reuse
       `pyproject.toml:4`, trimmed), Website → `https://pypi.org/project/providify/`,
       Topics → `python`, `dependency-injection`, `di`, `ioc`, `async`, `library`.
       Discoverability, not security — but free.
 
-8a.4 [ ] **Settings → Actions → General** (rows 15–17):
+8a.4 [X] **Settings → Actions → General** (rows 15–17):
       - *Workflow permissions* → "Read repository contents and packages permissions".
         **Verify only** — read-only has been the default since Feb 2023 (003 §4). The
         `publish` job escalates to `id-token: write` in its own `permissions:` block,
@@ -746,7 +756,7 @@ trip. Row numbers refer to **Appendix A**.
         first-time contributors who are new to GitHub". Blocks drive-by bot accounts
         without taxing real contributors (003 §4).
 
-8a.5 [ ] **Settings → Code security** (rows 20–26), top to bottom:
+8a.5 [X] **Settings → Code security** (rows 20–26), top to bottom:
       - Dependabot alerts → **Enable**
       - Dependabot security updates → **Enable**
       - Secret scanning → **Enable**
@@ -771,7 +781,7 @@ string shaped like an AWS key and try to push — it must be refused.
 
 ### Phase 6 — R9: README badges
 
-27. [ ] `README.md` — insert a badge block immediately after the title/description
+27. [X] `README.md` — insert a badge block immediately after the title/description
         (currently lines 1–4, before the `---` at line 6):
     ```markdown
     [![CI](https://github.com/edoardoscarpaci/providify/actions/workflows/ci.yml/badge.svg)](https://github.com/edoardoscarpaci/providify/actions/workflows/ci.yml)
@@ -782,7 +792,7 @@ string shaped like an AWS key and try to push — it must be refused.
     badge — not required by the backlog. The OpenSSF Scorecard badge (Appendix A row 35)
     also belongs in this block, but only add it after the Scorecard workflow from Phase
     5d has actually produced a result — see step 8b.6.
-28. [ ] *(Optional, not in the backlog — one line, recommended)* `README.md:10–12`
+28. [X] *(Optional, not in the backlog — one line, recommended)* `README.md:10–12`
         tells users to install with `poetry install`, which is a contributor command,
         not an install instruction for a stable release. Consider
         ```bash
@@ -790,7 +800,8 @@ string shaped like an AWS key and try to push — it must be refused.
         # or: uv add providify
         ```
         Skip if you want strict zero-scope-creep.
-29. [ ] Commit: `docs(readme): add CI and PyPI badges`.
+        (Applied in the Phase 4 commit `f9e1b6f` since it touches the same file.)
+29. [X] Commit: `docs(readme): add CI and PyPI badges`.
 
 **Verify:** after the CI workflow has run at least once on the default branch, the CI
 badge renders green rather than "no status"; the PyPI badge shows `2.0.0` only after
