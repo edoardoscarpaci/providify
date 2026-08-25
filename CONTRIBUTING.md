@@ -18,20 +18,32 @@ dependency group (pytest, pytest-asyncio, ruff, PyYAML, pydantic).
 ```bash
 make test           # uv run pytest
 make lint            # uv run ruff check .
-make format-check    # uv run ruff format --check .
+make format-check    # uv run ruff format --check . && uv run ruff check .
 ```
 
-**CI gates on ruff (lint + format) and pytest only — there is no type-check
-gate.** No mypy, pyright, or basedpyright is configured today. That is a
-deliberate, documented decision for this release, not an oversight; adopting
-a type checker means triaging findings across the whole public API and is
-tracked as separate future work, not a contribution requirement.
+**CI gates on ruff *lint* and pytest only — there is no type-check gate and
+no format gate.** `.github/workflows/ci.yml` runs `uv run ruff check .` and
+`uv run pytest`; it deliberately does **not** run `ruff format --check .` —
+this codebase is currently formatted with `black` via a local pre-commit
+hook rather than `ruff format`, so gating CI on `ruff format --check` would
+fail on most of the tree today. `make format-check` still exists locally as
+a preview of what a future `ruff format` migration would flag, but it is not
+what CI enforces — don't be surprised if it disagrees with `black`. No mypy,
+pyright, or basedpyright is configured either; that is a deliberate,
+documented decision for this release, not an oversight; adopting a type
+checker means triaging findings across the whole public API and is tracked
+as separate future work, not a contribution requirement.
 
 ## Coding standards
 
 - Ruff configuration lives in `pyproject.toml` (`[tool.ruff]` /
   `[tool.ruff.lint]`): line-length 100, target `py312`, rule sets `E`, `F`,
-  `I`, `UP`, double-quote strings.
+  `I`, `UP`, double-quote strings. `E501` (line-too-long) is ignored because
+  line length is enforced by the formatter, not the linter; `UP046`/`UP047`
+  (PEP 695 generic syntax) are also ignored — migrating the public generic
+  API (`Component`/`Provider`/`Singleton`/... decorators, `LazyProxy`,
+  `InstanceProxy`, `EventProxy`, ...) to `class Foo[T]:` / `def foo[T]`
+  syntax is real but separate future work, not a v2.0.0 requirement.
 - Public API (anything exported from `providify/__init__.py`) needs a
   complete docstring: `Args` / `Returns` / `Raises`, plus an `Example` where
   it helps.

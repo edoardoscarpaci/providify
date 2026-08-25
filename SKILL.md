@@ -8,7 +8,7 @@
 
 **Providify** is a zero-dependency Python dependency injection (DI) container library inspired by Jakarta CDI and Spring Framework. It automates constructor injection via type hints, manages component lifecycles across multiple scopes, and supports both synchronous and asynchronous resolution patterns.
 
-- **Version:** 0.1.7 (dev — see pyproject.toml for current tag)
+- **Version:** 2.0.0 (see `pyproject.toml` for the current version)
 - **Python:** 3.12+
 - **License:** Apache-2.0
 - **Dependencies:** None (stdlib only)
@@ -615,9 +615,8 @@ Tests live in `tests/`. Each test class is fully self-contained.
 
 **Run tests:**
 ```bash
-cd tests
-poetry install
-poetry run pytest
+uv sync
+uv run pytest
 ```
 
 ---

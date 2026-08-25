@@ -2099,9 +2099,8 @@ long-lived app container is exposed.
 ## Running tests
 
 ```bash
-cd tests
-poetry install
-poetry run pytest
+uv sync
+uv run pytest
 ```
 
 Tests are organised by feature — one file per subsystem:
