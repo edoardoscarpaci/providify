@@ -3,13 +3,13 @@ repos:
     rev: v0.4.1
     hooks:
       - id: ruff
-        args: [--fix]  # Auto-fix what it can
+        args: [--fix --format]  # Auto-fix what it can
 
-  # Optional: also auto-format with black
-  - repo: https://github.com/psf/black
-    rev: 24.3.0
-    hooks:
-      - id: black
+  ## Optional: also auto-format with black
+  #- repo: https://github.com/psf/black
+  #  rev: 24.3.0
+  #  hooks:
+  #    - id: black
 
   - repo: local
     hooks:
