@@ -27,7 +27,6 @@ from providify.binding import ClassBinding, ProviderBinding
 from providify.container import DIContainer
 from providify.decorator.scope import Component, Provider, Singleton
 
-
 # ─────────────────────────────────────────────────────────────────
 #  Shared fixtures — small domain types reused across test classes
 # ─────────────────────────────────────────────────────────────────

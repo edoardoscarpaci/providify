@@ -23,7 +23,6 @@ from __future__ import annotations
 #      e.g. Repository[Dog] does NOT match Repository[Animal] even if Dog ⊆ Animal
 #   ❌ TypeVar-parameterised aliases (e.g. Repository[T]) won't match concrete
 #      requests — TypeVars are resolved at class-definition time, not here
-
 from typing import Any, get_args, get_origin
 
 

@@ -22,7 +22,6 @@ from providify.container import DIContainer
 from providify.decorator.scope import Component, Singleton
 from providify.type import Lazy, LazyMeta, LazyProxy
 
-
 # ─────────────────────────────────────────────────────────────────
 #  Domain types
 # ─────────────────────────────────────────────────────────────────
@@ -188,7 +187,7 @@ class TestLazyInjection:
 
         @Singleton
         class A:
-            def __init__(self, b: Lazy["B"]) -> None:  # type: ignore[valid-type]
+            def __init__(self, b: Lazy[B]) -> None:  # type: ignore[valid-type]
                 self.b = b
 
         @Singleton

@@ -20,13 +20,13 @@ in _resolve_hint_sync and acts on the metadata.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
-from typing import ClassVar, Optional, Union
 
 from providify.container import DIContainer
 from providify.decorator.scope import Component
-from providify.type import Inject, InjectInstances, Lazy, Live, LazyProxy, LiveProxy
-
+from providify.type import Inject, InjectInstances, Lazy, LazyProxy, Live, LiveProxy
 
 # ─────────────────────────────────────────────────────────────────
 #  Domain types
@@ -729,7 +729,7 @@ class TestUnionOptionalInjection:
 
         @Component
         class Consumer:
-            def __init__(self, dep: Optional[_UnionDep]) -> None:
+            def __init__(self, dep: _UnionDep | None) -> None:
                 self.dep = dep
 
         container.register(_UnionDep)
@@ -743,7 +743,7 @@ class TestUnionOptionalInjection:
 
         @Component
         class Consumer:
-            def __init__(self, dep: Optional[_UnionMissingDep] = None) -> None:
+            def __init__(self, dep: _UnionMissingDep | None = None) -> None:
                 self.dep = dep
 
         # _UnionMissingDep intentionally NOT registered — no binding exists for it
@@ -790,7 +790,7 @@ class TestUnionOptionalInjection:
 
         @Component
         class Consumer:
-            def __init__(self, dep: Union[_UnionT1, _UnionMissingDep]) -> None:
+            def __init__(self, dep: _UnionT1 | _UnionMissingDep) -> None:
                 self.dep = dep
 
         # Register T1 only — T2 (_UnionMissingDep) has no binding
@@ -805,7 +805,7 @@ class TestUnionOptionalInjection:
 
         @Component
         class Consumer:
-            def __init__(self, dep: Union[_UnionMissingDep, _UnionT2]) -> None:
+            def __init__(self, dep: _UnionMissingDep | _UnionT2) -> None:
                 self.dep = dep
 
         # Register T2 only — T1 (_UnionMissingDep) has no binding
@@ -822,9 +822,7 @@ class TestUnionOptionalInjection:
 
         @Component
         class Consumer:
-            def __init__(
-                self, dep: Union[_UnionUnresolvable1, _UnionUnresolvable2]
-            ) -> None:
+            def __init__(self, dep: _UnionUnresolvable1 | _UnionUnresolvable2) -> None:
                 self.dep = dep
 
         # Neither _UnionUnresolvable1 nor _UnionUnresolvable2 are registered
@@ -841,7 +839,7 @@ class TestUnionOptionalInjection:
         @Component
         class Consumer:
             def __init__(
-                self, dep: Union[_UnionUnresolvable1, _UnionUnresolvable2, None] = None
+                self, dep: _UnionUnresolvable1 | _UnionUnresolvable2 | None = None
             ) -> None:
                 self.dep = dep
 
@@ -859,7 +857,7 @@ class TestUnionOptionalInjection:
         @Component
         class Consumer:
             def __init__(
-                self, dep: Union[_UnionT1, _UnionUnresolvable1, None] = None
+                self, dep: _UnionT1 | _UnionUnresolvable1 | None = None
             ) -> None:
                 self.dep = dep
 

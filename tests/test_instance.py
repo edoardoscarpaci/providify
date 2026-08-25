@@ -77,7 +77,6 @@ from providify.decorator.scope import (
 )
 from providify.type import Instance, InstanceMeta, InstanceProxy
 
-
 # ─────────────────────────────────────────────────────────────────
 #  Domain types shared across all test classes
 # ─────────────────────────────────────────────────────────────────

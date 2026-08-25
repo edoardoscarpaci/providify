@@ -24,7 +24,6 @@ from providify.exceptions import (
 )
 from providify.metadata import Scope
 
-
 # ─────────────────────────────────────────────────────────────────
 #  Domain types used across binding tests
 # ─────────────────────────────────────────────────────────────────

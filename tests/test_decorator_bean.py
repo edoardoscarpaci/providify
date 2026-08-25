@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from providify import (
     Decorator,
     Delegate,
@@ -9,7 +11,6 @@ from providify import (
     DIContainer,
     Singleton,
 )
-from typing import Annotated
 
 
 class Notifier:
@@ -59,7 +60,7 @@ def test_decorator_marker_stamped():
 
 def test_delegate_alias_produces_annotated():
     ann = Delegate[Notifier]
-    from typing import get_origin, get_args, Annotated
+    from typing import Annotated, get_args, get_origin
 
     assert get_origin(ann) is Annotated
     args = get_args(ann)

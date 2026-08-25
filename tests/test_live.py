@@ -40,7 +40,6 @@ from providify.decorator.scope import RequestScoped, SessionScoped, Singleton
 from providify.exceptions import LiveInjectionRequiredError
 from providify.type import Inject, Lazy, Live, LiveMeta, LiveProxy
 
-
 # ─────────────────────────────────────────────────────────────────
 #  Domain types
 # ─────────────────────────────────────────────────────────────────

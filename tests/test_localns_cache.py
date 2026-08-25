@@ -22,10 +22,8 @@ the lookup with every registered class, making locally-defined deps resolvable.
 
 from __future__ import annotations
 
-
 from providify.container import DIContainer
 from providify.decorator.scope import Component, Provider, Singleton
-
 
 # ─────────────────────────────────────────────────────────────────
 #  Module-level sentinel for provider return-type tests

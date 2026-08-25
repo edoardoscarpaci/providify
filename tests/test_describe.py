@@ -33,13 +33,11 @@ Covered:
 
 from __future__ import annotations
 
-
 from providify.binding import BindingDescriptor, ClassBinding, ProviderBinding
 from providify.container import DIContainer
 from providify.decorator.scope import Component, Provider, Singleton
 from providify.metadata import Scope
 from providify.type import Inject
-
 
 # ─────────────────────────────────────────────────────────────────
 #  Leaf — no constructor parameters; acts as the bottom of any dep chain.

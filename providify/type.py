@@ -8,11 +8,10 @@ from typing import (
     Any,
     ClassVar,
     Generic,
-    Type,
     TypeVar,
-    overload,
-    get_origin,
     get_args,
+    get_origin,
+    overload,
 )
 
 # TYPE_CHECKING guard — DIContainer is only imported for the type checker.
@@ -198,7 +197,7 @@ class _InjectedInstancesAlias:
     @overload
     def __getitem__(
         self, tp: type[T]
-    ) -> Type[list[T]]: ...  # InjectedInstances[T] → list[T] for checker
+    ) -> type[list[T]]: ...  # InjectedInstances[T] → list[T] for checker
     @overload
     def __getitem__(self, tp: Any) -> Any: ...  # fallback
     def __getitem__(
@@ -209,7 +208,7 @@ class _InjectedInstancesAlias:
     @overload
     def __call__(
         self, tp: type[T], *, qualifier: str | type | None = ...
-    ) -> Type[list[T]]: ...
+    ) -> type[list[T]]: ...
     @overload
     def __call__(self, tp: Any, *, qualifier: str | type | None = ...) -> Any: ...
 

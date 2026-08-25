@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Annotated
+
 import pytest
 
 from providify import (
@@ -13,7 +15,6 @@ from providify import (
     ObservesMarker,
     Singleton,
 )
-from typing import Annotated
 
 
 class OrderPlaced:
@@ -69,7 +70,7 @@ def test_subtype_events_match_supertype_observer(container: DIContainer):
 
 def test_event_alias_produces_annotated():
     ann = Event[OrderPlaced]
-    from typing import get_origin, get_args, Annotated
+    from typing import Annotated, get_args, get_origin
 
     assert get_origin(ann) is Annotated
     args = get_args(ann)

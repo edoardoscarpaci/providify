@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from providify import (
     Component,
     Default,
@@ -9,7 +11,6 @@ from providify import (
     InjectMeta,
     Singleton,
 )
-from typing import Annotated
 
 
 class Service:

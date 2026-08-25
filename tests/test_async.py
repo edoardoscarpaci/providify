@@ -19,7 +19,6 @@ import pytest
 from providify.container import DIContainer
 from providify.decorator.scope import Component, Provider, Singleton
 
-
 # ─────────────────────────────────────────────────────────────────
 #  Domain types
 # ─────────────────────────────────────────────────────────────────

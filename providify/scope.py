@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
-import uuid
 import threading
-from contextlib import contextmanager, asynccontextmanager
+import uuid
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
-from typing import Any, Awaitable, Callable, Generator, AsyncGenerator
+from typing import Any
 
 logger = logging.getLogger(__name__)
 

@@ -20,7 +20,6 @@ import pytest
 
 from providify import DIContainer, Provider, Singleton
 
-
 # ─────────────────────────────────────────────────────────────────
 #  Domain types — simple singletons with construction counters
 # ─────────────────────────────────────────────────────────────────

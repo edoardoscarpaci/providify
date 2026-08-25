@@ -19,11 +19,10 @@ from __future__ import annotations
 
 import pytest
 
+from providify.binding import BindingDescriptor
 from providify.container import DIContainer, DIContainerDescriptor
 from providify.decorator.scope import Component, Provider, Singleton
-from providify.binding import BindingDescriptor
 from providify.metadata import Scope
-
 
 # ─────────────────────────────────────────────────────────────────
 #  Domain fixtures

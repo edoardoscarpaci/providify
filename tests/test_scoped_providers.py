@@ -35,12 +35,11 @@ import pytest
 
 from providify.container import DIContainer
 from providify.decorator.scope import (
+    Provider,
     Singleton,
 )
-from providify.decorator.scope import Provider
 from providify.metadata import Scope
 from providify.type import Inject, Live, LiveProxy
-
 
 # ─────────────────────────────────────────────────────────────────
 #  Domain types — shared across test classes
@@ -474,8 +473,8 @@ class TestProviderScopeLeakDetection:
         Args:
             container: Fresh container.
         """
-        from providify.exceptions import LiveInjectionRequiredError
         from providify.decorator.scope import RequestScoped
+        from providify.exceptions import LiveInjectionRequiredError
 
         @RequestScoped
         class CurrentRequest:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Annotated
+
 import pytest
 
 from providify import (
@@ -11,7 +13,6 @@ from providify import (
     NamedMeta,
     Singleton,
 )
-from typing import Annotated
 
 
 class Cache:
