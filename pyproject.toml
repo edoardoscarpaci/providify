@@ -66,7 +66,14 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
-ignore = ["E501"]
+# E501: line-length is enforced by the formatter, not the linter.
+# UP046/UP047: flag `Generic[T]` subclasses and generic functions that predate
+# PEP 695 `class Foo[T]:` / `def foo[T]` syntax. Migrating providify's public
+# generic API (Component/Provider/Singleton/... decorators, LazyProxy,
+# InstanceProxy, EventProxy, ...) is a real but separate piece of work, not a
+# v2.0.0 packaging-release change — ignored here rather than silently drifting
+# to red the moment the CI lint gate (Phase 5a) lands.
+ignore = ["E501", "UP046", "UP047"]
 
 [tool.ruff.format]
 quote-style = "double"
