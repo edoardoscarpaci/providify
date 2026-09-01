@@ -9,7 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- `IssueKind.UNREACHABLE_PRE_DESTROY` — `container.validate()` now reports a
+  `WARNING` when a `SINGLETON`-scoped `@Provider` has no `@Disposes` disposer
+  and the type it produces carries a `@PreDestroy` hook that will therefore
+  never run. This mirrors Jakarta CDI: instances returned from a producer
+  method receive no lifecycle callbacks, so `@Disposes` is the only teardown
+  path for them. See `plans/012-unreachable-pre-destroy-validation.md`.
+  ⚠️ This can newly make a previously-clean `report.ok` `False` for containers
+  that have this pattern — it is a `WARNING`, so `validate(raise_on_error=True)`
+  (the default) still does not raise for it; a gate that inspects
+  `report.errors` only will not see it.
+
+### Changed
+
+- `@PreDestroy` / `@Disposes` docstrings (`providify/decorator/lifecycle.py`)
+  and the README corrected to state that `@PreDestroy` applies to class
+  bindings only, and that `@Disposes` is the teardown path for
+  provider-produced instances.
 
 ---
 

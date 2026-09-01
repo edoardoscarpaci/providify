@@ -942,6 +942,12 @@ Called when a cached instance is about to be discarded. Fires in two situations:
 
 `DEPENDENT` instances are not owned by the container and are never destroyed automatically.
 
+> `@PreDestroy` is **not** called for `@Provider`-produced instances — use
+> [`@Disposes`](#disposes--provider-teardown) instead. `container.validate()`
+> reports `UNREACHABLE_PRE_DESTROY` (a `WARNING`) when a singleton provider
+> produces a type carrying a `@PreDestroy` hook and has no `@Disposes` to
+> reach it.
+
 ```python
 from providify import PreDestroy
 
@@ -1011,6 +1017,8 @@ container.shutdown()   # close_conn(conn) is called here ✅
 ```
 
 `@Disposes` is only triggered for **SINGLETON-scoped providers** that have a cached instance. DEPENDENT providers are not tracked and their disposers are never called.
+
+`@Disposes` is the teardown mechanism for provider-produced instances — `@PreDestroy` is never invoked on an object returned from a `@Provider` (see the note above). `container.validate()` flags the missing case: a singleton provider whose produced type carries `@PreDestroy` but has no `@Disposes` reports an `UNREACHABLE_PRE_DESTROY` warning.
 
 ### DEPENDENT scope tracking — `track=True`
 
@@ -1516,12 +1524,18 @@ if not report.ok:
 `validate()` is a superset of `validate_bindings()` / `validate_all()`: those
 two remain unchanged (scope-leak tier only, triggered automatically on the
 first `get()`/`aget()`); `validate()` adds the whole-graph checks — missing
-bindings, ambiguous bindings, and static cycle detection — that only a full
-walk can catch, and never mutates state (no `create()`, no cache write, no
+bindings, ambiguous bindings, static cycle detection, and unreachable
+`@PreDestroy` hooks on provider-produced types — that only a full walk can
+catch, and never mutates state (no `create()`, no cache write, no
 `@PostConstruct`). The report/issue types (`ValidationReport`,
 `ValidationIssue`, `IssueKind`, `Severity`) live in `providify/validation.py`;
 see the `validate()` docstring in `providify/container.py` for the full
 per-issue-kind breakdown (which forms are `ERROR` vs `WARNING` and why).
+
+`report.ok` is `False` for **any** issue, warnings included — but
+`validate(raise_on_error=True)` only raises on `ERROR`-severity issues.
+A gate that must also catch `WARNING` issues like `UNREACHABLE_PRE_DESTROY`
+needs to inspect `report.issues` (or `report.ok`), not just `report.errors`.
 
 ---
 

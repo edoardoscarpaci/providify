@@ -284,6 +284,7 @@ class Database:
 - Hooks are detected via MRO walk and are inheritable.
 - `@PreDestroy` fires in two situations: (1) `shutdown()` / `ashutdown()` for every cached singleton, and (2) automatically when a `request()` / `session()` scope block exits for any `@RequestScoped` / `@SessionScoped` instance cached in that scope.
 - `DEPENDENT` instances are never tracked by the container — `@PreDestroy` is never called on them.
+- `@PreDestroy` is **never called on `@Provider`-produced instances** — those are not container-managed (Jakarta CDI: producer-returned objects receive no lifecycle callbacks). Use `@Disposes` for provider teardown instead. `container.validate()` reports `IssueKind.UNREACHABLE_PRE_DESTROY` (a `WARNING`) when a singleton provider produces a type carrying `@PreDestroy` and has no `@Disposes`.
 - Async `@PreDestroy` hooks on scoped (REQUEST/SESSION) instances are silently skipped if the scope exits via the **sync** `request()` / `session()` context manager. Use `arequest()` / `asession()` when async teardown is needed.
 
 ### Configuration Modules (grouping namespace for `@Provider` / `@Produces`)

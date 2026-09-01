@@ -89,6 +89,11 @@ class IssueKind(StrEnum):
     #: `AnnotationResolutionError`. The binding's edges are omitted from the
     #: graph walk (partial graph, never silently "no dependencies").
     UNRESOLVED_ANNOTATION = "unresolved_annotation"
+    #: A `SINGLETON`-scoped `ProviderBinding` has no `@Disposes` disposer and
+    #: the type it produces carries a `@PreDestroy` hook that will therefore
+    #: never run. Mirrors Jakarta CDI: producer-returned objects receive no
+    #: lifecycle callbacks, so `@Disposes` is the only teardown path for them.
+    UNREACHABLE_PRE_DESTROY = "unreachable_pre_destroy"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -116,9 +121,13 @@ class ValidationIssue:
                     — safe to print directly to a log or console.
         param_name: The specific parameter/class-attribute name, when known.
                     ``None`` for graph-level issues (e.g. cycles) that are
-                    not anchored to a single parameter.
+                    not anchored to a single parameter. For
+                    ``UNREACHABLE_PRE_DESTROY``, the unreachable hook's
+                    method name.
         requested:  ``_type_name()`` of the type the injection point asked
-                    for. ``None`` when not applicable (e.g. cycles).
+                    for. ``None`` when not applicable (e.g. cycles). For
+                    ``UNREACHABLE_PRE_DESTROY``, the type the provider
+                    produces.
         qualifier:  The qualifier the injection point requested, if any.
         candidates: Populated only for ``AMBIGUOUS_BINDING`` — the
                     human-readable names of every tied candidate.
@@ -258,17 +267,13 @@ class ValidationReport:
         Returns:
             Multi-line string; a single header line when ``issues`` is empty.
         """
-        header = (
-            f"ValidationReport(checked_bindings={self.checked_bindings}, ok={self.ok})"
-        )
+        header = f"ValidationReport(checked_bindings={self.checked_bindings}, ok={self.ok})"
         if not self.issues:
             return header
         # Errors first, then warnings — the more actionable tier leads.
         lines = [header]
         for issue in (*self.errors, *self.warnings):
-            lines.append(
-                f"  [{issue.severity.value.upper()}] {issue.owner}: {issue.message}"
-            )
+            lines.append(f"  [{issue.severity.value.upper()}] {issue.owner}: {issue.message}")
         return "\n".join(lines)
 
 

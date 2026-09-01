@@ -96,6 +96,12 @@ module's `__init__` and reach it via `self` — a convenience, not the norm.
 **Takeaway:** Jakarta CDI has no `@Configuration`. Treating it as the Spring "config
 object where all beans go" is the anti-pattern this guide exists to prevent.
 
+**On `@Disposes`:** the Spring column (`@Bean(destroyMethod=...)`) is misleading if
+read too literally — Spring *also* runs `@PreDestroy` on `@Bean`-produced singleton
+and request-scoped instances, so Spring migrants have two working teardown paths.
+In CDI (and providify), `@Disposes` is the **only** teardown path for
+`@Produces`/`@Provider`-produced instances — `@PreDestroy` is never invoked on them.
+
 ---
 
 ## Advanced CDI features (when you actually need them)

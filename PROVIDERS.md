@@ -129,6 +129,14 @@ beans. providify offers `@Configuration` only as a convenience grouping; treatin
 it as "the Spring config object where all my beans go" is the anti-pattern this
 guide exists to prevent.
 
+The `@Bean(destroyMethod=...)` column is a rough gloss, not an equivalence: Spring
+*also* runs `@PreDestroy` on `@Bean`-produced singleton/request-scoped instances,
+so Spring migrants have two working teardown paths. In CDI (and providify),
+`@Disposes` is the **only** teardown path for `@Provider`-produced instances —
+`@PreDestroy` is never invoked on them. `container.validate()` reports
+`IssueKind.UNREACHABLE_PRE_DESTROY` (a `WARNING`) when a singleton provider
+produces a type carrying `@PreDestroy` but has no `@Disposes`.
+
 ---
 
 ## Per-method injection (no `__init__` needed)

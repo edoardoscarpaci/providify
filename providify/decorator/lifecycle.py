@@ -160,9 +160,20 @@ def PostConstruct(fn: F) -> F:
 
 def PreDestroy(fn: F) -> F:
     """
-    Marks a method to be called on shutdown or scope teardown.
+    Marks a method to be called on shutdown or scope teardown — for
+    **class bindings** (`@Singleton` / `@RequestScoped` / `@SessionScoped`,
+    and `@Component` with `track=True`).
+
     Stamps a PreDestroyMarker onto the function's __dict__.
     Returns the function unchanged.
+
+    **Not called for instances returned from a `@Provider`.** Producer
+    methods are not container-managed instances — use `@Disposes` for
+    provider-produced teardown instead, matching Jakarta CDI, where
+    producer-returned objects receive no lifecycle callbacks.
+    `container.validate()` reports `IssueKind.UNREACHABLE_PRE_DESTROY`
+    (a WARNING) when a singleton provider produces a type carrying this
+    hook and has no `@Disposes` to reach it.
 
     Equivalent to Jakarta's @PreDestroy.
     """
@@ -247,6 +258,10 @@ def Disposes(disposed_type: type) -> Callable[[F], F]:
             @Disposes(Connection)
             def close_conn(self, conn: Connection) -> None:
                 conn.close()
+
+    This is the teardown mechanism for provider-produced instances: since
+    `@PreDestroy` is never invoked on an object returned from a `@Provider`,
+    `@Disposes` is the only way to run cleanup for it.
 
     Equivalent to Jakarta's @Disposes parameter annotation.
     """

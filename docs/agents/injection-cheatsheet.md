@@ -187,7 +187,8 @@ class Database:
 
 - One `@PostConstruct` and one `@PreDestroy` per class (else `TypeError`).
 - Detected via MRO walk; inheritable.
-- `@PreDestroy` never fires on `DEPENDENT` instances (they aren't tracked).
+- `@PreDestroy` never fires on `DEPENDENT` instances (they aren't tracked), and
+  never fires for `@Provider`-produced instances — use `@Disposes`.
 - Async `@PreDestroy` on a scoped instance is **skipped** if the scope exits via the
   **sync** `request()`/`session()` block — use `arequest()`/`asession()` for async
   teardown.
