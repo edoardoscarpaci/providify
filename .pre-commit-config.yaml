@@ -1,9 +1,18 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.4.1
+    # Bumped to match the root [dependency-groups] lint pin (RL-6, plan 017)
+    # — v0.4.1 predates rule codes now referenced in [tool.ruff.lint]
+    # (UP046/UP047), so it failed to parse the config at all.
+    rev: v0.16.4
     hooks:
-      - id: ruff
-        args: [--fix --format]  # Auto-fix what it can
+      # `ruff-check`, not the bare `ruff` id — the latter is a legacy alias
+      # that pre-commit reports as "ruff (legacy alias)" and that upstream
+      # intends to retire.
+      - id: ruff-check
+        args: [--fix]
+      # Must run AFTER `ruff` — an autofix can leave a line the formatter then
+      # rewraps, and pre-commit runs hooks top-to-bottom within a repo block.
+      - id: ruff-format
 
   ## Optional: also auto-format with black
   #- repo: https://github.com/psf/black

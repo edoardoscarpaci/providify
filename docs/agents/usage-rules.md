@@ -181,7 +181,11 @@ with DIContainer() as container:        # async: `async with` → ashutdown()
 
 `@PreDestroy` fires for cached singletons on shutdown, and for `@RequestScoped` /
 `@SessionScoped` instances when their scope block exits. `DEPENDENT` instances are
-never tracked, so their `@PreDestroy` never fires.
+never tracked, so their `@PreDestroy` never fires. `@PreDestroy` also never fires
+for instances returned from a `@Provider` — that's `@Disposes`'s job, not
+`@PreDestroy`'s; `container.validate()` reports `UNREACHABLE_PRE_DESTROY` (R12)
+when a singleton provider produces a type with a `@PreDestroy` hook and no
+`@Disposes`.
 
 **Ordering guarantee**: `shutdown()` / `ashutdown()` tear down cached singletons in
 **reverse creation order** — every dependent is destroyed before the dependencies it
@@ -235,6 +239,13 @@ dependencies — defects that only surface at first-`get()` time otherwise.
 `validate_bindings()` / `validate_all()` are unchanged and still run
 automatically on first `get()`/`aget()`; `validate()` is the explicit,
 opt-in, whole-graph startup gate on top of them.
+
+`validate()` also reports `IssueKind.UNREACHABLE_PRE_DESTROY` — a `WARNING`,
+not an `ERROR` — for a singleton provider whose produced type carries a
+`@PreDestroy` that will never run (no `@Disposes`). Because it is a warning,
+`validate()`'s default `raise_on_error=True` does **not** raise for it: a
+strict gate must inspect `report.issues` / `report.warnings` / `report.ok`,
+not just `report.errors`, to catch it.
 
 ---
 

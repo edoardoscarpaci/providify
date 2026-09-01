@@ -434,13 +434,78 @@ def _find_advised_fields(cls: type) -> list[str]:
     pydantic_fields = getattr(cls, "__pydantic_fields__", None)
     if pydantic_fields:
         for name, info in pydantic_fields.items():
-            if (
-                isinstance(getattr(info, "default", None), Advised)
-                and name not in found
-            ):
+            if isinstance(getattr(info, "default", None), Advised) and name not in found:
                 found.append(name)
 
     return found
+
+
+def _unreachable_pre_destroy(binding: AnyBinding) -> LifecycleMarker | None:
+    """Return the ``@PreDestroy`` hook that *binding* will never invoke, if any.
+
+    Used by :meth:`DIContainer.validate` (pass 1b) to report
+    ``IssueKind.UNREACHABLE_PRE_DESTROY``. Mirrors Jakarta CDI: instances
+    returned from a producer method receive no lifecycle callbacks —
+    ``@Disposes`` is the only teardown path for them (see plan 012 §Design).
+
+    Args:
+        binding: Any registered binding — ``ClassBinding`` or
+            ``ProviderBinding`` (``AnyBinding`` is exactly that union,
+            `binding.py:827`).
+
+    Returns:
+        The unreachable ``@PreDestroy`` :class:`LifecycleMarker`, or
+        ``None`` when the hook is reachable (or there is no hook at all).
+
+    Edge cases:
+        - Not a ``ProviderBinding`` (i.e. a ``ClassBinding``) → ``None``,
+          always — its own ``@PreDestroy`` runs today.
+        - Not ``Scope.SINGLETON`` (``REQUEST``/``SESSION``/``DEPENDENT``)
+          → ``None``, deliberately. Scope-exit teardown only indexes
+          ``ClassBinding``s and ``@Disposes`` only fires for cached
+          singletons, so neither mechanism applies there either — flagging
+          would give advice that does not fix anything (plan 012 §Edge
+          cases E9).
+        - ``binding.disposer is not None`` → ``None``; the designed
+          teardown path is present.
+        - ``binding.interface`` is a parameterised generic alias (e.g.
+          ``Repo[User]``, a ``typing._GenericAlias``) → normalised via
+          ``get_origin(...) or ...`` before the MRO walk. **Mandatory, not
+          defensive**: ``typing._GenericAlias.__getattr__`` refuses to
+          forward dunder attributes, so ``Repo[User].__mro__`` raises
+          ``AttributeError`` and would crash ``validate()`` outright if this
+          guard were removed (plan 012 §Risks, "SETTLED, scout open
+          question 1"). Do not remove it.
+        - ``binding.interface`` is ``NoneType`` (``def p() -> None``) or any
+          non-``type`` a ``returns=`` override resolved to → ``None`` via
+          the ``isinstance(produced, type)`` guard.
+        - The produced class declares two ``@PreDestroy``s on itself →
+          ``_find_pre_destroy`` raises ``TypeError``; swallowed to ``None``.
+          ``validate()`` is a report builder — it must not raise from a
+          defect it was not asked about. That duplicate-hook defect already
+          raises at registration for any class binding; a second issue kind
+          for it is out of scope here.
+
+    Thread safety:  ✅ Pure function, no container state, no shared mutation.
+    Async safety:   ✅ No await points.
+
+    Example:
+        >>> _unreachable_pre_destroy(some_singleton_provider_binding)
+        LifecycleMarker(fn_name='close', ...)  # or None
+    """
+    if not isinstance(binding, ProviderBinding):
+        return None
+    if binding.scope is not Scope.SINGLETON:
+        return None
+    if binding.disposer is not None:
+        return None
+    produced = get_origin(binding.interface) or binding.interface
+    if not isinstance(produced, type):
+        return None
+    try:
+        return _find_pre_destroy(produced)
+    except TypeError:
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -507,9 +572,7 @@ class DIContainer:
     # Two locks — one per execution context.
     # threading.Lock for sync callers, asyncio.Lock for async callers.
     _sync_lock: ClassVar[threading.Lock] = threading.Lock()
-    _async_lock: ClassVar[asyncio.Lock | None] = (
-        None  # created lazily — needs event loop
-    )
+    _async_lock: ClassVar[asyncio.Lock | None] = None  # created lazily — needs event loop
 
     # Exposed as a class attribute so callers (and tests) that already have
     # a resolved `Annotated[...]` hint in hand can classify its union shape
@@ -958,9 +1021,7 @@ class DIContainer:
         # supertype sweeps like get_all(BaseClass) — it only answers to
         # container.get(ConcreteClass) directly.
         if interface is not implementation:
-            self._bindings.append(
-                ClassBinding(implementation, implementation, exact_only=True)
-            )
+            self._bindings.append(ClassBinding(implementation, implementation, exact_only=True))
 
     def register(self, cls: type[T]) -> None:
         """Register a concrete class so it resolves to itself.
@@ -979,9 +1040,7 @@ class DIContainer:
                 decorated with ``@Component`` or ``@Singleton``.
         """
         if not _has_own_metadata(cls):
-            raise TypeError(
-                f"{cls.__name__} must be decorated with @Component or @Singleton."
-            )
+            raise TypeError(f"{cls.__name__} must be decorated with @Component or @Singleton.")
         self._validated = False
         self._invalidate_type_caches()  # new binding — localns/hints must be rebuilt
         self._bindings.append(ClassBinding(cls, cls))
@@ -1205,9 +1264,7 @@ class DIContainer:
         Example:
             container.warm_up(qualifier="db", priority=10)
         """
-        singleton_bindings = self._filter_singleton(
-            qualifier=qualifier, priority=priority
-        )
+        singleton_bindings = self._filter_singleton(qualifier=qualifier, priority=priority)
         # All-or-nothing guard — raises if any async provider is present
         self._validate_no_async_providers(singleton_bindings)
         for binding in singleton_bindings:
@@ -1247,9 +1304,7 @@ class DIContainer:
         Example:
             await container.awarm_up(qualifier="db")
         """
-        singleton_bindings = self._filter_singleton(
-            qualifier=qualifier, priority=priority
-        )
+        singleton_bindings = self._filter_singleton(qualifier=qualifier, priority=priority)
         for binding in singleton_bindings:
             if isinstance(binding, ProviderBinding) and binding.is_async:
                 await self._instantiate_async(binding=binding)
@@ -1347,9 +1402,7 @@ class DIContainer:
             raise LookupError(f"No bindings found for '{_type_name(cls)}'.")
 
         # Guard — fail early if any candidate is async
-        async_providers = [
-            b for b in candidates if isinstance(b, ProviderBinding) and b.is_async
-        ]
+        async_providers = [b for b in candidates if isinstance(b, ProviderBinding) and b.is_async]
         if async_providers:
             names = ", ".join(b.fn.__name__ for b in async_providers)
             raise RuntimeError(
@@ -1407,9 +1460,7 @@ class DIContainer:
         inner = args[0]
         return inner if self._is_collection_point(inner) else None
 
-    def _collect_sync(
-        self, inner: Any, qualifier: str | type | None = None
-    ) -> list[Any]:
+    def _collect_sync(self, inner: Any, qualifier: str | type | None = None) -> list[Any]:
         """Resolve every active binding for *inner*, synchronously — the list[T] terminal.
 
         Thin wrapper around ``_filter`` + the same async-provider guard
@@ -1439,9 +1490,7 @@ class DIContainer:
         """
         candidates = self._filter(inner, qualifier=qualifier)
 
-        async_providers = [
-            b for b in candidates if isinstance(b, ProviderBinding) and b.is_async
-        ]
+        async_providers = [b for b in candidates if isinstance(b, ProviderBinding) and b.is_async]
         if async_providers:
             names = ", ".join(b.fn.__name__ for b in async_providers)
             raise RuntimeError(
@@ -1456,9 +1505,7 @@ class DIContainer:
             for b in sorted(candidates, key=lambda b: b.priority)
         ]
 
-    async def _collect_async(
-        self, inner: Any, qualifier: str | type | None = None
-    ) -> list[Any]:
+    async def _collect_async(self, inner: Any, qualifier: str | type | None = None) -> list[Any]:
         """Async mirror of :meth:`_collect_sync` — see its docstring for the full rationale.
 
         Args:
@@ -1615,9 +1662,7 @@ class DIContainer:
         # Short-circuit order: `not b.profiles` first — the overwhelmingly
         # common case is an unprofiled binding, and this avoids the frozenset
         # scan in `matches()` entirely for it.
-        profile_ok = not b.profiles or _profile_matches(
-            b.profiles, self._active_profiles
-        )
+        profile_ok = not b.profiles or _profile_matches(b.profiles, self._active_profiles)
         if not profile_ok:
             return False
 
@@ -2049,11 +2094,7 @@ class DIContainer:
             around_invoke = _get_around_invoke_method(interceptor_cls)
             around_get_fn = _get_around_get_method(interceptor_cls)
             around_set_fn = _get_around_set_method(interceptor_cls)
-            if (
-                around_invoke is None
-                and around_get_fn is None
-                and around_set_fn is None
-            ):
+            if around_invoke is None and around_get_fn is None and around_set_fn is None:
                 continue
 
             # Shared, container-scoped singleton (see
@@ -2073,9 +2114,7 @@ class DIContainer:
             # bypasses any __setattr__ the target class defines (e.g. pydantic
             # models), matching how _InterceptorProxy itself stores _target/
             # _chain.
-            object.__setattr__(
-                instance, "__di_field_chain__", {"get": get_chain, "set": set_chain}
-            )
+            object.__setattr__(instance, "__di_field_chain__", {"get": get_chain, "set": set_chain})
 
         if not invoke_chain:
             return instance
@@ -2104,9 +2143,7 @@ class DIContainer:
                 event_type = marker.event_type
                 if event_type not in self._observers:
                     self._observers[event_type] = []
-                self._observers[event_type].append(
-                    (weakref.ref(instance), name, marker.is_async)
-                )
+                self._observers[event_type].append((weakref.ref(instance), name, marker.is_async))
 
     def _dispatch_event_sync(self, event: object) -> None:
         """Dispatch *event* synchronously to all registered ``@Observes`` observers.
@@ -2236,9 +2273,7 @@ class DIContainer:
         with self.request():
             return fn(*args, **kwargs)
 
-    async def arun_in_request(
-        self, fn: Callable[..., Any], *args: Any, **kwargs: Any
-    ) -> Any:
+    async def arun_in_request(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Execute *fn* inside an async request scope, returning its result.
 
         Args:
@@ -2598,16 +2633,12 @@ class DIContainer:
                 # name so a test can patch `providify.container.perf_counter_ns`
                 # and assert it is never called with zero hooks.
                 started = perf_counter_ns() if self._hooks else 0
-                token = _singleton_in_progress.set(
-                    _singleton_in_progress.get() | {(id(self), key)}
-                )
+                token = _singleton_in_progress.set(_singleton_in_progress.get() | {(id(self), key)})
                 try:
                     instance = binding.create(self)
                     if isinstance(binding, ClassBinding):
                         self._register_observers(instance, binding.implementation)
-                        instance = self._apply_interceptors(
-                            instance, binding.implementation
-                        )
+                        instance = self._apply_interceptors(instance, binding.implementation)
                     cache[key] = instance
                     # Record AFTER the cache write so a concurrent shutdown()
                     # racing this creation never sees the key in _singleton_order
@@ -2724,16 +2755,12 @@ class DIContainer:
                     return cache[key]
                 # Zero-cost rule — see _instantiate_sync's matching comment.
                 started = perf_counter_ns() if self._hooks else 0
-                token = _singleton_in_progress.set(
-                    _singleton_in_progress.get() | {(id(self), key)}
-                )
+                token = _singleton_in_progress.set(_singleton_in_progress.get() | {(id(self), key)})
                 try:
                     instance = await binding.acreate(self)
                     if isinstance(binding, ClassBinding):
                         self._register_observers(instance, binding.implementation)
-                        instance = self._apply_interceptors(
-                            instance, binding.implementation
-                        )
+                        instance = self._apply_interceptors(instance, binding.implementation)
                     cache[key] = instance  # type: ignore[index]
                     # Record AFTER the cache write — see _instantiate_sync.
                     self._record_singleton_creation(key, binding)
@@ -2981,9 +3008,7 @@ class DIContainer:
         if cached is not None:
             return dict(cached)
 
-        globalns, localns = _annotation_namespaces(
-            target, self._build_localns(), owner=owner
-        )
+        globalns, localns = _annotation_namespaces(target, self._build_localns(), owner=owner)
         hints = resolve_params(target, owner_name, globalns, localns)
         self._hints_cache[target] = hints
         return dict(hints)
@@ -3129,9 +3154,7 @@ class DIContainer:
             )
             ip_token = _current_injection_point.set(ip)
             try:
-                resolved_value = await self._resolve_hint_async(
-                    hint, param_name, owner_name
-                )
+                resolved_value = await self._resolve_hint_async(hint, param_name, owner_name)
             finally:
                 _current_injection_point.reset(ip_token)
 
@@ -3197,9 +3220,7 @@ class DIContainer:
         dependencies: list[AnyBinding] = []
 
         for _, hint in hints.items():
-            resolved_dep = self._resolve_dependency(
-                hint, qualifier=qualifier, priority=priority
-            )
+            resolved_dep = self._resolve_dependency(hint, qualifier=qualifier, priority=priority)
             if resolved_dep is not None:
                 dependencies.append(resolved_dep)
         return dependencies
@@ -3231,9 +3252,7 @@ class DIContainer:
         args = get_args(hint)
         base_type = args[0]
         try:
-            return self._get_best_candidate(
-                base_type, qualifier=qualifier, priority=priority
-            )
+            return self._get_best_candidate(base_type, qualifier=qualifier, priority=priority)
         except LookupError:
             return None
 
@@ -3295,9 +3314,7 @@ class DIContainer:
             # check in this order so the most specific proxy type wins.
             live_meta = next((a for a in args[1:] if isinstance(a, LiveMeta)), None)
             lazy_meta = next((a for a in args[1:] if isinstance(a, LazyMeta)), None)
-            instance_meta = next(
-                (a for a in args[1:] if isinstance(a, InstanceMeta)), None
-            )
+            instance_meta = next((a for a in args[1:] if isinstance(a, InstanceMeta)), None)
             inject_meta = next((a for a in args[1:] if isinstance(a, InjectMeta)), None)
 
             if live_meta:
@@ -3357,9 +3374,7 @@ class DIContainer:
 
             # ── NamedMeta / DelegateMeta / EventMeta (still inside Annotated) ──
             named_meta = next((a for a in args[1:] if isinstance(a, NamedMeta)), None)
-            delegate_meta = next(
-                (a for a in args[1:] if isinstance(a, DelegateMeta)), None
-            )
+            delegate_meta = next((a for a in args[1:] if isinstance(a, DelegateMeta)), None)
             event_meta = next((a for a in args[1:] if isinstance(a, EventMeta)), None)
 
             if named_meta:
@@ -3374,9 +3389,7 @@ class DIContainer:
                 candidates = [
                     b
                     for b in self._filter(effective_base_type)
-                    if not (
-                        isinstance(b, ClassBinding) and b.implementation is current_cls
-                    )
+                    if not (isinstance(b, ClassBinding) and b.implementation is current_cls)
                 ]
                 if not candidates:
                     return _UNRESOLVED
@@ -3409,9 +3422,7 @@ class DIContainer:
             # back to the parameter's default value.
             return None if is_optional else _UNRESOLVED
 
-        elif (
-            isinstance(hint, type) or get_origin(hint) is not None
-        ) and self._is_resolvable(hint):
+        elif (isinstance(hint, type) or get_origin(hint) is not None) and self._is_resolvable(hint):
             # DESIGN: also accept generic aliases (e.g. Repository[User]) which are
             # not `type` instances but do have a get_origin().  Plain annotations
             # like `repo: Repository[User]` land here when no Inject[] wrapper is used.
@@ -3424,9 +3435,7 @@ class DIContainer:
 
         return _UNRESOLVED  # signal: no binding found, caller decides
 
-    async def _resolve_hint_async(
-        self, hint: Any, param_name: str, owner_name: str
-    ) -> Any:
+    async def _resolve_hint_async(self, hint: Any, param_name: str, owner_name: str) -> Any:
         """Resolve a single type hint to an instance, asynchronously.
 
         Async mirror of :meth:`_resolve_hint_sync`. Handles all four cases
@@ -3460,9 +3469,7 @@ class DIContainer:
             # Mirror of _resolve_hint_sync — same priority order: Live → Lazy → Instance → Inject.
             live_meta = next((a for a in args[1:] if isinstance(a, LiveMeta)), None)
             lazy_meta = next((a for a in args[1:] if isinstance(a, LazyMeta)), None)
-            instance_meta = next(
-                (a for a in args[1:] if isinstance(a, InstanceMeta)), None
-            )
+            instance_meta = next((a for a in args[1:] if isinstance(a, InstanceMeta)), None)
             inject_meta = next((a for a in args[1:] if isinstance(a, InjectMeta)), None)
 
             if live_meta:
@@ -3509,16 +3516,12 @@ class DIContainer:
 
             # ── NamedMeta / DelegateMeta / EventMeta (async mirror) ────────────
             named_meta = next((a for a in args[1:] if isinstance(a, NamedMeta)), None)
-            delegate_meta = next(
-                (a for a in args[1:] if isinstance(a, DelegateMeta)), None
-            )
+            delegate_meta = next((a for a in args[1:] if isinstance(a, DelegateMeta)), None)
             event_meta = next((a for a in args[1:] if isinstance(a, EventMeta)), None)
 
             if named_meta:
                 try:
-                    return await self.aget(
-                        effective_base_type, qualifier=named_meta.name
-                    )
+                    return await self.aget(effective_base_type, qualifier=named_meta.name)
                 except LookupError:
                     return _UNRESOLVED
             elif delegate_meta:
@@ -3526,9 +3529,7 @@ class DIContainer:
                 candidates = [
                     b
                     for b in self._filter(effective_base_type)
-                    if not (
-                        isinstance(b, ClassBinding) and b.implementation is current_cls
-                    )
+                    if not (isinstance(b, ClassBinding) and b.implementation is current_cls)
                 ]
                 if not candidates:
                     return _UNRESOLVED
@@ -3550,9 +3551,7 @@ class DIContainer:
                     continue
             return None if is_optional else _UNRESOLVED
 
-        elif (
-            isinstance(hint, type) or get_origin(hint) is not None
-        ) and self._is_resolvable(hint):
+        elif (isinstance(hint, type) or get_origin(hint) is not None) and self._is_resolvable(hint):
             # Mirror of _resolve_hint_sync — accept generic aliases here too
             return await self.aget(hint)
 
@@ -3617,9 +3616,7 @@ class DIContainer:
         # Constructor params already injected via _collect_kwargs_sync take priority.
         # Skip matching names to avoid overwriting values set by __init__.
         try:
-            init_params = set(inspect.signature(cls.__init__).parameters.keys()) - {
-                "self"
-            }
+            init_params = set(inspect.signature(cls.__init__).parameters.keys()) - {"self"}
         except (ValueError, TypeError):
             # __init__ may not be inspectable (e.g. C-extension types). Safe default.
             init_params = set()
@@ -3634,9 +3631,7 @@ class DIContainer:
             # ClassVar[Instance[T]] expands to ClassVar[Annotated[T, InstanceMeta()]].
             # _resolve_hint_sync expects the Annotated form as its top-level type,
             # so strip the ClassVar wrapper before resolving.
-            resolved = self._resolve_hint_sync(
-                _unwrap_classvar(hint), name, cls.__name__
-            )
+            resolved = self._resolve_hint_sync(_unwrap_classvar(hint), name, cls.__name__)
             if resolved is not _UNRESOLVED:
                 setattr(instance, name, resolved)
 
@@ -3666,9 +3661,7 @@ class DIContainer:
             return
 
         try:
-            init_params = set(inspect.signature(cls.__init__).parameters.keys()) - {
-                "self"
-            }
+            init_params = set(inspect.signature(cls.__init__).parameters.keys()) - {"self"}
         except (ValueError, TypeError):
             init_params = set()
 
@@ -3679,9 +3672,7 @@ class DIContainer:
                 continue
             # Mirror of _inject_class_vars_sync — strip ClassVar[...] wrapper so
             # _resolve_hint_async receives a plain Annotated[T, Meta(...)] type.
-            resolved = await self._resolve_hint_async(
-                _unwrap_classvar(hint), name, cls.__name__
-            )
+            resolved = await self._resolve_hint_async(_unwrap_classvar(hint), name, cls.__name__)
             if resolved is not _UNRESOLVED:
                 setattr(instance, name, resolved)
 
@@ -3741,9 +3732,7 @@ class DIContainer:
         token = _resolution_stack.set(stack + [cls])
 
         try:
-            resolved_kwargs = await self._collect_kwargs_async(
-                cls.__init__, cls.__name__
-            )
+            resolved_kwargs = await self._collect_kwargs_async(cls.__init__, cls.__name__)
             instance = cls(**resolved_kwargs)
             # Async mirror — same class-var injection after construction.
             await self._inject_class_vars_async(instance, cls)
@@ -3949,9 +3938,7 @@ class DIContainer:
     #   After:   with container.request(): ...
 
     @contextmanager
-    def _emit_scope_events(
-        self, kind: Literal["request", "session"], inner: Any
-    ) -> Iterator[Any]:
+    def _emit_scope_events(self, kind: Literal["request", "session"], inner: Any) -> Iterator[Any]:
         """Wrap a sync ``ScopeContext`` context manager with ``ScopeEntered``/``ScopeExited`` emission.
 
         Only constructed by the façade methods below, and only when
@@ -3986,9 +3973,7 @@ class DIContainer:
                 )
 
     @asynccontextmanager
-    async def _aemit_scope_events(
-        self, kind: Literal["request", "session"], inner: Any
-    ) -> Any:
+    async def _aemit_scope_events(self, kind: Literal["request", "session"], inner: Any) -> Any:
         """Async mirror of :meth:`_emit_scope_events` — wraps an async ``ScopeContext`` CM.
 
         Args:
@@ -4075,9 +4060,7 @@ class DIContainer:
         """
         if not self._hooks:
             return self.scope_context.session(session_id)
-        return self._emit_scope_events(
-            "session", self.scope_context.session(session_id)
-        )
+        return self._emit_scope_events("session", self.scope_context.session(session_id))
 
     def asession(self, session_id: str | None = None) -> Any:
         """Activate an async session scope context.
@@ -4099,9 +4082,7 @@ class DIContainer:
         """
         if not self._hooks:
             return self.scope_context.asession(session_id)
-        return self._aemit_scope_events(
-            "session", self.scope_context.asession(session_id)
-        )
+        return self._aemit_scope_events("session", self.scope_context.asession(session_id))
 
     def invalidate_session(self, session_id: str) -> None:
         """Destroy a session cache and run sync @PreDestroy hooks — call on logout or expiry.
@@ -4456,9 +4437,7 @@ class DIContainer:
                     # Nothing was disposed — no InstanceDisposed for this key.
                     async_hook_error = RuntimeError(str(exc))
                     break
-                except (
-                    Exception
-                ) as exc:  # noqa: BLE001 — deliberately broad: aggregate ALL hook failures
+                except Exception as exc:  # noqa: BLE001 — deliberately broad: aggregate ALL hook failures
                     failures.append(
                         ShutdownFailure(owner=self._owner_label(binding), exception=exc)
                     )
@@ -4466,9 +4445,7 @@ class DIContainer:
                         self._emit(
                             InstanceDisposed(
                                 interface=binding.interface,
-                                implementation=self._instance_created_implementation(
-                                    binding
-                                ),
+                                implementation=self._instance_created_implementation(binding),
                                 scope=binding.scope,
                                 owner=self._owner_label(binding),
                                 duration_ns=perf_counter_ns() - started,
@@ -4480,9 +4457,7 @@ class DIContainer:
                     self._emit(
                         InstanceDisposed(
                             interface=binding.interface,
-                            implementation=self._instance_created_implementation(
-                                binding
-                            ),
+                            implementation=self._instance_created_implementation(binding),
                             scope=binding.scope,
                             owner=self._owner_label(binding),
                             duration_ns=perf_counter_ns() - started,
@@ -4515,9 +4490,7 @@ class DIContainer:
                         break
                     try:
                         getattr(rec.instance, hook.fn_name)()
-                    except (
-                        Exception
-                    ) as exc:  # noqa: BLE001 — aggregate ALL module hook failures too
+                    except Exception as exc:  # noqa: BLE001 — aggregate ALL module hook failures too
                         failures.append(
                             ShutdownFailure(
                                 owner=self._module_pre_destroy_owner_label(cls, hook),
@@ -4619,9 +4592,7 @@ class DIContainer:
                 started = perf_counter_ns() if (self._hooks and has_hook) else 0
                 try:
                     await self._adispose(key, binding)
-                except (
-                    Exception
-                ) as exc:  # noqa: BLE001 — deliberately broad: aggregate ALL hook failures
+                except Exception as exc:  # noqa: BLE001 — deliberately broad: aggregate ALL hook failures
                     failures.append(
                         ShutdownFailure(owner=self._owner_label(binding), exception=exc)
                     )
@@ -4629,9 +4600,7 @@ class DIContainer:
                         self._emit(
                             InstanceDisposed(
                                 interface=binding.interface,
-                                implementation=self._instance_created_implementation(
-                                    binding
-                                ),
+                                implementation=self._instance_created_implementation(binding),
                                 scope=binding.scope,
                                 owner=self._owner_label(binding),
                                 duration_ns=perf_counter_ns() - started,
@@ -4643,9 +4612,7 @@ class DIContainer:
                     self._emit(
                         InstanceDisposed(
                             interface=binding.interface,
-                            implementation=self._instance_created_implementation(
-                                binding
-                            ),
+                            implementation=self._instance_created_implementation(binding),
                             scope=binding.scope,
                             owner=self._owner_label(binding),
                             duration_ns=perf_counter_ns() - started,
@@ -4669,9 +4636,7 @@ class DIContainer:
                         await bound()
                     else:
                         bound()
-                except (
-                    Exception
-                ) as exc:  # noqa: BLE001 — aggregate ALL module hook failures too
+                except Exception as exc:  # noqa: BLE001 — aggregate ALL module hook failures too
                     failures.append(
                         ShutdownFailure(
                             owner=self._module_pre_destroy_owner_label(cls, hook),
@@ -4913,9 +4878,7 @@ class DIContainer:
         # Exclude __init__ params — they're already validated / graphed via the
         # existing __init__-based path.  Keeping them here would double-count them.
         try:
-            init_params = set(inspect.signature(cls.__init__).parameters.keys()) - {
-                "self"
-            }
+            init_params = set(inspect.signature(cls.__init__).parameters.keys()) - {"self"}
         except (ValueError, TypeError):
             # __init__ not inspectable (rare — C-extension types). Safe empty set.
             init_params = set()
@@ -5002,18 +4965,14 @@ class DIContainer:
             if get_origin(hint) is Annotated:
                 args = get_args(hint)
                 base_type = args[0]
-                inject_marker = next(
-                    (a for a in args[1:] if isinstance(a, _providify)), None
-                )
+                inject_marker = next((a for a in args[1:] if isinstance(a, _providify)), None)
             else:
                 base_type = hint
 
             if not isinstance(base_type, type):
                 continue
 
-            dep_bindings = self._filter(
-                base_type, qualifier=qualifier, priority=priority
-            )
+            dep_bindings = self._filter(base_type, qualifier=qualifier, priority=priority)
             for dep in dep_bindings:
                 if not _is_scope_leak(parent_scope=binding.scope, dep_scope=dep.scope):
                     continue
@@ -5109,9 +5068,7 @@ class DIContainer:
             if get_origin(hint) is Annotated:
                 args = get_args(hint)
                 base_type = args[0]
-                inject_marker = next(
-                    (a for a in args[1:] if isinstance(a, _providify)), None
-                )
+                inject_marker = next((a for a in args[1:] if isinstance(a, _providify)), None)
             else:
                 base_type = hint
 
@@ -5300,7 +5257,7 @@ class DIContainer:
         write, no ``@PostConstruct``. See also :meth:`warm_up`, which is the
         "actually build it" counterpart.
 
-        Two passes over ``self._bindings``, O(V) + O(E):
+        Two-and-a-bit passes over ``self._bindings``, O(V) + O(E):
 
         1. **Scope tier** — ``binding.validate(self)`` is reused as-is; its
            structured exceptions (``ScopeViolationDetectedError``,
@@ -5308,6 +5265,15 @@ class DIContainer:
            unpacked into one :class:`~providify.validation.ValidationIssue`
            per underlying violation, not one per exception, so a single
            binding with three scope leaks reports three issues.
+        1b. **Teardown tier** (plan 012) — a ``SINGLETON``-scoped
+           ``ProviderBinding`` with no ``@Disposes`` disposer, whose produced
+           type carries a ``@PreDestroy`` hook, contributes one
+           ``UNREACHABLE_PRE_DESTROY`` **warning** — that hook will never
+           run, mirroring Jakarta CDI (producer-returned objects receive no
+           lifecycle callbacks). Runs even for a binding also reporting
+           ``UNRESOLVED_ANNOTATION`` in pass 1, since
+           ``ProviderBinding.interface`` is resolved independently at
+           registration time.
         2. **Graph tier** — :meth:`_iter_injection_points` yields every
            statically-classified injection point; each is resolved against a
            call-local candidate memo (wrapping :meth:`_filter`) to detect
@@ -5358,6 +5324,13 @@ class DIContainer:
             - REQUEST/SESSION-scoped bindings validate cleanly with no active
               scope context — nothing is instantiated, so ``_get_cache`` is
               never reached.
+            - ``UNREACHABLE_PRE_DESTROY`` (plan 012) runs on registered
+              bindings regardless of ``@Profile`` activation — pass 1
+              iterates ``self._bindings`` unfiltered — and requires
+              :meth:`install` to have run first, since ``ProviderBinding.disposer``
+              is wired during ``install()``; calling ``validate()`` before
+              ``install()`` produces false-positive warnings for providers
+              whose ``@Disposes`` has not been wired up yet.
 
         Example:
             container.scan("myapp")
@@ -5389,9 +5362,7 @@ class DIContainer:
         # calls is always reflected.
         candidate_memo: dict[tuple[Any, Any, Any], list[AnyBinding]] = {}
 
-        def memo_filter(
-            base_type: Any, qualifier: Any, priority: Any
-        ) -> list[AnyBinding]:
+        def memo_filter(base_type: Any, qualifier: Any, priority: Any) -> list[AnyBinding]:
             try:
                 key = (base_type, qualifier, priority)
                 cached = candidate_memo.get(key)
@@ -5424,6 +5395,33 @@ class DIContainer:
             if isinstance(c, ProviderBinding):
                 return c.fn.__name__
             return _type_name(c.interface)  # pragma: no cover — exhaustive guard
+
+        def unreachable_pre_destroy_issue(b: AnyBinding) -> ValidationIssue | None:
+            # See module-level `_unreachable_pre_destroy` (plan 012 §Design)
+            # for the four load-bearing guards this dispatches through.
+            hook = _unreachable_pre_destroy(b)
+            if hook is None:
+                return None
+            produced = get_origin(b.interface) or b.interface
+            produced_name = _type_name(produced)
+            return ValidationIssue(
+                kind=IssueKind.UNREACHABLE_PRE_DESTROY,
+                severity=Severity.WARNING,
+                owner=owner_of(b),
+                message=(
+                    f"@PreDestroy '{hook.fn_name}' on {produced_name} will never "
+                    f"run: {produced_name} is produced by {owner_of(b)}, and "
+                    f"@PreDestroy is only invoked for class bindings "
+                    f"(@Singleton/@Component), never for provider-produced "
+                    f"instances. Fix: add a '@Disposes({produced_name})' method "
+                    f"to the @Configuration that declares this provider, or "
+                    f"register {produced_name} as a class binding instead of a "
+                    f"provider."
+                ),
+                param_name=hook.fn_name,
+                requested=produced_name,
+                qualifier=b.qualifier,
+            )
 
         for idx, binding in enumerate(self._bindings):
             owner_name = owner_of(binding)
@@ -5485,6 +5483,11 @@ class DIContainer:
                 # report "no dependencies" — skip edge-building for this
                 # binding entirely rather than silently under-reporting.
                 unresolved = True
+
+            # ── Pass 1b: teardown tier — an unreachable @PreDestroy ───────
+            pre_destroy_issue = unreachable_pre_destroy_issue(binding)
+            if pre_destroy_issue is not None:
+                issues.append(pre_destroy_issue)
 
             if unresolved:
                 continue
@@ -5555,9 +5558,7 @@ class DIContainer:
                     first_matched: list[AnyBinding] | None = None
                     any_matched = False
                     for member in union_members:
-                        member_candidates = memo_filter(
-                            member, spec.qualifier, spec.priority
-                        )
+                        member_candidates = memo_filter(member, spec.qualifier, spec.priority)
                         if member_candidates:
                             any_matched = True
                             if first_matched is None:
@@ -6064,9 +6065,7 @@ class DIContainer:
             container.install(RepoModule)   # installs InfraModule first
         """
         if not _has_configuration_module(module_cls):
-            raise TypeError(
-                f"{module_cls.__name__} must be decorated with @Configuration."
-            )
+            raise TypeError(f"{module_cls.__name__} must be decorated with @Configuration.")
         # Cycle/type-error detection happens for the WHOLE closure before any
         # instantiation — resolve_install_order raises before we touch the
         # loop below, so a cycle leaves _installed_modules (and _bindings)
@@ -6106,9 +6105,7 @@ class DIContainer:
             await container.ainstall(RepoModule)
         """
         if not _has_configuration_module(module_cls):
-            raise TypeError(
-                f"{module_cls.__name__} must be decorated with @Configuration."
-            )
+            raise TypeError(f"{module_cls.__name__} must be decorated with @Configuration.")
         for cls in resolve_install_order([module_cls]):
             if cls in self._installed_modules:
                 continue
@@ -6141,9 +6138,7 @@ class DIContainer:
         # (_installed_modules docstring, role 2/3); registration itself
         # cannot fail once construction/PostConstruct succeeded, so ordering
         # here vs. before registration is not otherwise observable.
-        self._installed_modules[cls] = _ModuleRecord(
-            instance=instance, owned=True, disposed=False
-        )
+        self._installed_modules[cls] = _ModuleRecord(instance=instance, owned=True, disposed=False)
 
     async def _ainstall_one(self, cls: type) -> None:
         """Async mirror of :meth:`_install_one`.
@@ -6160,9 +6155,7 @@ class DIContainer:
         instance = await self._resolve_constructor_async(cls)
         await self._run_post_construct_async(instance, _find_post_construct(cls))
         self._register_module_providers(cls, instance)
-        self._installed_modules[cls] = _ModuleRecord(
-            instance=instance, owned=True, disposed=False
-        )
+        self._installed_modules[cls] = _ModuleRecord(instance=instance, owned=True, disposed=False)
 
     def _register_module_providers(self, module_cls: type, instance: object) -> None:
         """Register every ``@Provider``-decorated method from a module instance.
@@ -6185,10 +6178,7 @@ class DIContainer:
                 continue
             # Unwrap @property so that @Provider @property works naturally.
             effective_fn = fn.fget if isinstance(fn, property) else fn
-            if (
-                callable(effective_fn)
-                and _get_provider_metadata(effective_fn) is not None
-            ):
+            if callable(effective_fn) and _get_provider_metadata(effective_fn) is not None:
                 if isinstance(fn, property):
                     # Wrap the property getter as a bound-method-like callable.
                     # functools.wraps copies __module__, __globals__, __annotations__,
@@ -6288,9 +6278,7 @@ class DIContainer:
             binding = container.get_binding(UserRepository)
             print(binding.scope)  # Scope.SINGLETON
         """
-        return self._get_best_candidate(
-            interface, qualifier=qualifier, priority=priority
-        )
+        return self._get_best_candidate(interface, qualifier=qualifier, priority=priority)
 
     def get_all_bindings(
         self,
@@ -6328,9 +6316,7 @@ class DIContainer:
 
     # ── Observability hooks (F6) ────────────────────────────────────
 
-    def add_hook(
-        self, event_type: type, callback: Callable[[Any], None]
-    ) -> Callable[[], None]:
+    def add_hook(self, event_type: type, callback: Callable[[Any], None]) -> Callable[[], None]:
         """Register *callback* to run whenever an event of exactly *event_type* is emitted.
 
         Dispatch is by exact type (``type(event) is event_type``), never
@@ -6518,9 +6504,7 @@ class DIContainer:
         # size bounded (no unbounded growth across repeated override() calls
         # in a long-lived test session) rather than changing shutdown() semantics.
         evicted = set(to_evict)
-        self._singleton_order = [
-            e for e in self._singleton_order if e[0] not in evicted
-        ]
+        self._singleton_order = [e for e in self._singleton_order if e[0] not in evicted]
 
         # Register the replacement via the public bind() API — which also
         # resets _validated and _localns_cache.
@@ -6598,9 +6582,7 @@ class DIContainer:
         # matching comment; _teardown_plan already filters these out via the
         # `_singleton_cache` membership check, this just bounds log growth.
         evicted = set(to_evict)
-        self._singleton_order = [
-            e for e in self._singleton_order if e[0] not in evicted
-        ]
+        self._singleton_order = [e for e in self._singleton_order if e[0] not in evicted]
 
         # Reset validation so scope checks run again
         self._validated = False
@@ -6722,8 +6704,7 @@ class DIContainer:
         # them (mirrors _singleton_order's ownership reasoning above: a
         # shared history, but only the source disposes what it created).
         new._installed_modules = {
-            cls: replace(rec, owned=False)
-            for cls, rec in self._installed_modules.items()
+            cls: replace(rec, owned=False) for cls, rec in self._installed_modules.items()
         }
         return new
 
@@ -6835,15 +6816,11 @@ class DIContainer:
         # Drop lock entries for cache keys no longer present after restore —
         # bounds growth. Stale locks for still-present keys are harmless
         # (same lock protects the same key either way).
-        stale_keys = [
-            key for key in self._singleton_locks if key not in self._singleton_cache
-        ]
+        stale_keys = [key for key in self._singleton_locks if key not in self._singleton_cache]
         for key in stale_keys:
             del self._singleton_locks[key]
         stale_async_keys = [
-            key
-            for key in self._async_singleton_locks
-            if key not in self._singleton_cache
+            key for key in self._async_singleton_locks if key not in self._singleton_cache
         ]
         for key in stale_async_keys:
             del self._async_singleton_locks[key]
