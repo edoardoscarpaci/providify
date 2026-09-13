@@ -35,6 +35,7 @@ bad2: Inject(Service, qualifier="x")   # ❌ runs, but type checkers report "Unk
 | `Live[T]` | one binding, **re-resolved every `.get()`** | inject narrow scope into wider scope (R5) |
 | `Instance[T]` | a programmatic handle; nothing resolved until you call it | choose qualifier/priority at call time |
 | `Event[T]` | a dispatch handle (`EventProxy`) | fire CDI events to `@Observes` methods |
+| `entity: type[T]` (in an OPEN `@Provider`, plan 016) | filled with the CLOSED type argument, **not resolved from the container** (name-matched; an unannotated single-`TypeVar` parameter gets it positionally instead) | replace a per-type `provide()` loop with one open registration — see `usage-rules.md` R10 |
 
 ### `Inject[T]` / `InjectInstances[T]`
 
@@ -188,7 +189,8 @@ class Database:
 - One `@PostConstruct` and one `@PreDestroy` per class (else `TypeError`).
 - Detected via MRO walk; inheritable.
 - `@PreDestroy` never fires on `DEPENDENT` instances (they aren't tracked), and
-  never fires for `@Provider`-produced instances — use `@Disposes`.
+  never fires for `@Provider`-produced instances — use `@Disposes` (matched
+  within the same `@Configuration` only).
 - Async `@PreDestroy` on a scoped instance is **skipped** if the scope exits via the
   **sync** `request()`/`session()` block — use `arequest()`/`asession()` for async
   teardown.

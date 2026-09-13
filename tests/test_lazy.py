@@ -123,9 +123,7 @@ class TestLazyProxyUnit:
 
         assert result1 is None
         assert result2 is None
-        assert (
-            call_count == 1
-        ), "Container must be called only once even when result is None"
+        assert call_count == 1, "Container must be called only once even when result is None"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -140,9 +138,7 @@ class TestLazyInjection:
         """Reset the instance counter before each test."""
         ExpensiveService.reset()
 
-    def test_lazy_parameter_receives_proxy_not_instance(
-        self, container: DIContainer
-    ) -> None:
+    def test_lazy_parameter_receives_proxy_not_instance(self, container: DIContainer) -> None:
         """Constructor with Lazy[T] must receive a LazyProxy, not the resolved type."""
 
         @Component
@@ -157,9 +153,9 @@ class TestLazyInjection:
 
         # Must be a proxy — the service is NOT yet instantiated
         assert isinstance(consumer.svc, LazyProxy)
-        assert (
-            ExpensiveService.instance_count == 0
-        ), "Service must not be created until .get() is called"
+        assert ExpensiveService.instance_count == 0, (
+            "Service must not be created until .get() is called"
+        )
 
     def test_proxy_resolves_on_get(self, container: DIContainer) -> None:
         """Calling .get() on the proxy must return the actual resolved service."""
@@ -206,9 +202,7 @@ class TestLazyInjection:
         b_instance = container.get(B)
         assert isinstance(b_instance, B)
 
-    def test_lazy_with_qualifier_forwards_to_container(
-        self, container: DIContainer
-    ) -> None:
+    def test_lazy_with_qualifier_forwards_to_container(self, container: DIContainer) -> None:
         """Lazy(T, qualifier='x') must forward the qualifier when resolving."""
 
         class DB:
@@ -279,9 +273,7 @@ class UnboundService:
 class TestLazyOptional:
     """Tests for Lazy[T | None] and Annotated[T, LazyMeta(optional=True)]."""
 
-    def test_lazy_t_or_none_returns_none_when_not_bound_sync(
-        self, container: DIContainer
-    ) -> None:
+    def test_lazy_t_or_none_returns_none_when_not_bound_sync(self, container: DIContainer) -> None:
         """Lazy[T | None] proxy .get() returns None when T has no binding.
 
         The union annotation Lazy[T | None] expands at runtime to
@@ -307,9 +299,7 @@ class TestLazyOptional:
         result = consumer.svc.get()
         assert result is None, "Lazy[T | None] must return None when T is not bound"
 
-    def test_lazy_t_or_none_returns_instance_when_bound_sync(
-        self, container: DIContainer
-    ) -> None:
+    def test_lazy_t_or_none_returns_instance_when_bound_sync(self, container: DIContainer) -> None:
         """Lazy[T | None] proxy .get() returns the resolved instance when T is bound.
 
         Args:
@@ -342,9 +332,7 @@ class TestLazyOptional:
 
         @Component
         class Consumer:
-            def __init__(
-                self, svc: Annotated[UnboundService, LazyMeta(optional=True)]
-            ) -> None:
+            def __init__(self, svc: Annotated[UnboundService, LazyMeta(optional=True)]) -> None:
                 self.svc = svc
 
         container.register(Consumer)
@@ -354,9 +342,7 @@ class TestLazyOptional:
 
         assert result is None, "LazyMeta(optional=True) must return None when not bound"
 
-    async def test_lazy_t_or_none_returns_none_async_path(
-        self, container: DIContainer
-    ) -> None:
+    async def test_lazy_t_or_none_returns_none_async_path(self, container: DIContainer) -> None:
         """Lazy[T | None] proxy .aget() returns None when T has no binding (async path).
 
         Args:
@@ -373,13 +359,9 @@ class TestLazyOptional:
         consumer = await container.aget(Consumer)
         result = await consumer.svc.aget()
 
-        assert (
-            result is None
-        ), "Lazy[T | None] .aget() must return None when T is not bound"
+        assert result is None, "Lazy[T | None] .aget() must return None when T is not bound"
 
-    async def test_lazy_meta_optional_true_async_path(
-        self, container: DIContainer
-    ) -> None:
+    async def test_lazy_meta_optional_true_async_path(self, container: DIContainer) -> None:
         """Annotated[T, LazyMeta(optional=True)] .aget() returns None when not bound.
 
         Args:
@@ -388,9 +370,7 @@ class TestLazyOptional:
 
         @Component
         class Consumer:
-            def __init__(
-                self, svc: Annotated[UnboundService, LazyMeta(optional=True)]
-            ) -> None:
+            def __init__(self, svc: Annotated[UnboundService, LazyMeta(optional=True)]) -> None:
                 self.svc = svc
 
         container.register(Consumer)
@@ -442,9 +422,7 @@ class TestLazyProxyReset:
         assert proxy._resolved is False
         assert proxy._instance is None
 
-    def test_reset_causes_re_resolution_on_next_get(
-        self, container: DIContainer
-    ) -> None:
+    def test_reset_causes_re_resolution_on_next_get(self, container: DIContainer) -> None:
         """After reset(), .get() calls the container again and returns a new instance."""
         call_count = 0
 
@@ -466,9 +444,7 @@ class TestLazyProxyReset:
         # Container called twice — once before reset, once after
         assert call_count == 2
 
-    async def test_async_reset_causes_re_resolution(
-        self, container: DIContainer
-    ) -> None:
+    async def test_async_reset_causes_re_resolution(self, container: DIContainer) -> None:
         """After reset(), .aget() re-resolves from the container."""
         call_count = 0
 
@@ -498,9 +474,7 @@ class TestLazyProxyReset:
 class TestLazyProxyThreadSafety:
     """Tests that concurrent .get() calls produce exactly one instance."""
 
-    def test_concurrent_get_creates_exactly_one_instance(
-        self, container: DIContainer
-    ) -> None:
+    def test_concurrent_get_creates_exactly_one_instance(self, container: DIContainer) -> None:
         """Multiple threads calling .get() simultaneously must only instantiate T once."""
         import threading
 

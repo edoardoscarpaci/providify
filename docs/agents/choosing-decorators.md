@@ -92,6 +92,7 @@ module's `__init__` and reach it via `self` — a convenience, not the norm.
 | `@Configuration` class | *(no equivalent)* | `@Configuration` |
 | `@Disposes` method | `@Disposes` | `@Bean(destroyMethod=...)` |
 | `@Named` / `qualifier=` | `@Named` | `@Qualifier` |
+| `@Fallback` | *(no equivalent)* | Quarkus `@DefaultBean` / Spring `@ConditionalOnMissingBean` (evaluated at resolve time, not registration time) |
 
 **Takeaway:** Jakarta CDI has no `@Configuration`. Treating it as the Spring "config
 object where all beans go" is the anti-pattern this guide exists to prevent.
@@ -111,7 +112,9 @@ SKILL.md / README.md for full examples.
 
 - **Qualifiers & stereotypes** — `@Named(name=...)` / `qualifier=` to disambiguate
   multiple bindings of one type; `@Stereotype(...)` to define a reusable composed
-  decorator; `@Alternative` / `@Default` for selection.
+  decorator; `@Alternative` (deployment-time replacement) / `@Default` (qualifier
+  meaning "no name") / `@Fallback` (yield when a real binding exists) for
+  selection; `@Profile` / `@Requires(condition=…, env=…)` for activation.
 - **Events** — inject `Event[T]`, fire with `.fire(e)` / `.afire(e)`; observe with a
   method decorated `@Observes(T)`.
 - **Interceptors** — `@Interceptor` + `@AroundInvoke(ctx)` calling `ctx.proceed()`.

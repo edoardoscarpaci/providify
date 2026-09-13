@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, TypeVar
@@ -84,6 +86,16 @@ _ALTERNATIVE_ATTR = "__di_alternative__"
 # ── @Profile — deployment-time profile activation marker ─────────
 _PROFILE_ATTR = "__di_profile__"
 
+# ── @Fallback — resolve-time "yield to any active non-fallback" marker ──
+_FALLBACK_ATTR = "__di_fallback__"
+
+# ── @Requires — condition-gated binding marker ────────────────────
+# Storage slot only — value is tuple[RequiresMarker, ...], never a single
+# marker, so stacked `@Requires` decorators can each be named individually
+# in a CONDITION_INACTIVE message or a ConditionEvaluationError (plan 015
+# §Design "Stacking -> tuple of markers, not a merge").
+_REQUIRES_ATTR = "__di_requires__"
+
 # ── @Decorator — bean decorator marker ───────────────────────────
 _DECORATOR_ATTR = "__di_decorator__"
 
@@ -113,9 +125,7 @@ class DecoratorMarker:
 class StereotypeMetadata:
     """Holds composed annotation metadata for a @Stereotype class."""
 
-    scope: Any = (
-        None  # Scope — None means DEPENDENT (resolved lazily to avoid forward ref)
-    )
+    scope: Any = None  # Scope — None means DEPENDENT (resolved lazily to avoid forward ref)
     qualifier: Any = None  # str | type | None
     priority: int = 0
     inherited: bool = False
@@ -186,6 +196,176 @@ class ProfileMetadata:
     """
 
     expressions: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FallbackMarker:
+    """Stamps a class or `@Provider` function/method as a `@Fallback` default.
+
+    Stored directly on the target's own `__dict__` via `_FALLBACK_ATTR` —
+    same storage guarantees as every other marker in this module (picklable,
+    GC-safe, multiprocess-safe, debuggable via plain attribute access).
+
+    DESIGN: frozen dataclass with zero fields, not a bare `__slots__` class
+    like `AlternativeMarker` (`:109-112`).
+        ✅ gets `__eq__`/`__hash__` for free, matching `ProfileMetadata`'s
+           shape, useful if callers ever compare markers structurally
+        ✅ can grow fields later (e.g. a reason string) without a shape
+           change — adding a field to a `__slots__` marker class would be
+           the same diff size, but the dataclass form documents intent
+        ❌ marginally heavier than `__slots__ = ()` for a type that will
+           likely never carry data — accepted, matches `ProfileMetadata`
+
+    The TYPE is the signal, not the attribute name — `isinstance(meta,
+    FallbackMarker)` is the only valid membership check, matching
+    `ProfileMetadata` and `StereotypeMetadata` above (repo rule, see
+    `_is_fallback` below).
+
+    Thread safety: Frozen dataclass — safe to share across threads once built.
+    Async safety:  Pure data — no shared mutable state.
+    """
+
+
+@dataclass(frozen=True)
+class RequiresMarker:
+    """One `@Requires(...)` clause stamped by the decorator of the same name.
+
+    Stored directly on the class/function's `__dict__` via `_REQUIRES_ATTR`
+    — same storage guarantees as every other marker in this module
+    (picklable, GC-safe, multiprocess-safe, debuggable via plain attribute
+    access). A second `@Requires` on the same target appends a second
+    `RequiresMarker` to the stored tuple rather than merging into this one
+    (plan 015 §Design) — each marker keeps its own `(condition, env,
+    value)` so a `CONDITION_INACTIVE` message or a
+    `ConditionEvaluationError` can name *which* clause failed/raised.
+
+    Thread safety: Frozen dataclass — safe to share across threads once
+        built. `is_satisfied()` reads `os.environ`/calls `condition()` on
+        every invocation — see that method's own note.
+    Async safety:  Pure data holder; `is_satisfied()` is a plain sync call
+        (conditions must be "cheap and pure", never awaited).
+
+    Attributes:
+        condition: A zero-arg predicate evaluated at `is_satisfied()` call
+            time — the primitive escape hatch. `None` means "no predicate
+            clause" (only `env=`/`value=` gate this marker).
+        env: Name of an OS environment variable to read at call time, or
+            `None` for a pure `condition=` marker. Unlike `@Profile`'s
+            lower-casing (`scope.py:712-714`), this name is used verbatim —
+            POSIX environment variable names are case-sensitive.
+        value: Exact, case-sensitive string the `env` variable must equal
+            to satisfy this marker. `None` means "any non-empty string
+            satisfies" (see `is_satisfied()`'s truth table below).
+    """
+
+    condition: Callable[[], bool] | None = None
+    env: str | None = None
+    value: str | None = None
+
+    def is_satisfied(self) -> bool:
+        """Return whether this marker's clause(s) currently hold, AND'd together.
+
+        Reads `os.environ` and/or calls `condition()` NOW, never at
+        decoration time — the whole point of "lazy at resolve time"
+        (plan 015 [GAP:161]): a container built once and asked repeatedly
+        must see a later `monkeypatch.setenv`/flag flip on the very next
+        call, with no memoisation anywhere in this method or its callers.
+
+        Returns:
+            `True` iff every populated clause (`env`/`value`, then
+            `condition`) is satisfied. `True` for a marker with neither
+            clause set — but the `@Requires()` decorator itself never
+            constructs one (`ValueError` at decoration time), so that case
+            is unreachable through the public API.
+
+        Raises:
+            Nothing itself — a raising `condition()` propagates verbatim.
+            Callers (`container._conditions_hold`, `validate()`'s pass 1c)
+            are responsible for catching it and wrapping it in a
+            `ConditionEvaluationError` that knows the owning binding's
+            name; this method deliberately does not know that name.
+
+        Edge cases:
+            - `env=` set, `value=None` -> satisfied iff the variable is set
+              to a non-empty string; unset OR `""` -> `False` (mirrors
+              `PROVIDIFY_PROFILES=""`, `profiles.py:119`).
+            - `env=` + `value=""` -> satisfied iff the variable is set AND
+              exactly `""` — "set and exactly empty" is a DIFFERENT state
+              from "unset" (E9 in plan 015).
+            - `value=` given -> exact, case-sensitive equality; `"Redis"`
+              != `"redis"` (E8) — no normalisation, unlike `@Profile`.
+            - `condition` returns a truthy non-`bool` (`"yes"`, `1`) ->
+              coerced via `not self.condition()`, matching the
+              `if condition():` idiom every Python reader already expects.
+              A predicate returning the string `"false"` is therefore
+              truthy — documented here as the caller's responsibility, not
+              guarded against (a strict `isinstance(result, bool)` check
+              was rejected — see plan 015 §Design "Truthiness, not strict
+              bool").
+            - Both `env=`/`value=` and `condition` populated -> AND of both
+              (E11); either failing makes the whole marker inactive.
+
+        Thread safety: ✅ Pure read of `os.environ` plus a call to
+            `condition` — safe to call from any thread PROVIDED `condition`
+            itself is thread-safe; this method makes no synchronisation
+            guarantee about the caller-supplied predicate.
+        Async safety:  ✅ No await points. `condition` must be a plain sync
+            callable — there is no async form (documented as part of the
+            decorator's "cheap and pure" contract).
+
+        Example:
+            >>> RequiresMarker(env="FEATURE_X").is_satisfied()
+            False   # FEATURE_X unset
+        """
+        if self.env is not None:
+            actual = os.environ.get(self.env)
+            if self.value is None:
+                # env= without value= means "set to a non-empty string" —
+                # both unset and "" read as inactive, matching how
+                # PROVIDIFY_PROFILES="" is treated (profiles.py:119).
+                if not actual:
+                    return False
+            elif actual != self.value:
+                # Exact, case-sensitive equality — env values are user data
+                # ("Redis" != "redis"), unlike @Profile's normalised names.
+                return False
+        if self.condition is not None and not self.condition():
+            return False
+        return True
+
+    def describe(self) -> str:
+        """Render this marker in its declaration form, for messages.
+
+        Used by `ConditionEvaluationError`'s message and by `validate()`'s
+        `CONDITION_INACTIVE` issue to name exactly which clause is at fault
+        without forcing every caller to re-implement this formatting.
+
+        Returns:
+            `"@Requires(condition=<qualname>)"`, `"@Requires(env='X')"`, or
+            `"@Requires(env='X', value='y')"` depending on which clauses are
+            populated. Both `condition` and `env`/`value` populated renders
+            all of them, comma-separated, inside one `@Requires(...)`.
+
+        Thread safety: ✅ Pure formatting — no shared state.
+        Async safety:  ✅ No await points.
+
+        Example:
+            >>> RequiresMarker(env="X", value="redis").describe()
+            "@Requires(env='X', value='redis')"
+        """
+        parts: list[str] = []
+        if self.condition is not None:
+            # __qualname__ over __name__ — disambiguates a lambda or a
+            # nested function from a same-named sibling, at the cost of a
+            # slightly longer string; falls back to repr() for a callable
+            # object (e.g. functools.partial) with no __qualname__.
+            name = getattr(self.condition, "__qualname__", repr(self.condition))
+            parts.append(f"condition={name}")
+        if self.env is not None:
+            parts.append(f"env={self.env!r}")
+            if self.value is not None:
+                parts.append(f"value={self.value!r}")
+        return f"@Requires({', '.join(parts)})"
 
 
 class DIMetadata:
@@ -374,9 +554,7 @@ def _has_config_properties(cls: type) -> bool:
     @ConfigProperties class carries no marker and must re-declare, matching
     `_is_alternative`'s non-inheriting `__dict__` lookup (`:448-450`).
     """
-    return isinstance(
-        cls.__dict__.get(_CONFIG_PROPERTIES_ATTR), ConfigPropertiesMetadata
-    )
+    return isinstance(cls.__dict__.get(_CONFIG_PROPERTIES_ATTR), ConfigPropertiesMetadata)
 
 
 def _get_config_properties(cls: type) -> ConfigPropertiesMetadata:
@@ -643,6 +821,176 @@ def _set_profile_marker(obj: Any, expressions: tuple[str, ...]) -> None:
         beyond the general one above.
     """
     setattr(obj, _PROFILE_ATTR, ProfileMetadata(expressions))
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Fallback marker helpers (plan 017)
+# ─────────────────────────────────────────────────────────────────
+
+
+def _is_fallback(obj: Any) -> bool:
+    """Return True if *obj* was decorated with `@Fallback` on its own `__dict__`.
+
+    Reads `obj.__dict__` first and, only if the marker is absent there,
+    falls back to `obj.__func__.__dict__` — exactly the bound-method
+    fallback `_get_profile_metadata` performs above, needed because a
+    `@Configuration` method's `ProviderBinding.fn` is a bound method, which
+    owns no `__dict__` of its own (the marker lives on the underlying
+    function).
+
+    Args:
+        obj: A class, function, or bound method to inspect. An object
+            without a `__dict__` (e.g. a C-level builtin) is treated as
+            unmarked rather than raising.
+
+    Returns:
+        `True` iff *obj* (or, for a bound method, its `__func__`) carries a
+        `FallbackMarker` on its own `__dict__`.
+
+    Thread safety: Pure read — safe to call from any thread.
+    Async safety:  Pure read — no await points.
+
+    Edge cases:
+        - Bound method → checked via `__func__.__dict__`, matching
+          `@Provider @property` getters whose wrapper copies the getter's
+          `__dict__` (container.py, `@Configuration` install path).
+        - Object with no `__dict__` at all → `False`, never raises.
+        - **Never walks the MRO** — a subclass of a `@Fallback` class does
+          not inherit the marker, matching `@Profile` (`_get_profile_metadata`
+          above) and `_is_alternative` (`:715-717`). A subclass that wants
+          the same treatment must be re-decorated (see plan 017 E23).
+
+    Example:
+        >>> _is_fallback(SomeUndecoratedClass)
+        False
+    """
+    d = getattr(obj, "__dict__", None)
+    val = d.get(_FALLBACK_ATTR) if d is not None else None
+
+    if val is None:
+        # Bound method — marker lives on __func__, not on the method object
+        # (bound methods do not own a __dict__ of their own).
+        func = getattr(obj, "__func__", None)
+        if func is not None:
+            fd = getattr(func, "__dict__", None)
+            if fd is not None:
+                val = fd.get(_FALLBACK_ATTR)
+
+    return isinstance(val, FallbackMarker)
+
+
+def _set_fallback_marker(obj: Any) -> None:
+    """Stamp `FallbackMarker()` onto *obj*'s own `__dict__`.
+
+    Sole write path for the fallback marker — mirrors `_set_profile_marker`
+    above ("only entry point for writing"). Idempotent: re-decorating an
+    already-marked object simply overwrites with an equal `FallbackMarker()`
+    (the dataclass has no fields, so there is nothing to lose).
+
+    Args:
+        obj: A class or function to stamp. `setattr` works uniformly for
+            both — classes and functions both support arbitrary attribute
+            assignment.
+
+    Returns:
+        None
+
+    Thread safety: ⚠️ Not synchronized — stamping the same object from two
+        threads concurrently is a plain last-write-wins race, identical to
+        every other marker setter in this module. Decoration happens at
+        import time, on a single thread, in every documented usage.
+    Async safety:  Same caveat as thread safety — no async-specific concern
+        beyond the general one above.
+    """
+    setattr(obj, _FALLBACK_ATTR, FallbackMarker())
+
+
+# ─────────────────────────────────────────────────────────────────
+#  @Requires marker helpers
+# ─────────────────────────────────────────────────────────────────
+
+
+def _get_requires_markers(obj: Any) -> tuple[RequiresMarker, ...]:
+    """Read the `@Requires` marker tuple from *obj*'s own `__dict__`.
+
+    Mirrors `_get_profile_metadata` above, including its bound-method
+    `__func__` fallback — that fallback is what makes the marker readable
+    off a `@Configuration` method's bound `ProviderBinding.fn` (plan 015
+    §Design). Deliberately does **not** walk `cls.__mro__` — a subclass of
+    a `@Requires`-decorated class must re-declare, matching `@Profile`'s
+    non-inheriting `__dict__` lookup (E21).
+
+    Args:
+        obj: A class, function, or bound method to inspect. Any object
+            without a `__dict__` (e.g. a C-level builtin) is treated as
+            unmarked rather than raising.
+
+    Returns:
+        `()` for an unmarked object; otherwise every stacked `RequiresMarker`
+        in declaration order (first `@Requires` applied — i.e. the one
+        closest to the target in the decorator stack — first).
+
+    Edge cases:
+        - Unmarked object -> `()`.
+        - Value stored under `_REQUIRES_ATTR` is not a `tuple` of
+          `RequiresMarker` (e.g. corrupted by direct attribute assignment)
+          -> `()`; every element is `isinstance`-checked, not trusted blind.
+        - Subclass of a `@Requires`-decorated class -> `()` (E21).
+
+    Thread safety: Pure read — safe to call from any thread.
+    Async safety:  Pure read — no await points.
+
+    Example:
+        >>> _get_requires_markers(SomeUnmarkedClass)
+        ()
+    """
+    d = getattr(obj, "__dict__", None)
+    val = d.get(_REQUIRES_ATTR) if d is not None else None
+
+    if val is None:
+        # Bound method — marker lives on __func__, not on the method object
+        # (bound methods do not own a __dict__ of their own). Same fallback
+        # as _get_profile_metadata; this is what lets @Requires gate a
+        # @Configuration method's bound ProviderBinding.fn.
+        func = getattr(obj, "__func__", None)
+        if func is not None:
+            fd = getattr(func, "__dict__", None)
+            if fd is not None:
+                val = fd.get(_REQUIRES_ATTR)
+
+    if not isinstance(val, tuple):
+        return ()
+    # Every element isinstance-checked — a raw dict or a tuple containing a
+    # stray non-marker value (e.g. from a future incompatible providify
+    # version's pickle) is treated as "no markers" rather than crashing the
+    # hot resolution path with a downstream AttributeError.
+    return val if all(isinstance(m, RequiresMarker) for m in val) else ()
+
+
+def _set_requires_markers(obj: Any, markers: tuple[RequiresMarker, ...]) -> None:
+    """Stamp `markers` onto *obj*'s own `__dict__` as the `@Requires` tuple.
+
+    Sole write path for the `@Requires` marker tuple — mirrors
+    `_set_profile_marker`'s "only entry point for writing" contract.
+    Callers (`Requires` in `decorator/scope.py`) are responsible for
+    validating and appending to any pre-existing tuple before calling this
+    function — it performs no validation of its own.
+
+    Args:
+        obj: A class or function to stamp. `setattr` works uniformly for
+            both.
+        markers: The final (already-appended) marker tuple to store.
+
+    Returns:
+        None
+
+    Thread safety: ⚠️ Not synchronized — stamping the same object from two
+        threads concurrently is a plain last-write-wins race, identical to
+        `_set_profile_marker`. Decoration happens at import time, on a
+        single thread, in every documented usage.
+    Async safety:  Same caveat as thread safety.
+    """
+    setattr(obj, _REQUIRES_ATTR, markers)
 
 
 # ─────────────────────────────────────────────────────────────────

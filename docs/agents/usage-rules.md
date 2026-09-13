@@ -160,6 +160,25 @@ for model in (User, Order):
     container.provide(repo_factory, returns=Repository[model])
 ```
 
+**Prefer a single open-generic registration** (plan 016) over the loop above
+whenever the factory can take the closed type as a `type[T]` parameter — one
+`provide()` call replaces the whole loop:
+
+```python
+T = TypeVar("T")
+
+def repo_factory(entity: type[T]) -> Repository[T]:
+    return InMemoryRepo(entity)
+
+container.provide(repo_factory, returns=Repository[T])   # open — no loop
+container.get(Repository[User])    # -> InMemoryRepo(User)
+container.get(Repository[Order])   # -> InMemoryRepo(Order)
+```
+
+Keep the per-model loop above only when the factory CANNOT take a uniform
+`type[T]` parameter — e.g. each model needs a genuinely different factory
+body, not just a different type argument to the same one.
+
 Mutating another function's `__annotations__` is an anti-pattern (see
 `anti-patterns.md`): it patches a function object the caller may not own,
 the ordering between decoration and the mutation is load-bearing but
@@ -185,7 +204,8 @@ never tracked, so their `@PreDestroy` never fires. `@PreDestroy` also never fire
 for instances returned from a `@Provider` — that's `@Disposes`'s job, not
 `@PreDestroy`'s; `container.validate()` reports `UNREACHABLE_PRE_DESTROY` (R12)
 when a singleton provider produces a type with a `@PreDestroy` hook and no
-`@Disposes`.
+`@Disposes`. `@Disposes` only attaches to providers declared in the **same**
+`@Configuration`.
 
 **Ordering guarantee**: `shutdown()` / `ashutdown()` tear down cached singletons in
 **reverse creation order** — every dependent is destroyed before the dependencies it
@@ -242,10 +262,19 @@ opt-in, whole-graph startup gate on top of them.
 
 `validate()` also reports `IssueKind.UNREACHABLE_PRE_DESTROY` — a `WARNING`,
 not an `ERROR` — for a singleton provider whose produced type carries a
-`@PreDestroy` that will never run (no `@Disposes`). Because it is a warning,
-`validate()`'s default `raise_on_error=True` does **not** raise for it: a
+`@PreDestroy` that will never run (no `@Disposes`), alongside
+`IssueKind.DISPOSER_OVERWRITTEN` and `IssueKind.UNMATCHED_DISPOSER` (also
+`WARNING`) for `@Disposes` wiring defects. Because these are warnings,
+`validate()`'s default `raise_on_error=True` does **not** raise for them: a
 strict gate must inspect `report.issues` / `report.warnings` / `report.ok`,
-not just `report.errors`, to catch it.
+not just `report.errors`, to catch them.
+
+`IssueKind.CONDITION_INACTIVE` (`Severity.INFO`) reports a `@Requires`-gated
+binding whose condition currently evaluates `False` — this is the feature
+working as declared, not a defect, and it is a third, even quieter tier than
+`WARNING`: it never raises, is never in `report.warnings`, and never affects
+`report.ok`. Read `report.infos` if you want the wiring report to explain
+*why* a candidate is not the live one.
 
 ---
 
@@ -289,6 +318,8 @@ for active in (("dev",), ("prod",)):
     c.validate()   # each profile's graph must be independently complete
 ```
 
+The same applies per env-var/condition state you ship — see `@Requires` below.
+
 `@Profile` also composes with `@Alternative`: an `@Alternative` bean that also carries
 `@Profile` no longer needs an imperative `enable_alternative()` call — the profile
 itself is the activator, and it is a hard AND-gate (`enable_alternative()` cannot
@@ -298,6 +329,25 @@ override a non-matching profile).
 now genuinely disabled by default, matching the decorator's documented promise. Code
 that previously relied on `@Alternative` doing nothing on a provider function will now
 see `LookupError` until the provider is enabled (or given a matching `@Profile`).
+
+`@Requires(condition=..., env=..., value=...)` is the third activation gate, AND'd with
+`@Profile`/`@Alternative` and evaluated last, lazily, on every `get()` — never cached,
+never evaluated at decoration time. Prefer it over a hand-rolled `if` inside a
+`@Provider` body for anything that should show up as `IssueKind.CONDITION_INACTIVE` in
+`container.validate()`'s report — note `describe()` itself carries no
+profiles/alternative/conditions field, so it does not reflect activation state:
+
+```python
+from providify import Requires, Singleton
+
+@Requires(env="FEATURE_REDIS_CACHE")
+@Singleton
+class RedisCache(Cache): ...
+```
+
+A raising `@Requires` predicate propagates as `ConditionEvaluationError` from every
+public lookup **and** from `validate()` — it is a programming error, not a legitimate
+"off" state, so it is never silently swallowed.
 
 ---
 
@@ -498,3 +548,36 @@ invisible to the interceptor chain. Three more rules that trip people up:
   interception in either profile — do not describe `Advised` as "closing a
   CDI gap" in code, comments, or commit messages. It is modelled on AspectJ's
   `get`/`set` pointcuts, implemented via Python's descriptor protocol.
+
+## R19 — `@Fallback` for framework defaults; never `priority=-sys.maxsize - 1`
+
+If you find yourself giving a binding an artificially low `priority=` just so
+any "real" binding automatically outranks it, that is `@Fallback`, spelled
+correctly:
+
+```python
+# ❌ floor-priority trick — fragile, and a second real binding at an even
+# lower priority (or a tie) reintroduces the exact bug this was meant to avoid
+@Singleton(priority=-sys.maxsize - 1)
+class InMemoryCache(Cache): ...
+
+# ✅ @Fallback — a candidate only when no active non-fallback binding matches
+@Fallback
+@Singleton
+class InMemoryCache(Cache): ...
+```
+
+A request is `(interface, qualifier, priority)` — an unqualified `@Fallback`
+yields to a *qualified* non-fallback sibling for an unqualified request, but a
+fallback that carries its own qualifier still wins when a caller asks for
+exactly that qualifier (the `qualifier="in_memory"` escape hatch keeps
+working; see the README's `@Fallback` section).
+
+Do not confuse it with `@Default`: `@Default` is a **qualifier** ("no named
+qualifier"); `@Fallback` is an **activation rule** ("yield when a real
+binding exists"). The names sound similar; the problems are unrelated.
+
+A `@Fallback` singleton resolved and cached *before* its shadowing binding is
+registered is **not evicted** — any dependent already holding a reference to
+it keeps that reference, the same non-eviction caveat `activate_profile()`
+already documents. `override()`/`reset_binding()` remain the eviction tools.

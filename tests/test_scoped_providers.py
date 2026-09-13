@@ -78,9 +78,7 @@ class TestRequestScopedProvider:
     scope caching is working correctly.
     """
 
-    def test_factory_runs_once_per_request_not_per_get(
-        self, container: DIContainer
-    ) -> None:
+    def test_factory_runs_once_per_request_not_per_get(self, container: DIContainer) -> None:
         """Factory must be called exactly once per request block, regardless of
         how many times the type is resolved within that block.
 
@@ -108,9 +106,7 @@ class TestRequestScopedProvider:
         # All three resolutions must return the same cached instance
         assert first is second is third
 
-    def test_factory_runs_again_for_each_new_request(
-        self, container: DIContainer
-    ) -> None:
+    def test_factory_runs_again_for_each_new_request(self, container: DIContainer) -> None:
         """A new request block must produce a fresh factory invocation.
 
         The REQUEST scope cache is cleared when the context manager exits,
@@ -167,9 +163,7 @@ class TestRequestScopedProvider:
 
         assert token.subject == "alice"
 
-    def test_scoped_provider_combined_with_live_injection(
-        self, container: DIContainer
-    ) -> None:
+    def test_scoped_provider_combined_with_live_injection(self, container: DIContainer) -> None:
         """@Singleton using Live[T] of a @Provider(scope=REQUEST) type sees current value.
 
         This is the complete Jakarta @Produces @RequestScoped pattern:
@@ -351,9 +345,7 @@ class TestProviderBackwardCompatibility:
         assert call_count == 1
         assert first is second
 
-    def test_explicit_scope_overrides_singleton_flag(
-        self, container: DIContainer
-    ) -> None:
+    def test_explicit_scope_overrides_singleton_flag(self, container: DIContainer) -> None:
         """scope= takes priority over singleton= when both are provided.
 
         DESIGN: Explicit scope is always the most specific signal — it supersedes

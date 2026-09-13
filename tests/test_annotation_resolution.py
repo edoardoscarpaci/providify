@@ -323,9 +323,7 @@ class TestClassVarInjectionHintFailure:
 
         assert isinstance(instance.var, Dep)
 
-    async def test_class_var_injection_still_works_async(
-        self, container: DIContainer
-    ) -> None:
+    async def test_class_var_injection_still_works_async(self, container: DIContainer) -> None:
         """Async positive control — no monkeypatch."""
         container.register(Consumer)
         container.bind(Dep, Dep)

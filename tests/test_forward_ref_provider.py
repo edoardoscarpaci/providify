@@ -161,9 +161,7 @@ class TestQuotedReturnAnnotation:
 
         assert isinstance(container.get(ProfilingSettings), ProfilingSettings)
 
-    async def test_quoted_return_annotation_async_provider(
-        self, container: DIContainer
-    ) -> None:
+    async def test_quoted_return_annotation_async_provider(self, container: DIContainer) -> None:
         """Async providers take the same registration path — cover it explicitly."""
 
         @Provider(singleton=True)

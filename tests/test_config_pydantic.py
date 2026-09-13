@@ -49,9 +49,7 @@ class TestPydanticModelValidatePath:
         """providify performs no coercion on the pydantic path — the string
         "20" is handed to pydantic verbatim, and pydantic itself coerces it.
         """
-        result = bind_config_object(
-            _Settings, [DictSource({"url": "x", "pool_size": "20"})]
-        )
+        result = bind_config_object(_Settings, [DictSource({"url": "x", "pool_size": "20"})])
 
         assert result.pool_size == 20  # pydantic did the coercion, not providify
 

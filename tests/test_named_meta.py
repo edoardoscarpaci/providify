@@ -54,9 +54,7 @@ def test_named_meta_same_as_inject_meta_with_qualifier(container: DIContainer):
 
     @Component
     class C2:
-        def __init__(
-            self, cache: Annotated[Cache, InjectMeta(qualifier="memory")]
-        ) -> None:
+        def __init__(self, cache: Annotated[Cache, InjectMeta(qualifier="memory")]) -> None:
             self.cache = cache
 
     container.register(C1)

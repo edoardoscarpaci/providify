@@ -12,18 +12,22 @@ from ..exceptions import NotDecoratedError
 from ..metadata import (
     DIMetadata,
     ProviderMetadata,
+    RequiresMarker,
     Scope,
     StereotypeMetadata,
     _get_own_metadata,
     _get_profile_expressions,
     _get_provider_metadata,
+    _get_requires_markers,
     _is_decorated,
     _set_alternative_marker,
     _set_decorator_marker,
+    _set_fallback_marker,
     _set_metadata,
     _set_profile_marker,
     _set_provider_metadata,
     _set_qualifier_marker,
+    _set_requires_markers,
     _set_stereotype,
 )
 from ..profiles import _normalise
@@ -564,6 +568,18 @@ def Provider(
         @Provider(returns=lambda: Repository[User])
         def user_repository() -> Any:
             return InMemoryRepo()
+
+        # Open-generic form (plan 016) — ONE registration replaces a
+        # per-type loop when every closed type shares one factory shape.
+        # `entity: type[T]` receives the CLOSED type argument (matched by
+        # TypeVar name), never resolved from the container. See
+        # DIContainer.provide()'s docstring for the full eight-rule table.
+        T = TypeVar("T")
+
+        @Provider
+        def repository(entity: type[T]) -> Repository[T]:
+            return InMemoryRepo(entity)
+        # container.get(Repository[User])  -> InMemoryRepo(User)
     """
 
     def decorator(fn: Callable[..., R]) -> Callable[..., R]:
@@ -581,9 +597,7 @@ def Provider(
             "qualifier": qualifier,
             "priority": priority,
             "scope": scope,
-            "is_async": inspect.iscoroutinefunction(
-                fn
-            ),  # detected once at decoration time
+            "is_async": inspect.iscoroutinefunction(fn),  # detected once at decoration time
         }
         if returns is not None:
             updates["returns"] = returns
@@ -598,9 +612,7 @@ def Provider(
                     qualifier=qualifier,
                     priority=priority,
                     scope=scope,
-                    is_async=inspect.iscoroutinefunction(
-                        fn
-                    ),  # detected once at decoration
+                    is_async=inspect.iscoroutinefunction(fn),  # detected once at decoration
                     returns=returns,
                 )
             ),
@@ -799,6 +811,266 @@ def Profile(*expressions: str) -> Callable[[Any], Any]:
 
 
 # ─────────────────────────────────────────────────────────────────
+#  @Requires — condition-gated binding (Micronaut @Requires parity)
+# ─────────────────────────────────────────────────────────────────
+
+
+def Requires(
+    *,
+    condition: Callable[[], bool] | None = None,
+    env: str | None = None,
+    value: str | None = None,
+) -> Callable[[Any], Any]:
+    """Gate a class or ``@Provider`` function on a predicate evaluated lazily.
+
+    The third conjunct of ``DIContainer._binding_is_active()`` beside
+    ``@Profile`` and ``@Alternative`` (plan 015). Spelled after Micronaut's
+    ``@Requires(property=..., value=...)``/``env=`` forms (research 014
+    §73-101) rather than Spring Boot's ``@ConditionalOn*`` family — one
+    name, keyword-only, no taxonomy of variants to promise.
+
+    ⚠️ Divergence from Micronaut: in Micronaut ``@Requires(env=...)`` names
+    an *environment* (≈ providify's own ``@Profile``). In providify the
+    profile role is already taken by ``@Profile``, so ``env=`` here is
+    unambiguously ``os.environ[...]`` — a plain OS environment variable
+    lookup, nothing more.
+
+    Two spellings, combinable by AND on one marker, and stackable (a second
+    ``@Requires`` appends a second marker; every marker in the stack must
+    be satisfied — AND across the whole stack, plan 015 §Design):
+
+    - ``condition=`` — the generic escape hatch: any zero-arg predicate.
+    - ``env=``/``env=`` + ``value=`` — sugar over the primitive, reading
+      ``os.environ`` at evaluation time. ``env="X"`` alone means "X is set
+      to a non-empty string"; ``env="X", value="y"`` means "X is set to
+      exactly ``'y'``" (exact, case-sensitive — env values are user data,
+      unlike ``@Profile``'s lower-cased names).
+
+    The condition is evaluated **lazily, at resolve time**, on every
+    ``_filter()`` call — never cached, never evaluated at decoration or
+    registration time (unlike an ``eager=`` scan-time option, which this
+    decorator does not offer — plan 015 §Non-goals). This is what lets a
+    test flip a flag or ``monkeypatch.setenv`` *after* import and see it
+    take effect on the very next ``get()``. The predicate contract is
+    therefore **cheap and pure, and must not raise** — a raising predicate
+    propagates as :class:`~providify.exceptions.ConditionEvaluationError`
+    from every public lookup path AND from :meth:`DIContainer.validate`.
+
+    Composition with ``@Profile``/``@Alternative``: AND'd together, and
+    ``@Requires`` is evaluated **last** — after profile/alternative
+    activation has already excluded a binding, its (possibly expensive or
+    environment-specific) predicate never runs at all. A
+    ``@Profile("prod")``-gated predicate that only works in production
+    cannot break a dev ``get()`` this way.
+
+    Stacking = AND, not merge: each ``@Requires`` keeps its own marker, so
+    a failure message can name exactly which clause is unsatisfied.
+    ``@Requires`` reads its own ``__dict__`` only — a subclass of a
+    ``@Requires``-decorated class does **not** inherit the marker, matching
+    ``@Profile``'s non-inheriting lookup.
+
+    No singleton eviction: a ``@Singleton`` resolved while its condition
+    was ``True`` stays cached (and still gets disposed at shutdown) even
+    after the condition flips ``False`` — the same documented caveat
+    ``activate_profile()`` already carries; ``override()``/
+    ``reset_binding()`` remain the eviction tools.
+
+    Goes on the ``@Provider`` **method**, not the ``@Configuration``
+    **class** — ``ProviderBinding.conditions`` is read off the provider
+    function only, mirroring ``ProviderBinding.profiles``. A ``@Requires``
+    stamped on a ``@Configuration`` class itself has no effect on the
+    providers it declares (E15, documented as an edge case, not
+    implemented).
+
+    Args:
+        condition: A zero-arg predicate returning (or coercing to) a
+            ``bool``. ``None`` means "no predicate clause" — must be
+            combined with ``env=`` or this decorator raises.
+        env: Name of an OS environment variable to check at resolve time.
+            ``None`` means "no env clause" — must be combined with
+            ``condition=`` or this decorator raises.
+        value: Exact string ``env`` must equal to satisfy this marker. Only
+            meaningful together with ``env=``; passing it without ``env=``
+            raises. ``value=""`` is allowed and distinct from omitting
+            ``value=`` — it means "the variable is set and exactly empty".
+
+    Returns:
+        A decorator that appends a ``RequiresMarker`` to the target's own
+        ``__dict__`` and returns the target unchanged (same object
+        identity) — order-insensitive relative to ``@Provider``/
+        ``@Singleton``/``@Component``/``@Profile`` since every scope
+        decorator in this module returns the object it was given.
+
+    Raises:
+        ValueError: Neither ``condition`` nor ``env`` given; ``value=``
+            given while ``env`` is ``None``; or ``env=""``/whitespace-only.
+            Raised at decoration time (import time), fail-fast, mirroring
+            ``@Profile``'s ``ValueError`` above.
+        TypeError: ``condition`` given but not callable, or ``env`` given
+            as a non-``str``.
+
+    Thread safety: Decoration happens at import time on a single thread in
+        every documented usage — see ``_set_requires_markers``'s note.
+    Async safety:  No await points; pure marker stamping. The stamped
+        predicate itself must be a plain sync callable — there is no async
+        ``@Requires`` form.
+
+    Edge cases:
+        - ``@Requires()`` (no args) -> ``ValueError``.
+        - ``@Requires(value="x")`` (no ``env``) -> ``ValueError``.
+        - ``@Requires(env="")`` / ``@Requires(env="   ")`` -> ``ValueError``.
+        - ``@Requires(condition="not-callable")`` -> ``TypeError``.
+        - ``@Requires(condition=..., env=..., value=...)`` all given -> AND
+          of both clauses on the one marker (E11).
+        - A subclass of a ``@Requires``-decorated class does **not**
+          inherit the marker (E21).
+        - Applied to an undecorated class then ``bind()`` -> the existing
+          ``ClassBindingNotDecoratedError`` fires as today — ``@Requires``
+          never stamps ``DIMetadata`` (E22).
+
+    Example:
+        @Requires(env="FEATURE_REDIS_CACHE")
+        @Singleton
+        class RedisCache(Cache): ...
+
+        @Requires(condition=lambda: settings.use_mock_mailer)
+        @Provider(singleton=True)
+        def fake_mailer() -> Mailer: ...
+
+        @Requires(env="CACHE_BACKEND", value="redis")
+        @Requires(condition=lambda: redis_is_reachable())
+        @Singleton
+        class RedisCache(Cache): ...   # AND of both clauses
+    """
+    if condition is None and env is None:
+        raise ValueError("@Requires needs at least one of condition= or env=.")
+    if value is not None and env is None:
+        raise ValueError("@Requires(value=...) is only meaningful together with env=.")
+    if condition is not None and not callable(condition):
+        raise TypeError("@Requires(condition=...) must be callable.")
+    if env is not None:
+        if not isinstance(env, str):
+            raise TypeError("@Requires(env=...) must be a str.")
+        if not env.strip():
+            raise ValueError("@Requires(env=...) must name a non-empty environment variable.")
+
+    marker = RequiresMarker(condition=condition, env=env, value=value)
+
+    def decorator(target: Any) -> Any:
+        # Append, not merge — a second @Requires keeps its own marker so a
+        # failure message can name exactly which clause is unsatisfied
+        # (plan 015 §Design "Stacking -> tuple of markers, not a merge").
+        existing = _get_requires_markers(target)
+        _set_requires_markers(target, (*existing, marker))
+        return target
+
+    return decorator
+
+
+# ─────────────────────────────────────────────────────────────────
+#  @Fallback — resolve-time default, yields to any active non-fallback
+#  binding (Quarkus @DefaultBean parity, plan 017)
+# ─────────────────────────────────────────────────────────────────
+
+
+def Fallback(target: Any) -> Any:
+    """Mark a class or ``@Provider`` function/method as a default binding.
+
+    Rule (one sentence, plan 017 §Design): for a request
+    ``(interface, qualifier, priority)``, a ``@Fallback`` binding is a
+    candidate **iff** the request's candidate set contains no active
+    non-fallback binding. Composes with ``@Profile``/``@Alternative`` by
+    AND — a ``@Fallback`` binding that is itself inactive (profile off,
+    alternative not enabled) is simply invisible, same as any other
+    inactive binding; it is not "shadowed", it never entered the candidate
+    set to begin with.
+
+    Evaluated **lazily, at resolve time** — the same moment ``@Profile``/
+    ``@Alternative``/``@Requires`` are checked, inside ``_filter()`` — so a
+    shadowing binding registered *after* the fallback still wins on the
+    very next lookup. This mirrors the mutable-after-registration model
+    ``enable_alternative()``/``activate_profile()`` already rely on, and
+    deliberately rejects a registration-time check (ASP.NET ``TryAdd*``):
+    a fallback ``scan()``ned before the real binding is ``install()``ed
+    would otherwise "win" the race and never yield (plan 017 §Design
+    "Alternatives considered").
+
+    Usable on classes **and** ``@Provider`` functions, including
+    ``@Configuration`` bound methods and ``@Provider @property`` getters —
+    place ``@Fallback`` **beneath** ``@property``, the same placement rule
+    ``@Profile`` has. Decorator order relative to
+    ``@Singleton``/``@Component``/``@Provider``/``@Profile``/
+    ``@Alternative`` is irrelevant: bindings are constructed at
+    ``bind()``/``register()``/``provide()``/``scan()`` time, long after
+    every decorator has already run.
+
+    Contrast with ``@Default``: ``@Default`` is a **qualifier** meaning "no
+    named qualifier" (selection by *name*); ``@Fallback`` is an
+    **activation rule** (selection by *presence of a competitor*) — the two
+    solve unrelated problems despite the similar-sounding names (plan 017
+    §Non-goals, rejecting the ``@DefaultBean`` name for exactly this
+    collision risk).
+
+    ``container.validate()`` reports each shadowed, active ``@Fallback``
+    binding as ``IssueKind.FALLBACK_SHADOWED`` at ``Severity.INFO`` — never
+    an error or warning, since shadowing is the feature working as
+    designed; the issue exists purely so a wiring report can explain *why*
+    a default is not the live binding.
+
+    Jakarta/Quarkus note: CDI itself has no fallback primitive; this
+    mirrors Quarkus's ``@DefaultBean`` (research 010 §19-22) adapted to
+    providify's resolve-time evaluation model instead of Quarkus's
+    build-time one (research 017 §41).
+
+    Args:
+        target: The class or function/method to mark. Returned unchanged
+            (same object identity) — this decorator carries no arguments,
+            so it is always used bare (``@Fallback``, no parentheses).
+
+    Returns:
+        *target*, unmodified except for the marker stamped on its own
+        ``__dict__``.
+
+    Thread safety: Decoration happens at import time on a single thread in
+        every documented usage — see ``_set_fallback_marker``'s note.
+    Async safety:  No await points; pure marker stamping.
+
+    Edge cases:
+        - A subclass of a ``@Fallback`` class does **not** inherit the
+          marker (``__dict__``-only lookup, matching ``@Profile``) — it
+          must be re-decorated to also be a fallback.
+        - Two ``@Fallback`` bindings tied at equal priority, with no active
+          non-fallback competitor: neither is dropped by the post-filter,
+          so ``get()`` falls back to today's "first registered wins" rule
+          and ``validate()`` reports the tie as the pre-existing
+          ``IssueKind.AMBIGUOUS_BINDING`` — never a second issue kind for
+          this.
+        - **Not evicted**: a ``@Fallback`` singleton resolved and cached
+          *before* its shadowing binding is registered stays cached (and is
+          still torn down at ``shutdown()``); a dependent constructed
+          earlier keeps its reference to it. This mirrors
+          ``activate_profile()``'s documented caveat exactly.
+          ``override()``/``reset_binding()`` remain the eviction tools.
+
+    Example:
+        @Fallback
+        @Singleton
+        class InMemoryCache(Cache): ...
+
+        @Singleton
+        class RedisCache(Cache): ...
+
+        container.bind(Cache, InMemoryCache)
+        container.get(Cache)              # -> InMemoryCache (sole candidate)
+
+        container.bind(Cache, RedisCache)
+        container.get(Cache)              # -> RedisCache (fallback yields)
+    """
+    _set_fallback_marker(target)
+    return target
+
+
+# ─────────────────────────────────────────────────────────────────
 #  @Stereotype — composed annotation bundles (Jakarta CDI @Stereotype)
 # ─────────────────────────────────────────────────────────────────
 
@@ -844,13 +1116,9 @@ def Stereotype(
                 DIMetadata(
                     scope=existing.scope,
                     qualifier=(
-                        existing.qualifier
-                        if existing.qualifier is not None
-                        else smeta.qualifier
+                        existing.qualifier if existing.qualifier is not None else smeta.qualifier
                     ),
-                    priority=(
-                        existing.priority if existing.priority != 0 else smeta.priority
-                    ),
+                    priority=(existing.priority if existing.priority != 0 else smeta.priority),
                     inherited=existing.inherited or smeta.inherited,
                     track=existing.track,
                 ),

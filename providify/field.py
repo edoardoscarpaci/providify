@@ -219,9 +219,7 @@ class Advised:
             ) from exc
 
 
-def _field_chain(
-    instance: object, kind: Literal["get", "set"]
-) -> list[tuple[object, str]]:
+def _field_chain(instance: object, kind: Literal["get", "set"]) -> list[tuple[object, str]]:
     """Return the armed advice chain of *kind* for *instance*, or `[]`.
 
     Args:

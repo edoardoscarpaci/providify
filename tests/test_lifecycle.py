@@ -32,9 +32,7 @@ from providify.decorator.scope import Component, Singleton
 class TestPostConstruct:
     """Tests for the @PostConstruct lifecycle hook."""
 
-    def test_sync_post_construct_called_after_construction(
-        self, container: DIContainer
-    ) -> None:
+    def test_sync_post_construct_called_after_construction(self, container: DIContainer) -> None:
         """@PostConstruct must be called once, after the constructor returns."""
 
         @Component
@@ -52,9 +50,7 @@ class TestPostConstruct:
 
         assert svc.initialized is True
 
-    def test_sync_post_construct_receives_injected_state(
-        self, container: DIContainer
-    ) -> None:
+    def test_sync_post_construct_receives_injected_state(self, container: DIContainer) -> None:
         """@PostConstruct should run after all dependencies are injected
         so that it can safely use them during initialization.
         """
@@ -81,9 +77,7 @@ class TestPostConstruct:
 
         assert svc.greeting == "greeting=hello"
 
-    def test_async_post_construct_raises_on_sync_get(
-        self, container: DIContainer
-    ) -> None:
+    def test_async_post_construct_raises_on_sync_get(self, container: DIContainer) -> None:
         """Async @PostConstruct must cause get() to raise RuntimeError — use aget() instead."""
 
         @Component
@@ -97,9 +91,7 @@ class TestPostConstruct:
         with pytest.raises(RuntimeError, match="async"):
             container.get(AsyncService)
 
-    async def test_async_post_construct_awaited_on_aget(
-        self, container: DIContainer
-    ) -> None:
+    async def test_async_post_construct_awaited_on_aget(self, container: DIContainer) -> None:
         """async @PostConstruct must be awaited when resolved via aget()."""
 
         @Component
@@ -142,9 +134,7 @@ class TestPreDestroy:
 
         assert destroyed == ["Resource.teardown"]
 
-    def test_pre_destroy_not_called_for_uncached_singleton(
-        self, container: DIContainer
-    ) -> None:
+    def test_pre_destroy_not_called_for_uncached_singleton(self, container: DIContainer) -> None:
         """@PreDestroy must NOT be called if the singleton was never actually resolved
         (i.e. it's in _bindings but not in _singleton_cache).
         """
@@ -161,13 +151,9 @@ class TestPreDestroy:
 
         container.shutdown()
 
-        assert (
-            destroyed == []
-        ), "Never-resolved singleton must not have @PreDestroy called"
+        assert destroyed == [], "Never-resolved singleton must not have @PreDestroy called"
 
-    def test_pre_destroy_not_called_for_dependent_scope(
-        self, container: DIContainer
-    ) -> None:
+    def test_pre_destroy_not_called_for_dependent_scope(self, container: DIContainer) -> None:
         """DEPENDENT instances are not cached — @PreDestroy must not be called for them.
 
         DESIGN: The container does not own DEPENDENT instances — they are
@@ -224,9 +210,7 @@ class TestPreDestroy:
 
         assert destroyed == [True]
 
-    def test_sync_shutdown_raises_for_async_pre_destroy(
-        self, container: DIContainer
-    ) -> None:
+    def test_sync_shutdown_raises_for_async_pre_destroy(self, container: DIContainer) -> None:
         """sync shutdown() must raise RuntimeError if a @PreDestroy is async def."""
 
         @Singleton
@@ -241,9 +225,7 @@ class TestPreDestroy:
         with pytest.raises(RuntimeError, match="async"):
             container.shutdown()
 
-    async def test_async_shutdown_awaits_async_pre_destroy(
-        self, container: DIContainer
-    ) -> None:
+    async def test_async_shutdown_awaits_async_pre_destroy(self, container: DIContainer) -> None:
         """ashutdown() must await async @PreDestroy hooks."""
         torn_down: list[bool] = []
 
@@ -260,9 +242,7 @@ class TestPreDestroy:
 
         assert torn_down == [True]
 
-    async def test_async_context_manager_calls_ashutdown(
-        self, container: DIContainer
-    ) -> None:
+    async def test_async_context_manager_calls_ashutdown(self, container: DIContainer) -> None:
         """async with container: ... must call ashutdown() on __aexit__."""
         torn_down: list[bool] = []
 

@@ -139,9 +139,7 @@ def parse_profiles(raw: str | None) -> frozenset[str]:
     """
     if not raw:
         return frozenset()
-    return frozenset(
-        _normalise(segment) for segment in raw.split(",") if segment.strip()
-    )
+    return frozenset(_normalise(segment) for segment in raw.split(",") if segment.strip())
 
 
 def resolve_active_profiles(explicit: Iterable[str] | None) -> frozenset[str]:

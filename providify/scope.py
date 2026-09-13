@@ -51,13 +51,9 @@ class ScopeContext:
         self,
         *,
         on_scope_exit: Callable[[dict[Any, object]], None] | None = None,
-        on_scope_exit_async: (
-            Callable[[dict[Any, object]], Awaitable[None]] | None
-        ) = None,
+        on_scope_exit_async: (Callable[[dict[Any, object]], Awaitable[None]] | None) = None,
         on_invalidate_session: Callable[[dict[Any, object]], None] | None = None,
-        on_invalidate_session_async: (
-            Callable[[dict[Any, object]], Awaitable[None]] | None
-        ) = None,
+        on_invalidate_session_async: (Callable[[dict[Any, object]], Awaitable[None]] | None) = None,
     ) -> None:
         """Initialise an empty scope context.
 
@@ -105,12 +101,8 @@ class ScopeContext:
         """
         # ContextVar — each task/thread gets its own value ✅
         # threading.local — all coroutines on same thread share value ❌
-        self._request_id: ContextVar[str | None] = ContextVar(
-            "request_id", default=None
-        )
-        self._session_id: ContextVar[str | None] = ContextVar(
-            "session_id", default=None
-        )
+        self._request_id: ContextVar[str | None] = ContextVar("request_id", default=None)
+        self._session_id: ContextVar[str | None] = ContextVar("session_id", default=None)
 
         # Actual instance caches — keyed by context ID
         # Lock protects concurrent writes to these shared dicts
@@ -294,9 +286,7 @@ class ScopeContext:
     # ── Session scope — async ─────────────────────────────────────
 
     @asynccontextmanager
-    async def asession(
-        self, session_id: str | None = None
-    ) -> AsyncGenerator[str, None]:
+    async def asession(self, session_id: str | None = None) -> AsyncGenerator[str, None]:
         """Activate a session scope context (async version).
 
         Args:

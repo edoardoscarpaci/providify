@@ -80,9 +80,7 @@ def test_advised_delete_is_unadvised_and_works() -> None:
     del acct.balance  # must not raise
 
 
-def test_advised_field_read_before_write_with_no_default_raises_attribute_error() -> (
-    None
-):
+def test_advised_field_read_before_write_with_no_default_raises_attribute_error() -> None:
     from providify.field import Advised
 
     class Account:

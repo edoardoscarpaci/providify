@@ -89,9 +89,7 @@ def _build_chain(container: DIContainer, order: list[str]) -> type:
 
 
 class TestSyncOrdering:
-    def test_chain_teardown_order_is_reverse_dependency_order(
-        self, container: DIContainer
-    ) -> None:
+    def test_chain_teardown_order_is_reverse_dependency_order(self, container: DIContainer) -> None:
         """Dependents must be destroyed before the dependencies they hold."""
         order: list[str] = []
         Service = _build_chain(container, order)
@@ -209,9 +207,7 @@ class TestSyncOrdering:
 
         assert order == ["Service", "Db", "Config"]
 
-    def test_never_resolved_singleton_has_no_pre_destroy_call(
-        self, container: DIContainer
-    ) -> None:
+    def test_never_resolved_singleton_has_no_pre_destroy_call(self, container: DIContainer) -> None:
         """A @Singleton that was registered but never get()'d contributes nothing."""
         order: list[str] = []
 
@@ -265,9 +261,7 @@ class TestSyncOrdering:
 
 
 class TestAsyncOrdering:
-    async def test_async_chain_teardown_order_via_ashutdown(
-        self, container: DIContainer
-    ) -> None:
+    async def test_async_chain_teardown_order_via_ashutdown(self, container: DIContainer) -> None:
         """4-node chain with async @PreDestroy hooks resolved via aget() and torn
         down by ashutdown() must yield reverse-dependency order.
         """
@@ -316,9 +310,7 @@ class TestAsyncOrdering:
 
         assert order == ["Service", "Repo", "Db", "Config"]
 
-    async def test_mixed_sync_and_async_chain_teardown_order(
-        self, container: DIContainer
-    ) -> None:
+    async def test_mixed_sync_and_async_chain_teardown_order(self, container: DIContainer) -> None:
         """A chain mixing sync and async @PreDestroy hooks still tears down in
         reverse-dependency order under ashutdown().
         """
@@ -357,9 +349,7 @@ class TestAsyncOrdering:
 
         assert order == ["Service", "Db", "Config"]
 
-    async def test_async_disposes_disposer_is_awaited(
-        self, container: DIContainer
-    ) -> None:
+    async def test_async_disposes_disposer_is_awaited(self, container: DIContainer) -> None:
         """An async @Disposes disposer must be awaited by ashutdown()."""
         order: list[str] = []
 
@@ -430,9 +420,7 @@ class TestFailureAggregation:
             assert isinstance(failure.exception, BaseException)
         assert "Good" in ran
 
-    def test_singleton_cache_is_cleared_after_shutdown_error(
-        self, container: DIContainer
-    ) -> None:
+    def test_singleton_cache_is_cleared_after_shutdown_error(self, container: DIContainer) -> None:
         """Caches must always be cleared, even when ShutdownError is raised."""
 
         @Singleton
@@ -449,9 +437,7 @@ class TestFailureAggregation:
 
         assert container._singleton_cache == {}
 
-    def test_shutdown_error_cause_is_first_raised_exception(
-        self, container: DIContainer
-    ) -> None:
+    def test_shutdown_error_cause_is_first_raised_exception(self, container: DIContainer) -> None:
         """exc.__cause__ must be the first captured exception (chained via `from`)."""
         first_error = ValueError("first boom")
 
@@ -477,9 +463,7 @@ class TestFailureAggregation:
 
         assert exc_info.value.__cause__ is first_error
 
-    async def test_async_shutdown_error_aggregates_failures(
-        self, container: DIContainer
-    ) -> None:
+    async def test_async_shutdown_error_aggregates_failures(self, container: DIContainer) -> None:
         """ashutdown() must aggregate failures the same way as shutdown()."""
 
         @Singleton
@@ -552,9 +536,7 @@ class TestIdempotencyAndEviction:
 
         assert calls == ["Resource"]
 
-    def test_override_evicts_instance_from_teardown_plan(
-        self, container: DIContainer
-    ) -> None:
+    def test_override_evicts_instance_from_teardown_plan(self, container: DIContainer) -> None:
         """override() after resolving an interface must drop the evicted instance
         from the teardown plan — no double teardown, no stale-binding error.
         """
@@ -584,9 +566,7 @@ class TestIdempotencyAndEviction:
 
         assert "Original" not in calls
 
-    def test_reset_binding_evicts_instance_from_teardown_plan(
-        self, container: DIContainer
-    ) -> None:
+    def test_reset_binding_evicts_instance_from_teardown_plan(self, container: DIContainer) -> None:
         """reset_binding() after resolving must drop the evicted instance from
         the teardown plan.
         """
@@ -610,9 +590,7 @@ class TestIdempotencyAndEviction:
 
         assert calls == []
 
-    def test_copy_has_independent_empty_teardown_order(
-        self, container: DIContainer
-    ) -> None:
+    def test_copy_has_independent_empty_teardown_order(self, container: DIContainer) -> None:
         """copy() must start with an empty teardown order: shutting it down runs
         no hooks and does not touch the original container's instances.
         """

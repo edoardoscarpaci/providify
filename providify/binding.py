@@ -23,12 +23,15 @@ from .exceptions import (
 from .metadata import (
     DIMetadata,
     ProviderMetadata,
+    RequiresMarker,
     Scope,
     _get_metadata,
     _get_profile_expressions,
     _get_provider_metadata,
+    _get_requires_markers,
+    _is_fallback,
 )
-from .utils import _is_generic_subtype, _type_name
+from .utils import _closing_args, _is_generic_subtype, _open_type_params, _type_name
 
 if TYPE_CHECKING:
     from .container import DIContainer
@@ -59,12 +62,21 @@ class Binding(ABC):
         ...
 
     @abstractmethod
-    def create(self, container: DIContainer) -> Any:
+    def create(self, container: DIContainer, *, requested: Any = None) -> Any:
         """
         Synchronously construct and return an instance for this binding.
 
         Args:
             container: The container used to resolve transitive dependencies.
+            requested: The closed alias being resolved (e.g. ``Repo[User]``)
+                — plan 016. Consulted ONLY by an open :class:`ProviderBinding`
+                (``self.type_params`` non-empty), which needs it to fill its
+                factory's ``type[T]`` parameter and to key its singleton
+                cache per closed alias. Reserved (accepted and ignored) by
+                every other binding kind, including :class:`ClassBinding` —
+                keyword-only with a default so a third-party ``Binding``
+                subclass that does not know about open generics still works
+                unchanged.
 
         Returns:
             A fully constructed and injected instance of the bound type.
@@ -72,12 +84,13 @@ class Binding(ABC):
         ...
 
     @abstractmethod
-    async def acreate(self, container: DIContainer) -> Any:
+    async def acreate(self, container: DIContainer, *, requested: Any = None) -> Any:
         """
         Asynchronously construct and return an instance for this binding.
 
         Args:
             container: The container used to resolve transitive dependencies.
+            requested: See :meth:`create` — identical contract, async mirror.
 
         Returns:
             A fully constructed and injected instance of the bound type.
@@ -187,6 +200,16 @@ class ClassBinding(Binding):
         # DESIGN: resolved once at construction — _filter() runs per
         # resolution and must not re-read markers (plan 005 §Design).
         self.profiles: tuple[str, ...] = _get_profile_expressions(implementation)
+        # DESIGN: same "resolved once at construction" rule as .profiles
+        # above — _filter()'s fallback post-step reads .fallback on every
+        # call and must never re-read the marker off the class itself
+        # (plan 017 §Design, mirrors plan 015's .conditions comment below).
+        self.fallback: bool = _is_fallback(implementation)
+        # DESIGN: same "resolved once at construction" rule as .profiles
+        # above — _binding_is_active() reads .conditions on every _filter()
+        # call, and must never re-read markers off the class itself (plan
+        # 015 §Design). The hot-path short-circuit is `not b.conditions`.
+        self.conditions: tuple[RequiresMarker, ...] = _get_requires_markers(implementation)
 
         meta: DIMetadata | None = _get_metadata(implementation)
         if meta is None:
@@ -237,12 +260,16 @@ class ClassBinding(Binding):
         if scope_violations:
             raise ScopeViolationDetectedError(scope_violations=scope_violations)
 
-    def create(self, container: DIContainer) -> Any:
+    def create(self, container: DIContainer, *, requested: Any = None) -> Any:
         """Instantiate the implementation class synchronously via constructor injection.
 
         Args:
             container: The active ``DIContainer``, used to resolve every
                 ``__init__`` parameter of :attr:`implementation`.
+            requested: Reserved for open-generic ``ProviderBinding``s (plan
+                016) — a ``ClassBinding`` never supports open aliases (see
+                plan 016 §Non-goals: "Changing ClassBinding... — not this
+                plan"), so this is accepted and silently ignored.
 
         Returns:
             A fully constructed instance of :attr:`implementation` with all
@@ -259,7 +286,7 @@ class ClassBinding(Binding):
         container._run_post_construct_sync(instance, self.post_construct)
         return instance
 
-    async def acreate(self, container: DIContainer) -> Any:
+    async def acreate(self, container: DIContainer, *, requested: Any = None) -> Any:
         """Instantiate the implementation class asynchronously via constructor injection.
 
         Async mirror of :meth:`create`. Both sync and async ``@PostConstruct``
@@ -268,6 +295,8 @@ class ClassBinding(Binding):
         Args:
             container: The active ``DIContainer``, used to resolve every
                 ``__init__`` parameter of :attr:`implementation`.
+            requested: Reserved for open-generic ``ProviderBinding``s — see
+                :meth:`create`. Ignored here.
 
         Returns:
             A fully constructed instance of :attr:`implementation` with all
@@ -567,6 +596,27 @@ class ProviderBinding(Binding):
           the result is cached by the container after first call.
         - ``validate()`` is a no-op — provider functions have no constructor
           dependencies to inspect for scope leaks.
+
+    Open generic bindings (plan 016):
+        A ``returns=Repo[T]`` (or ``@Provider(returns=Repo[T])``, or a plain
+        ``-> Repo[T]`` return annotation) whose alias args are ALL plain
+        ``TypeVar``s registers an OPEN binding — one that serves ANY closed
+        request sharing its origin (``get(Repo[User])``, ``get(Repo[Order])``,
+        ...) via the "Autofac resolve-time factory" model: the factory is
+        called once PER closed alias, receiving the closed type through a
+        ``type[T]``-annotated parameter (matched by TypeVar NAME, not
+        identity — see :meth:`type_args_for`). ``self.type_params`` is the
+        non-empty marker of this; ``()`` for every other binding (concrete
+        class, closed alias). See ``plans/016-open-generic-binding.md`` for
+        the full eight-row semantics table.
+
+        Edge cases:
+            - A partially-open alias (``Repo[list[T]]``, ``Pair[str, T]``) —
+              free type parameters that are not ALL plain TypeVars — raises
+              ``TypeError`` here (via :func:`_open_type_params`), at
+              registration, naming the alias: providify has no substitution
+              mechanism for a mixed alias, so registering one would create a
+              binding that can never match any request (plan 016 §Non-goals).
     """
 
     def __init__(self, fn: Callable[..., Any], *, returns: Any = None) -> None:
@@ -649,16 +699,32 @@ class ProviderBinding(Binding):
             # is a *declared* return type (get_type_hints normalises it to NoneType) and
             # must not be confused with "no return annotation at all".
             if "return" not in raw_annotations:
-                raise TypeError(
-                    f"Provider '{fn.__name__}' must declare a return type hint."
-                )
+                raise TypeError(f"Provider '{fn.__name__}' must declare a return type hint.")
             interface = _resolve_return_annotation(raw_annotations["return"], fn)
 
         self.interface = interface
         self.fn = fn
+        # Row 8 (plan 016) — computed ONCE at registration, never in
+        # _filter() (same "resolve markers once" rule as .profiles below).
+        # Raises TypeError for a partially-open alias (mixed TypeVar/concrete
+        # args) — the ONE place this validation happens, so @Provider(returns=),
+        # provide(returns=), and a bare `-> Repo[T]` return annotation can
+        # never disagree about whether an interface is open, closed, or illegal.
+        self.type_params: tuple[Any, ...] = _open_type_params(interface)
         # DESIGN: resolved once at construction — _filter() runs per
         # resolution and must not re-read markers (plan 005 §Design).
         self.profiles: tuple[str, ...] = _get_profile_expressions(fn)
+        # DESIGN: same "resolved once at construction" rule as .profiles
+        # above — _filter()'s fallback post-step reads .fallback on every
+        # call and must never re-read the marker off fn itself (plan 017
+        # §Design). `fn` may be a bound `@Configuration` method, so
+        # `_is_fallback` falls back to `fn.__func__.__dict__`, matching how
+        # `_get_profile_expressions` already reads bound methods above.
+        self.fallback: bool = _is_fallback(fn)
+        # DESIGN: same "resolved once at construction" rule as .profiles
+        # above (plan 015 §Design) — _binding_is_active() reads .conditions
+        # on every _filter() call.
+        self.conditions: tuple[RequiresMarker, ...] = _get_requires_markers(fn)
 
         # Detect async at registration time — avoids repeated inspect calls
         # on every resolution. iscoroutinefunction is cheap but registrations
@@ -689,14 +755,61 @@ class ProviderBinding(Binding):
         else:
             qualifier_part = ""
         async_part = ", async" if self.is_async else ""
+        # plan 016: an open binding's interface already renders its TypeVars
+        # via _type_name (e.g. "Repo[~T]"), but a debugger scanning a long
+        # repr() list benefits from a keyword flag, same style as ", async".
+        open_part = ", open" if self.type_params else ""
         # _type_name handles both concrete types (__name__) and generic aliases (str())
         return (
             f"ProviderBinding("
             f"{_type_name(self.interface)} ← {self.fn.__name__}, "
             f"scope={self.scope.name}"
             f"{qualifier_part}"
-            f"{async_part})"
+            f"{async_part}"
+            f"{open_part})"
         )
+
+    def type_args_for(self, requested: Any) -> dict[str, Any]:
+        """Return ``{TypeVar.__name__: concrete}`` for closing *requested* — row 3.
+
+        The bridge between the lookup-layer wildcard match (:func:`_closing_args`,
+        keyed by ``TypeVar`` OBJECT) and the factory-parameter fill
+        (``DIContainer._collect_kwargs_sync/_async``, matched by ``TypeVar``
+        NAME) — see the module docstring's "Open generic bindings" section
+        for why name, not identity, is the right key: a PEP 695
+        ``def factory[T](entity: type[T])`` and a module-level
+        ``returns=Repo[T]`` use two DIFFERENT ``T`` objects that share a name.
+
+        Args:
+            requested: The type or alias being resolved — e.g. ``Repo[User]``.
+
+        Returns:
+            ``{}`` when :attr:`type_params` is empty (every closed binding —
+            the overwhelmingly common case costs one dict-construction and
+            nothing else) or when *requested* does not close this binding's
+            interface; otherwise ``{"T": User}`` etc., one entry per TypeVar
+            in :attr:`type_params`.
+
+        Edge cases:
+            - Called on a closed binding → always ``{}`` — `_closing_args`
+              returns ``None`` immediately (`_open_type_params` gate).
+            - *requested* does not close this binding (wrong origin, bound
+              violation, ...) → ``{}``, NOT an exception — the container's
+              specificity/bound-as-non-match rules already decided this
+              binding should not have been picked; a defensive empty dict
+              here means a caller that got here anyway (a bug elsewhere)
+              fails at the factory's own missing-parameter error, not here.
+
+        Thread safety:  ✅ Pure function of ``self`` and *requested* — no
+                        shared state.
+        Async safety:   ✅ No awaits.
+        """
+        if not self.type_params:
+            return {}
+        mapping = _closing_args(self.interface, requested)
+        if mapping is None:
+            return {}
+        return {tp.__name__: arg for tp, arg in mapping.items()}
 
     def validate(self, container: DIContainer) -> None:
         """Check this provider binding for scope leaks against the container.
@@ -731,12 +844,18 @@ class ProviderBinding(Binding):
         if scope_violations:
             raise ScopeViolationDetectedError(scope_violations=scope_violations)
 
-    def create(self, container: DIContainer) -> Any:
+    def create(self, container: DIContainer, *, requested: Any = None) -> Any:
         """Invoke the provider function synchronously with all dependencies injected.
 
         Args:
             container: The active ``DIContainer``, used to resolve every
                 parameter of :attr:`fn`.
+            requested: The closed alias being resolved (plan 016) — e.g.
+                ``Repo[User]``. Consulted only when :attr:`type_params` is
+                non-empty (an open binding): supplies the closed type
+                argument the factory's ``type[T]`` parameter needs, and
+                overrides the cycle-detection key (see :meth:`type_args_for`
+                and the Raises entry below).
 
         Returns:
             The value returned by :attr:`fn`.
@@ -746,12 +865,21 @@ class ProviderBinding(Binding):
                 against this before calling ``create()``; use :meth:`acreate`
                 via ``container.aget()`` instead.
             CircularDependencyError: If the provider's return type is already
-                on the resolution stack.
+                on the resolution stack. For an open binding this uses the
+                CLOSED alias (*requested*) as the cycle key, not the open
+                interface — otherwise a factory for ``Repo[T]`` that
+                legitimately resolves ``Repo[Order]`` while producing
+                ``Repo[User]`` would trip a false cycle (both would push the
+                same ``Repo[T]`` key).
             LookupError: If any required parameter of :attr:`fn` has no binding.
         """
-        return container._call_provider(self.fn)
+        return container._call_provider(
+            self.fn,
+            type_args=self.type_args_for(requested),
+            cycle_key=requested if self.type_params else None,
+        )
 
-    async def acreate(self, container: DIContainer) -> Any:
+    async def acreate(self, container: DIContainer, *, requested: Any = None) -> Any:
         """Invoke the provider function asynchronously with all dependencies injected.
 
         Handles both sync and async provider functions transparently — async
@@ -760,16 +888,22 @@ class ProviderBinding(Binding):
         Args:
             container: The active ``DIContainer``, used to resolve every
                 parameter of :attr:`fn`.
+            requested: See :meth:`create` — identical contract, async mirror.
 
         Returns:
             The value returned (or awaited) from :attr:`fn`.
 
         Raises:
             CircularDependencyError: If the provider's return type is already
-                on the resolution stack.
+                on the resolution stack — see :meth:`create`'s Raises entry
+                for the open-binding cycle-key override.
             LookupError: If any required parameter of :attr:`fn` has no binding.
         """
-        return await container._call_provider_async(self.fn)
+        return await container._call_provider_async(
+            self.fn,
+            type_args=self.type_args_for(requested),
+            cycle_key=requested if self.type_params else None,
+        )
 
     def describe(
         self,

@@ -47,9 +47,7 @@ def test_inject_meta_with_default(container: DIContainer):
 
     @Component
     class Consumer:
-        def __init__(
-            self, svc: Annotated[Service, InjectMeta(qualifier=Default)]
-        ) -> None:
+        def __init__(self, svc: Annotated[Service, InjectMeta(qualifier=Default)]) -> None:
             self.svc = svc
 
     container.register(Consumer)

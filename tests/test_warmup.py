@@ -180,9 +180,7 @@ class TestWarmUp:
         # The sync singleton must NOT have been cached either (all-or-nothing)
         assert Alpha.instances_created == 0
 
-    def test_warm_up_noop_when_qualifier_matches_nothing(
-        self, container: DIContainer
-    ) -> None:
+    def test_warm_up_noop_when_qualifier_matches_nothing(self, container: DIContainer) -> None:
         """warm_up(qualifier='nonexistent') with no matching bindings is a no-op."""
         container.register(Alpha)
 
@@ -201,9 +199,7 @@ class TestAWarmUp:
     """Tests for DIContainer.awarm_up() — async eager instantiation."""
 
     @pytest.mark.asyncio
-    async def test_awarm_up_instantiates_sync_singletons(
-        self, container: DIContainer
-    ) -> None:
+    async def test_awarm_up_instantiates_sync_singletons(self, container: DIContainer) -> None:
         """awarm_up() handles plain sync singletons without needing async providers."""
         container.register(Alpha)
         container.register(Beta)
@@ -214,9 +210,7 @@ class TestAWarmUp:
         assert Beta.instances_created == 1
 
     @pytest.mark.asyncio
-    async def test_awarm_up_handles_async_provider(
-        self, container: DIContainer
-    ) -> None:
+    async def test_awarm_up_handles_async_provider(self, container: DIContainer) -> None:
         """awarm_up() must await async singleton providers and cache the result."""
         constructed: list[int] = []  # track order of construction
 
@@ -234,9 +228,7 @@ class TestAWarmUp:
         assert len(constructed) == 1
 
     @pytest.mark.asyncio
-    async def test_awarm_up_handles_mixed_providers(
-        self, container: DIContainer
-    ) -> None:
+    async def test_awarm_up_handles_mixed_providers(self, container: DIContainer) -> None:
         """awarm_up() handles a mix of sync and async singleton providers."""
         async_calls: list[str] = []
 
@@ -254,9 +246,7 @@ class TestAWarmUp:
         assert len(async_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_awarm_up_does_not_double_construct(
-        self, container: DIContainer
-    ) -> None:
+    async def test_awarm_up_does_not_double_construct(self, container: DIContainer) -> None:
         """awarm_up() after aget() must not construct the singleton a second time."""
         container.register(Alpha)
 
@@ -269,9 +259,7 @@ class TestAWarmUp:
         assert Alpha.instances_created == 1
 
     @pytest.mark.asyncio
-    async def test_awarm_up_noop_when_no_singletons(
-        self, container: DIContainer
-    ) -> None:
+    async def test_awarm_up_noop_when_no_singletons(self, container: DIContainer) -> None:
         """awarm_up() on a container with only DEPENDENT bindings is a no-op."""
         from providify import Component
 

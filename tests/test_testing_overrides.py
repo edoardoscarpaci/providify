@@ -118,9 +118,7 @@ class TestRemoveOverride:
 
 
 class TestProfileAndAlternativeOverride:
-    def test_profiles_active_inside_block_and_restored_after(
-        self, container: DIContainer
-    ) -> None:
+    def test_profiles_active_inside_block_and_restored_after(self, container: DIContainer) -> None:
         with ContainerOverrides(container) as ov:
             ov.profiles("test")
             assert "test" in container._active_profiles
@@ -143,9 +141,7 @@ class TestProfileAndAlternativeOverride:
 
 
 class TestExceptionSafety:
-    def test_overrides_are_undone_when_block_raises(
-        self, container: DIContainer
-    ) -> None:
+    def test_overrides_are_undone_when_block_raises(self, container: DIContainer) -> None:
         container.bind(Notifier, Notifier)
         with pytest.raises(ValueError):
             with ContainerOverrides(container) as ov:
@@ -168,9 +164,7 @@ class TestNestedOverrides:
 
 
 class TestExplicitReset:
-    def test_explicit_reset_then_exit_does_not_double_restore(
-        self, container: DIContainer
-    ) -> None:
+    def test_explicit_reset_then_exit_does_not_double_restore(self, container: DIContainer) -> None:
         container.bind(Notifier, Notifier)
         ov = ContainerOverrides(container)
         ov.__enter__()

@@ -25,9 +25,7 @@ from providify.exceptions import ShutdownError
 
 
 class TestModuleReverseInstallOrderTeardown:
-    def test_modules_torn_down_in_exact_reverse_install_order(
-        self, container: DIContainer
-    ) -> None:
+    def test_modules_torn_down_in_exact_reverse_install_order(self, container: DIContainer) -> None:
         """Infra -> Repo -> Service install order must tear down as
         Service -> Repo -> Infra."""
         order: list[str] = []
@@ -57,9 +55,7 @@ class TestModuleReverseInstallOrderTeardown:
 
 
 class TestSingletonsBeforeModules:
-    def test_every_singleton_hook_runs_before_any_module_hook(
-        self, container: DIContainer
-    ) -> None:
+    def test_every_singleton_hook_runs_before_any_module_hook(self, container: DIContainer) -> None:
         """A @Singleton component's @PreDestroy and a module's @PreDestroy
         both recording into the same list: every singleton hook must run
         before any module hook (modules teardown is phase 2)."""
@@ -118,9 +114,7 @@ class TestModulePreDestroyFailureAggregation:
 
 
 class TestModuleShutdownIdempotency:
-    def test_double_shutdown_runs_module_hooks_only_once(
-        self, container: DIContainer
-    ) -> None:
+    def test_double_shutdown_runs_module_hooks_only_once(self, container: DIContainer) -> None:
         calls: list[str] = []
 
         @Configuration

@@ -240,9 +240,7 @@ class TestLiveWithRequestScope:
         """Reset instance counter before each test for clean assertions."""
         RequestToken.reset()
 
-    def test_proxy_resolves_current_request_instance(
-        self, container: DIContainer
-    ) -> None:
+    def test_proxy_resolves_current_request_instance(self, container: DIContainer) -> None:
         """LiveProxy.get() inside a request context must return that request's instance.
 
         The proxy must route through the container's ScopeContext, which caches
@@ -267,9 +265,7 @@ class TestLiveWithRequestScope:
         # Same request context → same scoped instance, but resolved fresh each time
         assert first is second
 
-    def test_different_requests_yield_different_instances(
-        self, container: DIContainer
-    ) -> None:
+    def test_different_requests_yield_different_instances(self, container: DIContainer) -> None:
         """The SAME proxy must return different instances across request contexts.
 
         This is the critical Live[T] contract: the singleton is constructed once,
@@ -300,9 +296,7 @@ class TestLiveWithRequestScope:
         # Each request created exactly one RequestToken — total = 2
         assert RequestToken.instance_count == 2
 
-    def test_inject_would_freeze_but_live_does_not(
-        self, container: DIContainer
-    ) -> None:
+    def test_inject_would_freeze_but_live_does_not(self, container: DIContainer) -> None:
         """Live[T] must produce a new instance per request; Inject[T] would not.
 
         This test documents the exact defect that Live[T] was designed to fix.
@@ -373,9 +367,7 @@ class TestLiveWithSessionScope:
     def setup_method(self) -> None:
         SessionToken.reset()
 
-    def test_proxy_resolves_current_session_instance(
-        self, container: DIContainer
-    ) -> None:
+    def test_proxy_resolves_current_session_instance(self, container: DIContainer) -> None:
         """LiveProxy.get() must return the instance for the currently active session."""
 
         @Singleton
@@ -394,9 +386,7 @@ class TestLiveWithSessionScope:
         # Same session — scoped cache returns the same instance both times
         assert first is second
 
-    def test_different_sessions_yield_different_instances(
-        self, container: DIContainer
-    ) -> None:
+    def test_different_sessions_yield_different_instances(self, container: DIContainer) -> None:
         """The same proxy must return different instances for different session IDs."""
 
         @Singleton
@@ -541,9 +531,7 @@ class TestLiveValidation:
         with pytest.raises(LiveInjectionRequiredError):
             container.get(BadService)
 
-    def test_live_for_request_scoped_passes_validation(
-        self, container: DIContainer
-    ) -> None:
+    def test_live_for_request_scoped_passes_validation(self, container: DIContainer) -> None:
         """Live[T] for a REQUEST-scoped dep must pass validation without error.
 
         This is the positive counterpart to the error tests above — confirms
@@ -564,9 +552,7 @@ class TestLiveValidation:
 
         assert isinstance(svc.token, LiveProxy)
 
-    def test_live_for_session_scoped_passes_validation(
-        self, container: DIContainer
-    ) -> None:
+    def test_live_for_session_scoped_passes_validation(self, container: DIContainer) -> None:
         """Live[T] for a SESSION-scoped dep must pass validation without error."""
 
         @Singleton
@@ -582,9 +568,7 @@ class TestLiveValidation:
 
         assert isinstance(svc.token, LiveProxy)
 
-    def test_error_message_names_the_offending_parameter(
-        self, container: DIContainer
-    ) -> None:
+    def test_error_message_names_the_offending_parameter(self, container: DIContainer) -> None:
         """LiveInjectionRequiredError message must include the parameter name and fix hint.
 
         DESIGN: The error is actionable — it names the exact constructor parameter,
@@ -623,9 +607,7 @@ class UnboundLiveService:
 class TestLiveOptional:
     """Tests for Live[T | None] and Annotated[T, LiveMeta(optional=True)]."""
 
-    def test_live_t_or_none_returns_none_when_not_bound_sync(
-        self, container: DIContainer
-    ) -> None:
+    def test_live_t_or_none_returns_none_when_not_bound_sync(self, container: DIContainer) -> None:
         """Live[T | None] proxy .get() returns None when T has no binding.
 
         Args:
@@ -646,9 +628,7 @@ class TestLiveOptional:
         result = consumer.svc.get()
         assert result is None, "Live[T | None] must return None when T is not bound"
 
-    def test_live_t_or_none_returns_instance_when_bound_sync(
-        self, container: DIContainer
-    ) -> None:
+    def test_live_t_or_none_returns_instance_when_bound_sync(self, container: DIContainer) -> None:
         """Live[T | None] proxy .get() returns the resolved instance when T is bound.
 
         Args:
@@ -680,9 +660,7 @@ class TestLiveOptional:
 
         @Singleton
         class Consumer:
-            def __init__(
-                self, svc: Annotated[UnboundLiveService, LiveMeta(optional=True)]
-            ) -> None:
+            def __init__(self, svc: Annotated[UnboundLiveService, LiveMeta(optional=True)]) -> None:
                 self.svc = svc
 
         container.register(Consumer)
@@ -692,9 +670,7 @@ class TestLiveOptional:
 
         assert result is None, "LiveMeta(optional=True) must return None when not bound"
 
-    async def test_live_t_or_none_returns_none_async_path(
-        self, container: DIContainer
-    ) -> None:
+    async def test_live_t_or_none_returns_none_async_path(self, container: DIContainer) -> None:
         """Live[T | None] proxy .aget() returns None when T has no binding (async path).
 
         Args:
@@ -711,13 +687,9 @@ class TestLiveOptional:
         consumer = await container.aget(Consumer)
         result = await consumer.svc.aget()
 
-        assert (
-            result is None
-        ), "Live[T | None] .aget() must return None when T is not bound"
+        assert result is None, "Live[T | None] .aget() must return None when T is not bound"
 
-    async def test_live_meta_optional_true_async_path(
-        self, container: DIContainer
-    ) -> None:
+    async def test_live_meta_optional_true_async_path(self, container: DIContainer) -> None:
         """Annotated[T, LiveMeta(optional=True)] .aget() returns None when not bound.
 
         Args:
@@ -726,9 +698,7 @@ class TestLiveOptional:
 
         @Singleton
         class Consumer:
-            def __init__(
-                self, svc: Annotated[UnboundLiveService, LiveMeta(optional=True)]
-            ) -> None:
+            def __init__(self, svc: Annotated[UnboundLiveService, LiveMeta(optional=True)]) -> None:
                 self.svc = svc
 
         container.register(Consumer)

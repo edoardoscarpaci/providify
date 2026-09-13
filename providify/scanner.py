@@ -180,16 +180,12 @@ class DefaultContainerScanner(ContainerScanner):
         if package_path is None:
             return
 
-        for module_info in pkgutil.walk_packages(
-            path=package_path, prefix=package.__name__ + "."
-        ):
+        for module_info in pkgutil.walk_packages(path=package_path, prefix=package.__name__ + "."):
             try:
                 submodule = importlib.import_module(module_info.name)
                 self._scan_module(submodule)
             except ImportError as e:
-                LOGGER.warning(
-                    f"[DIContainer] Warning: could not import '{module_info.name}': {e}"
-                )
+                LOGGER.warning(f"[DIContainer] Warning: could not import '{module_info.name}': {e}")
 
     def _autoregister_class(self, cls: type) -> None:
         """Register a DI-annotated class into the container, skipping duplicates.
@@ -206,9 +202,7 @@ class DefaultContainerScanner(ContainerScanner):
         bindings = self._container._bindings
 
         # Guard against scanning the same module twice
-        if any(
-            isinstance(b, ClassBinding) and b.implementation is cls for b in bindings
-        ):
+        if any(isinstance(b, ClassBinding) and b.implementation is cls for b in bindings):
             return
 
         interfaces = self._find_interfaces(cls)

@@ -45,9 +45,7 @@ from ..metadata import _CONFIG_PROPERTIES_ATTR, ConfigPropertiesMetadata
 # ─────────────────────────────────────────────────────────────────
 
 
-def ConfigProperties(
-    *, prefix: str | None = None, sources: tuple[object, ...] | None = None
-):
+def ConfigProperties(*, prefix: str | None = None, sources: tuple[object, ...] | None = None):
     """Mark a class as a typed configuration-binding target.
 
     This is **not** `@Configuration` — see the module-level DESIGN comment
@@ -95,9 +93,7 @@ def ConfigProperties(
         setattr(
             cls,
             _CONFIG_PROPERTIES_ATTR,
-            ConfigPropertiesMetadata(
-                prefix=normalised_prefix, sources=effective_sources
-            ),
+            ConfigPropertiesMetadata(prefix=normalised_prefix, sources=effective_sources),
         )
         return cls
 

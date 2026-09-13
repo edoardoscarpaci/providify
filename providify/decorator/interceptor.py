@@ -214,14 +214,10 @@ def _is_interceptor(cls: type) -> bool:
 
 def _is_interceptor_binding(cls: type) -> bool:
     """Returns True if the class is decorated with @InterceptorBinding."""
-    return isinstance(
-        getattr(cls, _INTERCEPTOR_BINDING_ATTR, None), InterceptorBindingMarker
-    )
+    return isinstance(getattr(cls, _INTERCEPTOR_BINDING_ATTR, None), InterceptorBindingMarker)
 
 
-def _get_marked_method(
-    cls: type, attr: str, marker_cls: type
-) -> Callable[..., Any] | None:
+def _get_marked_method(cls: type, attr: str, marker_cls: type) -> Callable[..., Any] | None:
     """Return the single method on *cls* (MRO-walked) marked with *marker_cls*, or None.
 
     Shared implementation behind `_get_around_invoke_method`,
@@ -248,9 +244,7 @@ def _get_marked_method(
     found: list[Callable[..., Any]] = []
     for base in cls.__mro__:
         for name, val in vars(base).items():
-            if callable(val) and isinstance(
-                getattr(val, "__dict__", {}).get(attr), marker_cls
-            ):
+            if callable(val) and isinstance(getattr(val, "__dict__", {}).get(attr), marker_cls):
                 found.append(val)
     if len(found) > 1:
         names = ", ".join(fn.__name__ for fn in found)

@@ -9,6 +9,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-09-13
+
+### Fixed
+
+- `@Disposes` wiring attached to the first matching `ProviderBinding` in the
+  whole container instead of the installing module's own — with two
+  `@Configuration`s providing the same interface, the second module's
+  disposer overwrote the first's and the second module's instance was never
+  torn down (silent leak on `shutdown()`/`ashutdown()`). Wiring is now scoped
+  to the bindings the same `install()`/`ainstall()` registered.
+  **Behaviour change:** a `@Disposes(X)` on a module that declares no `X`
+  provider no longer attaches to another module's binding; `validate()` now
+  reports it as `UNMATCHED_DISPOSER`. (P24-DISPOSES-FIRSTMATCH, plan 014.)
+
+### Added
+
+- `IssueKind.DISPOSER_OVERWRITTEN`, `IssueKind.UNMATCHED_DISPOSER` — both
+  `WARNING`; can newly make `report.ok` `False`.
+- `DIContainer.provide()` now returns the `ProviderBinding` it registered
+  (was `None`).
+- `@Requires(condition=..., env=..., value=...)` — gates a class or
+  `@Provider` function on a predicate evaluated lazily at resolve time, the
+  third conjunct of binding activation beside `@Profile` and `@Alternative`.
+  `RequiresMarker` (the stamped, frozen dataclass) and
+  `ConditionEvaluationError` (raised when a predicate raises, from every
+  public lookup path and from `validate()`) are new public names. See
+  `plans/015-requires-conditional-registration.md`.
+- `Severity.INFO` and `IssueKind.CONDITION_INACTIVE` — `container.validate()`
+  reports one `CONDITION_INACTIVE` (`INFO`) issue per binding whose
+  `@Requires` currently evaluates `False`; `ValidationReport.infos` is the
+  new third partition alongside `.errors`/`.warnings`. `INFO` issues never
+  raise and never affect `report.ok`. `repr(report)` now has a third
+  `[INFO]` tier — a report with only `INFO` issues renders them where
+  before they were silently omitted. `DIContainer._validated` is **not**
+  set when only `INFO` issues are present, matching the existing
+  errors-and-warnings-only rule.
+- `@Fallback` and `FallbackMarker` — marks a class or `@Provider`
+  function/method as a default binding: a candidate **only when no active
+  non-fallback binding matches the same request** `(interface, qualifier,
+  priority)`. Evaluated lazily, at resolve time — the same moment
+  `@Profile`/`@Alternative`/`@Requires` are checked — so a shadowing binding
+  registered after the fallback still wins on the next lookup. Honoured by
+  `get()`, `aget()`, `get_all()`, `aget_all()`, `is_resolvable()`,
+  `get_binding()`, `get_all_bindings()`, and `list[T]` multibinding
+  collection — a shadowed fallback is excluded from every one of them. An
+  unqualified fallback yields to a qualified non-fallback sibling only for
+  an unqualified request; a fallback with its own qualifier still wins its
+  own qualified request (the `qualifier="in_memory"` escape hatch keeps
+  working). Mirrors Quarkus's `@DefaultBean`, adapted to providify's
+  resolve-time evaluation model. See `plans/017-fallback-binding.md`.
+- `IssueKind.FALLBACK_SHADOWED` — `container.validate()` reports one
+  `FALLBACK_SHADOWED` (`INFO`) issue per active `@Fallback` binding whose own
+  natural request is currently won by an active non-fallback binding — the
+  feature working as declared, not a defect. `ValidationIssue.shadowed_by`
+  (new field, emitted by `to_dict()`) names the winning binding's owner.
+  Never raises, never affects `report.ok`, same tier as
+  `CONDITION_INACTIVE`.
+- **Open-generic provider bindings** — `container.provide(factory,
+  returns=Repo[T])` (or `@Provider(returns=Repo[T])`, or a bare `-> Repo[T]`
+  return annotation) whose alias args are ALL plain `TypeVar`s now registers
+  an OPEN binding, served at resolve time by any closed request sharing its
+  origin (`get(Repo[User])`, `get(Repo[Order])`, `get_all(Repo[User])`,
+  `InjectInstances[Repo[User]]`, a bare `repo: Repo[User]` constructor
+  parameter, `Lazy[Repo[User]]`, ...). Adapts Autofac's resolve-time factory
+  model — Python has no runtime "instantiate the closed generic type with
+  substituted parameters", so the factory receives the closed type as a
+  *value* through a `type[T]`-annotated parameter, matched by TypeVar NAME
+  (PEP 695-safe). Eight governing rules, all documented on
+  `DIContainer.provide()`: (1) binding-side `TypeVar` is a wildcard, a
+  request-side `TypeVar` and a bare request are not; (2) a closed binding
+  always beats an open one, regardless of priority/order; (3) `type[T]`
+  delivery by name, silently omitted for an ANNOTATED parameter that does
+  not use this exact shape or name — except a factory with exactly one
+  un-delivered closing value and a completely UNANNOTATED, no-default
+  parameter (`lambda entity: Repo(entity)`), which gets it positionally
+  (the single-`TypeVar` "positional by TypeVar" idiom); (4) `singleton=True`
+  caches ONE instance PER CLOSED ALIAS — never one
+  instance shared across every closed type, the "dangerous anti-pattern" a
+  naive cache-by-binding implementation would default to; (5) `get_all`/
+  `InjectInstances` include the open binding once per closed request, never
+  expand a bare request; (6) `validate()` skips the `type[T]` parameter as a
+  graph edge and checks closed requests against open bindings; (7) a
+  `bound=`/constraint violation is a non-match, not a resolve-time error;
+  (8) every alias arg must be all-`TypeVar` (open) or all-concrete (closed)
+  — a mixed alias (`Repo[list[T]]`, `Pair[str, T]`) raises `TypeError` at
+  registration. See `plans/016-open-generic-binding.md` and the README's
+  "Open-generic providers" section.
+
+### Changed
+
+- `utils._interface_matches()` — the both-generic-alias branch now also
+  matches an open binding-side alias (`Repo[T]`) against a closed request
+  (`Repo[User]`) via a new wildcard check (`utils._closing_args`), on top of
+  the existing literal `get_args() == get_args()` comparison. A **bare**
+  request (`Repo`) still matches an open binding structurally (unchanged,
+  fourth branch) — the new "an open binding needs closing args to actually
+  serve a request" rule lives one layer up, in the lookup-only
+  `DIContainer._binding_serves()`, so `@Disposes(Repo)`/`reset_binding(Repo)`
+  keep wiring to open bindings exactly as before.
+- `utils._type_name()` now renders a parameterised generic alias with SHORT
+  names at every level (`"Repository[User]"`) instead of Python's own fully
+  module-qualified `str()` (`"mymod.Repository[mymod.User]"`) — every
+  `LookupError`/`CircularDependencyError`/`validate()` message that names a
+  generic alias is correspondingly shorter and less noisy.
+
+⚠️ **Two narrow behaviour changes**, both on registrations that were never
+resolvable for a closed request before this release:
+
+- A provider whose interface is an open alias (`returns=Repo[T]`) is no
+  longer served for a **bare** origin request (`get(Repo)`) — previously it
+  was served with an uninformed factory call (no type information at all);
+  now it raises `LookupError`, matching `is_resolvable(Repo) is False`. A
+  coexisting closed `Repo[User]` binding is unaffected and still resolves
+  `get(Repo)` normally.
+- A partially-open alias (`Repo[list[T]]`, `Pair[str, T]`) now raises
+  `TypeError` at registration (`provide()`/`@Provider`/`install()`/`scan()`)
+  instead of silently registering a binding that could never match any
+  closed request.
+
 ## [2.0.1] — 2026-09-01
 
 ### Added
@@ -653,7 +772,8 @@ deprecation policy in [CONTRIBUTING.md](CONTRIBUTING.md#versioning-and-deprecati
 
 ---
 
-[Unreleased]: https://github.com/edoardoscarpaci/providify/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/edoardoscarpaci/providify/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/edoardoscarpaci/providify/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/edoardoscarpaci/providify/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/edoardoscarpaci/providify/releases/tag/v2.0.0
 [0.1.7]: https://github.com/edoardoscarpaci/providify/compare/v0.1.6...v0.1.7

@@ -99,9 +99,7 @@ class TestResolveInstallOrder:
 
         # Patch the marker after the fact so it can name the class itself —
         # the class object does not exist yet inside its own class body.
-        setattr(
-            Self_, _DI_CONFIGURATION_ATTR, ConfigurationMetadata(depends_on=(Self_,))
-        )
+        setattr(Self_, _DI_CONFIGURATION_ATTR, ConfigurationMetadata(depends_on=(Self_,)))
 
         with pytest.raises(ModuleCycleError):
             resolve_install_order([Self_])

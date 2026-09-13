@@ -174,6 +174,12 @@ bypasses return-annotation reading; nothing to patch, nothing to order.
 **Symptom:** the patched annotation silently drifts from what the factory
 actually returns after a refactor, since nothing ties the two together.
 
+Note: when every closed type shares one factory shape, an **open-generic**
+registration (`returns=Repository[T]`, plan 016) removes the per-type
+`provide()` loop entirely — one registration serves every closed request
+(`get(Repository[User])`, `get(Repository[Order])`, ...) instead of one
+`provide()` call per type. See `usage-rules.md` R10.
+
 ---
 
 ## Quick self-check before finishing

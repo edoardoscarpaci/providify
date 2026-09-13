@@ -100,9 +100,7 @@ _MARKER_TEXT_RE = re.compile(
 )
 
 
-def _eval_annotation(
-    raw: Any, globalns: dict[str, Any], localns: dict[str, Any]
-) -> Any:
+def _eval_annotation(raw: Any, globalns: dict[str, Any], localns: dict[str, Any]) -> Any:
     """Evaluate ONE annotation in isolation, with `get_type_hints`'s exact semantics.
 
     The naive approach — hand-rolled `eval()` plus manual `ForwardRef` /
@@ -225,9 +223,7 @@ def _annotation_namespaces(
         # fall back to the DEFINING class's module (via __objclass__ when
         # present, e.g. C-implemented methods), not the caller's module.
         objclass = getattr(unwrapped, "__objclass__", None)
-        module_name = getattr(
-            objclass if objclass is not None else unwrapped, "__module__", None
-        )
+        module_name = getattr(objclass if objclass is not None else unwrapped, "__module__", None)
         module = sys.modules.get(module_name) if module_name else None
         globalns = vars(module) if module is not None else {}
 
@@ -299,9 +295,7 @@ def _sniff_node(
             node.value, node.slice, globalns, localns, allow_textual, raw_text
         )
     if isinstance(node, ast.Call):
-        return _sniff_subscript_or_call(
-            node.func, None, globalns, localns, allow_textual, raw_text
-        )
+        return _sniff_subscript_or_call(node.func, None, globalns, localns, allow_textual, raw_text)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
         # `X | None` (PEP-604 union) — recurse into the non-`None` operand(s).
         # `Live[Foo | None]`'s *inner* union is never itself the thing being
@@ -374,9 +368,7 @@ def _sniff_subscript_or_call(
     # is neither necessary (the marker identity check doesn't need it) nor
     # safe (X is frequently the very name that made the whole annotation
     # unresolvable in the first place).
-    return _sniff_head(
-        head_src, globalns, localns, allow_textual, raw_text, wrapped=True
-    )
+    return _sniff_head(head_src, globalns, localns, allow_textual, raw_text, wrapped=True)
 
 
 def _sniff_head(
@@ -508,9 +500,7 @@ def _resolve_one(
 
     classification = _sniff_injection_marker(raw, globalns, localns, allow_textual=True)
     if classification == "inject":
-        raise AnnotationResolutionError(
-            owner_name, name_error, param_name=name
-        ) from name_error
+        raise AnnotationResolutionError(owner_name, name_error, param_name=name) from name_error
     if classification == "not-inject":
         return _SKIP
 
@@ -529,9 +519,7 @@ def _resolve_one(
         # today's behaviour didn't already produce (minus the spurious
         # whole-signature hint loss Phase 7 removes).
         return _SKIP
-    raise AnnotationResolutionError(
-        owner_name, name_error, param_name=name
-    ) from name_error
+    raise AnnotationResolutionError(owner_name, name_error, param_name=name) from name_error
 
 
 def resolve_params(

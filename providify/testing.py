@@ -191,9 +191,7 @@ class ContainerOverrides:
         self._container.provide(fn, returns=interface)
         return self
 
-    def remove(
-        self, interface: Any, *, qualifier: str | type | None = None
-    ) -> ContainerOverrides:
+    def remove(self, interface: Any, *, qualifier: str | type | None = None) -> ContainerOverrides:
         """Unregister *interface*, making it unresolvable for the block's duration.
 
         Thin delegate to `DIContainer.reset_binding()`.
