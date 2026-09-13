@@ -54,9 +54,7 @@ from providify.type import (
 class TestReportShape:
     """`validate()` / `ValidationReport` structural contract."""
 
-    def test_empty_container_returns_empty_ok_report(
-        self, container: DIContainer
-    ) -> None:
+    def test_empty_container_returns_empty_ok_report(self, container: DIContainer) -> None:
         """An empty container has nothing to validate — report is empty and ok."""
         report = container.validate()
 
@@ -78,9 +76,7 @@ class TestReportShape:
         assert report.ok is True
         assert report.errors == ()
 
-    def test_to_dict_round_trips_to_json_safe_primitives(
-        self, container: DIContainer
-    ) -> None:
+    def test_to_dict_round_trips_to_json_safe_primitives(self, container: DIContainer) -> None:
         """to_dict() must be safe to json.dumps() — only str/int/bool/list/dict/None."""
         import json
 
@@ -105,14 +101,20 @@ class TestReportShape:
 
         assert "__bool__" not in type(report).__dict__
 
-    def test_errors_and_warnings_properties_partition_issues(
-        self, container: DIContainer
-    ) -> None:
-        """report.errors / report.warnings must be disjoint views of report.issues."""
+    def test_errors_and_warnings_properties_partition_issues(self, container: DIContainer) -> None:
+        """report.errors / report.warnings / report.infos must be disjoint views
+        of report.issues (plan 015 adds the third INFO tier)."""
         report = container.validate()
 
         assert isinstance(report.errors, tuple)
         assert isinstance(report.warnings, tuple)
+        assert isinstance(report.infos, tuple)
+
+    def test_severity_has_info_member(self) -> None:
+        """Plan 015 adds Severity.INFO alongside ERROR/WARNING."""
+        from providify.validation import Severity
+
+        assert Severity.INFO == "info"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -311,9 +313,7 @@ class _Unbound:
 
 
 class TestMissingBindingDetection:
-    def test_unbound_inject_without_default_is_error(
-        self, container: DIContainer
-    ) -> None:
+    def test_unbound_inject_without_default_is_error(self, container: DIContainer) -> None:
         """Inject[T] with no default and no binding must be reported ERROR."""
         from providify.validation import IssueKind, Severity
 
@@ -331,9 +331,7 @@ class TestMissingBindingDetection:
         assert missing[0].severity == Severity.ERROR
         assert missing[0].param_name == "dep"
 
-    def test_unbound_inject_with_default_is_warning(
-        self, container: DIContainer
-    ) -> None:
+    def test_unbound_inject_with_default_is_warning(self, container: DIContainer) -> None:
         """Inject[T] with a default falls back safely at runtime → WARNING only."""
         from providify.validation import IssueKind, Severity
 
@@ -346,16 +344,12 @@ class TestMissingBindingDetection:
 
         report = container.validate(raise_on_error=False)
 
-        defaulted = [
-            i for i in report.issues if i.kind == IssueKind.MISSING_BINDING_DEFAULTED
-        ]
+        defaulted = [i for i in report.issues if i.kind == IssueKind.MISSING_BINDING_DEFAULTED]
         assert len(defaulted) == 1
         assert defaulted[0].severity == Severity.WARNING
         assert report.ok is True  # warnings never make ok False
 
-    def test_unbound_optional_inject_produces_no_issue(
-        self, container: DIContainer
-    ) -> None:
+    def test_unbound_optional_inject_produces_no_issue(self, container: DIContainer) -> None:
         """Inject[T | None] documents a legal None injection — no issue at all."""
 
         @Singleton
@@ -369,9 +363,7 @@ class TestMissingBindingDetection:
 
         assert report.issues == ()
 
-    def test_unbound_inject_instances_produces_no_issue(
-        self, container: DIContainer
-    ) -> None:
+    def test_unbound_inject_instances_produces_no_issue(self, container: DIContainer) -> None:
         """InjectInstances[T] with zero candidates legally returns [] — no issue."""
 
         @Singleton
@@ -431,9 +423,7 @@ class TestMissingBindingDetection:
 
         report = container.validate(raise_on_error=False)
 
-        deferred = [
-            i for i in report.issues if i.kind == IssueKind.MISSING_BINDING_DEFERRED
-        ]
+        deferred = [i for i in report.issues if i.kind == IssueKind.MISSING_BINDING_DEFERRED]
         assert len(deferred) == 1
         assert deferred[0].severity == Severity.WARNING
 
@@ -450,9 +440,7 @@ class TestMissingBindingDetection:
 
         report = container.validate(raise_on_error=False)
 
-        deferred = [
-            i for i in report.issues if i.kind == IssueKind.MISSING_BINDING_DEFERRED
-        ]
+        deferred = [i for i in report.issues if i.kind == IssueKind.MISSING_BINDING_DEFERRED]
         assert len(deferred) == 1
 
     def test_var_positional_and_var_keyword_are_never_reported(
@@ -462,9 +450,7 @@ class TestMissingBindingDetection:
 
         @Singleton
         class Svc:
-            def __init__(
-                self, *args: Inject[_Unbound], **kwargs: Inject[_Unbound]
-            ) -> None:
+            def __init__(self, *args: Inject[_Unbound], **kwargs: Inject[_Unbound]) -> None:
                 self.args = args
                 self.kwargs = kwargs
 
@@ -570,9 +556,7 @@ class TestAmbiguousBindingDetection:
 
         assert not [i for i in report.issues if i.kind == IssueKind.AMBIGUOUS_BINDING]
 
-    def test_different_qualifiers_are_not_ambiguous(
-        self, container: DIContainer
-    ) -> None:
+    def test_different_qualifiers_are_not_ambiguous(self, container: DIContainer) -> None:
         """Distinct qualifiers mean the injection point only ever sees one candidate."""
         from providify.validation import IssueKind
 
@@ -608,9 +592,7 @@ class _CycleProduct:
 
 
 class TestStaticCycleDetection:
-    def test_two_class_cycle_via_inject_is_one_error(
-        self, container: DIContainer
-    ) -> None:
+    def test_two_class_cycle_via_inject_is_one_error(self, container: DIContainer) -> None:
         from providify.validation import IssueKind, Severity
 
         @Singleton
@@ -632,9 +614,7 @@ class TestStaticCycleDetection:
         assert len(cycles) == 1
         assert cycles[0].severity == Severity.ERROR
 
-    def test_cycle_broken_by_lazy_on_one_side_is_not_reported(
-        self, container: DIContainer
-    ) -> None:
+    def test_cycle_broken_by_lazy_on_one_side_is_not_reported(self, container: DIContainer) -> None:
         """Lazy[T] is the documented cycle-breaker — no edge, no cycle issue."""
         from providify.validation import IssueKind
 
@@ -655,9 +635,7 @@ class TestStaticCycleDetection:
 
         assert not [i for i in report.issues if i.kind == IssueKind.CIRCULAR_DEPENDENCY]
 
-    def test_cycle_via_live_or_instance_is_not_reported(
-        self, container: DIContainer
-    ) -> None:
+    def test_cycle_via_live_or_instance_is_not_reported(self, container: DIContainer) -> None:
         """Live[T]/Instance[T] proxies never resolve during construction — no edge."""
         from providify.validation import IssueKind
 
@@ -693,9 +671,7 @@ class TestStaticCycleDetection:
         cycles = [i for i in report.issues if i.kind == IssueKind.CIRCULAR_DEPENDENCY]
         assert len(cycles) == 1
 
-    def test_three_node_cycle_reported_exactly_once(
-        self, container: DIContainer
-    ) -> None:
+    def test_three_node_cycle_reported_exactly_once(self, container: DIContainer) -> None:
         from providify.validation import IssueKind
 
         @Singleton
@@ -722,9 +698,7 @@ class TestStaticCycleDetection:
         cycles = [i for i in report.issues if i.kind == IssueKind.CIRCULAR_DEPENDENCY]
         assert len(cycles) == 1
 
-    def test_two_disjoint_cycles_report_two_issues(
-        self, container: DIContainer
-    ) -> None:
+    def test_two_disjoint_cycles_report_two_issues(self, container: DIContainer) -> None:
         from providify.validation import IssueKind
 
         @Singleton
@@ -783,9 +757,7 @@ class TestStaticCycleDetection:
 
         assert not [i for i in report.issues if i.kind == IssueKind.CIRCULAR_DEPENDENCY]
 
-    def test_provider_class_provider_cycle_is_one_issue(
-        self, container: DIContainer
-    ) -> None:
+    def test_provider_class_provider_cycle_is_one_issue(self, container: DIContainer) -> None:
         from providify.validation import IssueKind
 
         @Singleton
@@ -805,9 +777,7 @@ class TestStaticCycleDetection:
         cycles = [i for i in report.issues if i.kind == IssueKind.CIRCULAR_DEPENDENCY]
         assert len(cycles) == 1
 
-    def test_diamond_shared_dependency_is_not_a_cycle(
-        self, container: DIContainer
-    ) -> None:
+    def test_diamond_shared_dependency_is_not_a_cycle(self, container: DIContainer) -> None:
         from providify.validation import IssueKind
 
         @Component
@@ -891,9 +861,7 @@ class TestAggregateRaise:
         assert report.ok is False
         assert len(report.errors) >= 1
 
-    def test_warnings_only_container_does_not_raise(
-        self, container: DIContainer
-    ) -> None:
+    def test_warnings_only_container_does_not_raise(self, container: DIContainer) -> None:
         """A warning-only report must never raise, even with raise_on_error=True."""
 
         @Singleton
@@ -907,9 +875,7 @@ class TestAggregateRaise:
 
         assert report.ok is True
 
-    def test_exception_message_contains_every_error_message(
-        self, container: DIContainer
-    ) -> None:
+    def test_exception_message_contains_every_error_message(self, container: DIContainer) -> None:
         from providify.exceptions import ContainerValidationError
 
         @Singleton
@@ -939,9 +905,7 @@ class TestAggregateRaise:
 
 
 class TestCompositionGuards:
-    def test_validate_does_not_populate_singleton_cache(
-        self, container: DIContainer
-    ) -> None:
+    def test_validate_does_not_populate_singleton_cache(self, container: DIContainer) -> None:
         """validate() is pure introspection — never instantiates anything."""
 
         @Singleton
@@ -1005,9 +969,7 @@ class TestCompositionGuards:
         assert isinstance(errors, list)
         container.validate_bindings()  # must not raise for a missing-binding-only issue
 
-    def test_calling_validate_twice_yields_identical_report(
-        self, container: DIContainer
-    ) -> None:
+    def test_calling_validate_twice_yields_identical_report(self, container: DIContainer) -> None:
         @Component
         class Wired:
             pass

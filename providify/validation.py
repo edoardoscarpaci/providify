@@ -45,7 +45,11 @@ class Severity(StrEnum):
     what makes :meth:`~providify.container.DIContainer.validate` raise by
     default. ``WARNING`` issues describe a legal-but-notable pattern (a
     defaulted parameter with no binding, a caller-parameterised proxy with
-    nothing registered today) that never raises on its own.
+    nothing registered today) that never raises on its own. ``INFO`` issues
+    (plan 015) describe the container doing exactly what it was told —
+    recorded purely so a wiring report can explain *why* a candidate is not
+    the live one (e.g. an inactive ``@Requires`` condition); they never
+    raise and never affect :attr:`ValidationReport.ok`.
 
     Thread safety:  ✅ Safe — ``StrEnum`` members are immutable singletons.
     Async safety:   ✅ Safe — same reason.
@@ -53,6 +57,7 @@ class Severity(StrEnum):
 
     ERROR = "error"
     WARNING = "warning"
+    INFO = "info"
 
 
 class IssueKind(StrEnum):
@@ -94,6 +99,24 @@ class IssueKind(StrEnum):
     #: never run. Mirrors Jakarta CDI: producer-returned objects receive no
     #: lifecycle callbacks, so `@Disposes` is the only teardown path for them.
     UNREACHABLE_PRE_DESTROY = "unreachable_pre_destroy"
+    #: Two `@Disposes` methods on ONE @Configuration resolved to the same
+    #: ProviderBinding it registered; the later one (definition order)
+    #: replaced the earlier, which will therefore never run.
+    DISPOSER_OVERWRITTEN = "disposer_overwritten"
+    #: A `@Disposes(X)` on a @Configuration matches none of the bindings
+    #: that @Configuration itself registered — it is attached to nothing.
+    #: A disposer only ever tears down its own module's providers.
+    UNMATCHED_DISPOSER = "unmatched_disposer"
+    #: A binding carries `@Requires` whose condition currently evaluates
+    #: `False` — excluded from resolution, working as declared.
+    #: Informational (`Severity.INFO`); exists so wiring reports can
+    #: explain why a candidate is not the live one.
+    CONDITION_INACTIVE = "condition_inactive"
+    #: An active `@Fallback` binding that `get(interface, qualifier=...)`
+    #: would not return because an active non-fallback binding matches the
+    #: same request. `Severity.INFO` — expected, not a defect: the fallback
+    #: is doing exactly what a default is supposed to do (plan 017 §Design).
+    FALLBACK_SHADOWED = "fallback_shadowed"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -114,23 +137,37 @@ class ValidationIssue:
 
     Attributes:
         kind:       Discriminator — see :class:`IssueKind`.
-        severity:   :class:`Severity.ERROR` or :class:`Severity.WARNING`.
+        severity:   :class:`Severity.ERROR`, :class:`Severity.WARNING`,
+                    or :class:`Severity.INFO`.
         owner:      Human-readable owner of the injection point, e.g.
                     ``"OrderService.__init__"`` or ``"@Provider(make_db)"``.
+                    For ``UNMATCHED_DISPOSER``, ``"ModuleName.method_name"``
+                    (plan 014) — the disposer has no own binding to be
+                    "owned by", so it names itself instead.
         message:    A complete, actionable, one-line message with a fix hint
                     — safe to print directly to a log or console.
         param_name: The specific parameter/class-attribute name, when known.
                     ``None`` for graph-level issues (e.g. cycles) that are
                     not anchored to a single parameter. For
                     ``UNREACHABLE_PRE_DESTROY``, the unreachable hook's
-                    method name.
+                    method name. For ``DISPOSER_OVERWRITTEN`` /
+                    ``UNMATCHED_DISPOSER``, the `@Disposes` method name (the
+                    winning one, for ``DISPOSER_OVERWRITTEN``).
         requested:  ``_type_name()`` of the type the injection point asked
                     for. ``None`` when not applicable (e.g. cycles). For
                     ``UNREACHABLE_PRE_DESTROY``, the type the provider
-                    produces.
-        qualifier:  The qualifier the injection point requested, if any.
+                    produces. For ``DISPOSER_OVERWRITTEN`` /
+                    ``UNMATCHED_DISPOSER``, the `@Disposes(...)` argument. For
+                    ``FALLBACK_SHADOWED``, the fallback's own interface (not
+                    the shadowing winner's).
+        qualifier:  The qualifier the injection point requested, if any. For
+                    ``FALLBACK_SHADOWED``, the fallback binding's own
+                    qualifier (its natural request, not the winner's).
         candidates: Populated only for ``AMBIGUOUS_BINDING`` — the
                     human-readable names of every tied candidate.
+        shadowed_by: Populated only for ``FALLBACK_SHADOWED`` — the
+                    ``owner`` label of the binding that wins the fallback's
+                    natural request (plan 017 §Design).
 
     Example:
         ValidationIssue(
@@ -151,6 +188,9 @@ class ValidationIssue:
     requested: str | None = None
     qualifier: str | type | None = None
     candidates: tuple[str, ...] = field(default_factory=tuple)
+    # Trailing field (plan 017) — additive, so existing positional/keyword
+    # construction of ValidationIssue elsewhere in the repo is unaffected.
+    shadowed_by: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert this issue to a plain, JSON/YAML-safe dict.
@@ -179,6 +219,7 @@ class ValidationIssue:
                 else None
             ),
             "candidates": list(self.candidates),
+            "shadowed_by": self.shadowed_by,
         }
 
 
@@ -198,8 +239,9 @@ class ValidationReport:
     Attributes:
         issues:           Every issue found, in the order the graph walk
                            produced them (binding registration order, then
-                           per-binding injection-point order; cycles appended
-                           last).
+                           per-binding injection-point order; then
+                           module-level disposer-wiring issues in install
+                           order; cycles appended last).
         checked_bindings: Total number of bindings inspected — equal to
                            ``len(container._bindings)`` at validation time.
 
@@ -230,11 +272,17 @@ class ValidationReport:
         return tuple(i for i in self.issues if i.severity is Severity.WARNING)
 
     @property
+    def infos(self) -> tuple[ValidationIssue, ...]:
+        """Every ``INFO``-severity issue, preserving report order (plan 015)."""
+        return tuple(i for i in self.issues if i.severity is Severity.INFO)
+
+    @property
     def ok(self) -> bool:
         """``True`` iff there are no ``ERROR``-severity issues.
 
         Note: a report with warnings only is still ``ok``  — warnings never
-        block startup, only errors do (see :class:`Severity`).
+        block startup, only errors do (see :class:`Severity`). INFO issues,
+        like warnings, never make ``ok`` ``False`` either.
         """
         return not self.errors
 
@@ -262,6 +310,7 @@ class ValidationReport:
             ValidationReport(checked_bindings=N, ok=True/False)
               [ERROR] <owner>: <message>
               [WARNING] <owner>: <message>
+              [INFO] <owner>: <message>
               ...
 
         Returns:
@@ -270,9 +319,12 @@ class ValidationReport:
         header = f"ValidationReport(checked_bindings={self.checked_bindings}, ok={self.ok})"
         if not self.issues:
             return header
-        # Errors first, then warnings — the more actionable tier leads.
+        # Errors first, then warnings, then infos — the more actionable tier
+        # leads. Without *self.infos here an INFO issue would still be in
+        # `self.issues`/`to_dict()` but silently vanish from the printed
+        # report (plan 015 §Risks, "__repr__ silent-drop risk").
         lines = [header]
-        for issue in (*self.errors, *self.warnings):
+        for issue in (*self.errors, *self.warnings, *self.infos):
             lines.append(f"  [{issue.severity.value.upper()}] {issue.owner}: {issue.message}")
         return "\n".join(lines)
 

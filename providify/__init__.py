@@ -20,6 +20,10 @@ __all__ = [
     "Alternative",
     "Profile",
     "ProfileMetadata",
+    "Fallback",
+    "FallbackMarker",
+    "Requires",
+    "RequiresMarker",
     "Stereotype",
     "StereotypeMetadata",
     "Decorator",
@@ -61,6 +65,7 @@ __all__ = [
     "ConfigBindingError",
     "ConfigIssue",
     "ModuleCycleError",
+    "ConditionEvaluationError",
     # Binding and descriptor types — for type annotations and introspection
     "AnyBinding",
     "BindingDescriptor",
@@ -151,6 +156,7 @@ from .decorator.scope import (
     Component,
     Decorator,
     Default,
+    Fallback,
     Inheritable,
     Named,
     # Priority is a field-update decorator (same module as Named) — it was
@@ -161,6 +167,7 @@ from .decorator.scope import (
     # Jakarta CDI parity decorators
     Qualifier,
     RequestScoped,
+    Requires,
     SessionScoped,
     Singleton,
     Stereotype,
@@ -171,6 +178,7 @@ from .exceptions import (
     BindingError,
     CircularDependencyError,
     ClassBindingNotDecoratedError,
+    ConditionEvaluationError,
     ConfigBindingError,
     ConfigIssue,
     ContainerValidationError,
@@ -185,7 +193,9 @@ from .exceptions import (
 from .field import Advised, FieldAccessContext
 from .metadata import (
     ConfigPropertiesMetadata,
+    FallbackMarker,
     ProfileMetadata,
+    RequiresMarker,
     Scope,
     StereotypeMetadata,
 )

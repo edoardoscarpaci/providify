@@ -64,9 +64,7 @@ class TestTransitiveInstallOrder:
 
 
 class TestInstallDedup:
-    def test_double_install_registers_providers_once(
-        self, container: DIContainer
-    ) -> None:
+    def test_double_install_registers_providers_once(self, container: DIContainer) -> None:
         """Calling install() twice on the same module must not double-register
         its providers."""
 
@@ -220,9 +218,7 @@ class TestInstallTypeErrorGuardUnchanged:
 
 
 class TestInstallCycleLeavesNoPartialInstallation:
-    def test_depends_on_cycle_raises_and_installs_nothing(
-        self, container: DIContainer
-    ) -> None:
+    def test_depends_on_cycle_raises_and_installs_nothing(self, container: DIContainer) -> None:
         """A cycle must be detected before any instantiation — binding count
         must be unchanged after the raise."""
 

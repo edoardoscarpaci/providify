@@ -79,9 +79,7 @@ class TestRegistration:
         assert binding.interface is EmailNotifier
         assert binding.implementation is EmailNotifier  # type: ignore[union-attr]
 
-    def test_register_raises_for_undecorated_class(
-        self, container: DIContainer
-    ) -> None:
+    def test_register_raises_for_undecorated_class(self, container: DIContainer) -> None:
         """register() should raise TypeError when the class has no DI decorator."""
 
         class Bare:
@@ -152,16 +150,12 @@ class TestGet:
 
         assert isinstance(result, EmailNotifier)
 
-    def test_raises_lookup_error_for_unregistered_type(
-        self, container: DIContainer
-    ) -> None:
+    def test_raises_lookup_error_for_unregistered_type(self, container: DIContainer) -> None:
         """get() must raise LookupError when no binding matches the requested type."""
         with pytest.raises(LookupError, match="No binding found"):
             container.get(Notifier)
 
-    def test_raises_for_async_provider_on_sync_get(
-        self, container: DIContainer
-    ) -> None:
+    def test_raises_for_async_provider_on_sync_get(self, container: DIContainer) -> None:
         """get() must raise RuntimeError when the best match is an async provider."""
 
         @Provider
@@ -173,9 +167,7 @@ class TestGet:
         with pytest.raises(RuntimeError, match="async provider"):
             container.get(Notifier)
 
-    def test_qualifier_filter_selects_matching_binding(
-        self, container: DIContainer
-    ) -> None:
+    def test_qualifier_filter_selects_matching_binding(self, container: DIContainer) -> None:
         """get(T, qualifier=...) must return only the binding with that qualifier."""
         container.bind(Notifier, EmailNotifier)
         container.bind(Notifier, PushNotifier)
@@ -184,18 +176,14 @@ class TestGet:
 
         assert isinstance(result, PushNotifier)
 
-    def test_qualifier_filter_raises_when_no_match(
-        self, container: DIContainer
-    ) -> None:
+    def test_qualifier_filter_raises_when_no_match(self, container: DIContainer) -> None:
         """get(T, qualifier='missing') raises LookupError when qualifier is absent."""
         container.bind(Notifier, EmailNotifier)
 
         with pytest.raises(LookupError):
             container.get(Notifier, qualifier="does-not-exist")
 
-    def test_priority_filter_selects_exact_priority(
-        self, container: DIContainer
-    ) -> None:
+    def test_priority_filter_selects_exact_priority(self, container: DIContainer) -> None:
         """get(T, priority=N) returns the binding with that exact priority value."""
         container.bind(Notifier, PushNotifier)  # priority=1
         container.bind(Notifier, PushFallbackNotifier)  # priority=2
@@ -393,9 +381,7 @@ class TestProviderWithDeps:
         assert isinstance(notifier, EmailNotifier)
         assert notifier.pool_url == "postgres://localhost/db"  # type: ignore[attr-defined]
 
-    async def test_async_provider_receives_injected_dep(
-        self, container: DIContainer
-    ) -> None:
+    async def test_async_provider_receives_injected_dep(self, container: DIContainer) -> None:
         """An async @Provider function must also have its parameters injected."""
 
         @Singleton
@@ -602,9 +588,7 @@ class TestContainerCopy:
         assert isinstance(original_svc, EmailNotifier)
         assert isinstance(copy_svc, EmailNotifier)
 
-    def test_copy_singleton_caches_are_independent(
-        self, container: DIContainer
-    ) -> None:
+    def test_copy_singleton_caches_are_independent(self, container: DIContainer) -> None:
         """Singletons in the copy are independent from the original's cache."""
         from providify.decorator.scope import Singleton
 
@@ -624,9 +608,7 @@ class TestContainerCopy:
         assert isinstance(copy_svc, SharedService)
         assert original_svc is not copy_svc
 
-    def test_override_on_copy_does_not_affect_original(
-        self, container: DIContainer
-    ) -> None:
+    def test_override_on_copy_does_not_affect_original(self, container: DIContainer) -> None:
         """override() on the copy must not mutate the original's binding list."""
 
         @Component
@@ -645,9 +627,7 @@ class TestContainerCopy:
         copy_binding = copy.get_binding(Notifier)
         assert copy_binding.implementation is FakeNotifier  # type: ignore[union-attr]
 
-    def test_copy_of_empty_container_is_also_empty(
-        self, container: DIContainer
-    ) -> None:
+    def test_copy_of_empty_container_is_also_empty(self, container: DIContainer) -> None:
         """copy() of an empty container returns an empty, usable container."""
         copy = container.copy()
 
@@ -701,9 +681,7 @@ class TestValidateAll:
 
         assert violations == []
 
-    def test_validate_all_sets_is_valid_when_clean(
-        self, container: DIContainer
-    ) -> None:
+    def test_validate_all_sets_is_valid_when_clean(self, container: DIContainer) -> None:
         """validate_all() must set is_valid=True when there are no violations."""
         container.bind(Notifier, EmailNotifier)
 
@@ -752,9 +730,7 @@ class TestValidateAll:
         assert isinstance(violations, list)
         assert len(violations) >= 1
 
-    def test_validate_all_empty_container_returns_empty_list(
-        self, container: DIContainer
-    ) -> None:
+    def test_validate_all_empty_container_returns_empty_list(self, container: DIContainer) -> None:
         """validate_all() on an empty container returns [] and sets is_valid=True."""
         violations = container.validate_all()
 

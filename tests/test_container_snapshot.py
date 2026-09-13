@@ -159,16 +159,12 @@ class TestSnapshotSingletonLockCleanup:
 class TestScopedWithExistingContainer:
     """DIContainer.scoped(existing) must adopt *existing* as the global."""
 
-    def test_scoped_installs_existing_container_as_global(
-        self, container: DIContainer
-    ) -> None:
+    def test_scoped_installs_existing_container_as_global(self, container: DIContainer) -> None:
         with DIContainer.scoped(container) as c:
             assert c is container
             assert DIContainer.current() is container
 
-    def test_scoped_restores_previous_global_after_block(
-        self, container: DIContainer
-    ) -> None:
+    def test_scoped_restores_previous_global_after_block(self, container: DIContainer) -> None:
         previous = DIContainer.current()
         with DIContainer.scoped(container):
             pass
@@ -183,9 +179,7 @@ class TestScopedWithExistingContainer:
                 raise RuntimeError("boom")
         assert DIContainer.current() is previous
 
-    def test_scoped_does_not_shut_down_adopted_container(
-        self, container: DIContainer
-    ) -> None:
+    def test_scoped_does_not_shut_down_adopted_container(self, container: DIContainer) -> None:
         @Singleton
         class Resource:
             pass

@@ -531,9 +531,7 @@ class TestScanAutoBinding:
 class TestScanErrorPaths:
     """Verify scanner behaviour for invalid inputs."""
 
-    def test_scan_raises_module_not_found_for_unknown_name(
-        self, container: DIContainer
-    ) -> None:
+    def test_scan_raises_module_not_found_for_unknown_name(self, container: DIContainer) -> None:
         """scan('no.such.module') must raise ModuleNotFoundError."""
         with pytest.raises(ModuleNotFoundError):
             container.scan("no_such_module_xyzzy_providify_test")

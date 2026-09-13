@@ -313,6 +313,59 @@ class TestInterfaceMatches:
         """Non-type arguments must not raise — they return False."""
         assert _interface_matches("not a type", int) is False  # type: ignore[arg-type]
 
+    # ── Open-generic wildcard (plan 016) ───────────────────────────
+
+    def test_open_binding_wildcard_matches_closed_request(self) -> None:
+        """An open binding Repo[T] is a wildcard for a closed request Repo[User]."""
+
+        class Repo(Generic[T]):
+            pass
+
+        class User:
+            pass
+
+        assert _interface_matches(Repo[T], Repo[User]) is True
+
+    def test_closed_binding_does_not_match_typevar_request(self) -> None:
+        """A closed binding Repo[User] must NOT satisfy a request for Repo[T] —
+        the wildcard is binding-side only; a request-side TypeVar is literal."""
+
+        class Repo(Generic[T]):
+            pass
+
+        class User:
+            pass
+
+        assert _interface_matches(Repo[User], Repo[T]) is False
+
+    def test_open_binding_still_matches_bare_origin(self) -> None:
+        """Repo[T] vs bare Repo stays True (unchanged fourth branch) — this is
+        the regression guard for the bare-guard placement decision (plan 016
+        §Design "Where the bare guard lives"): the STRUCTURAL predicate keeps
+        saying True so @Disposes(Repo)/reset_binding(Repo) keep working; the
+        LOOKUP-layer bare-request guard lives in DIContainer._binding_serves,
+        not here."""
+
+        class Repo(Generic[T]):
+            pass
+
+        assert _interface_matches(Repo[T], Repo) is True
+
+    def test_open_binding_does_not_match_across_different_origin(self) -> None:
+        """Sub[T] must NOT serve Repo[User] even though Sub extends Repo[T] —
+        identical origin is required (plan 016 §Design "Match rule")."""
+
+        class Repo(Generic[T]):
+            pass
+
+        class Sub(Repo[T], Generic[T]):
+            pass
+
+        class User:
+            pass
+
+        assert _interface_matches(Sub[T], Repo[User]) is False
+
 
 # ─────────────────────────────────────────────────────────────────
 #  Container tests — bind / register / get / injection
@@ -322,9 +375,7 @@ class TestInterfaceMatches:
 class TestContainerGenericBind:
     """Tests for explicit container.bind(GenericAlias, Implementation)."""
 
-    def test_bind_generic_interface_to_implementation(
-        self, container: DIContainer
-    ) -> None:
+    def test_bind_generic_interface_to_implementation(self, container: DIContainer) -> None:
         """bind(Repo[Item], ItemRepo) must create a ClassBinding resolvable
         by get(Repo[Item])."""
 
@@ -343,9 +394,7 @@ class TestContainerGenericBind:
 
         assert isinstance(result, ItemRepo)
 
-    def test_bind_generic_wrong_implementation_raises(
-        self, container: DIContainer
-    ) -> None:
+    def test_bind_generic_wrong_implementation_raises(self, container: DIContainer) -> None:
         """bind(Repo[Item], OtherRepo) where OtherRepo extends Repo[Other]
         must raise TypeError at registration time."""
 
@@ -366,9 +415,7 @@ class TestContainerGenericBind:
         with pytest.raises(TypeError):
             container.bind(Repo[Item], OtherRepo)
 
-    def test_bind_multiple_generic_specialisations(
-        self, container: DIContainer
-    ) -> None:
+    def test_bind_multiple_generic_specialisations(self, container: DIContainer) -> None:
         """Two different type-arg specialisations must be independently resolvable."""
 
         class Repo(Generic[T]):
@@ -444,9 +491,7 @@ class TestContainerGenericRegister:
 
         assert isinstance(result, ItemRepo)
 
-    def test_register_multiple_specialisations_disambiguated(
-        self, container: DIContainer
-    ) -> None:
+    def test_register_multiple_specialisations_disambiguated(self, container: DIContainer) -> None:
         """Two registered repos with different type args must each resolve correctly."""
 
         class Repo(Generic[T]):
@@ -519,9 +564,7 @@ class TestContainerGenericRegister:
 class TestContainerGenericGetAll:
     """Tests for get_all() with generic interfaces."""
 
-    def test_get_all_returns_all_matching_specialisations(
-        self, container: DIContainer
-    ) -> None:
+    def test_get_all_returns_all_matching_specialisations(self, container: DIContainer) -> None:
         """get_all(Repo[Item]) must return every implementation of Repo[Item]."""
 
         class Repo(Generic[T]):
@@ -607,9 +650,7 @@ class TestContainerGenericAnnotationInjection:
 
         assert isinstance(svc.repo, ItemRepo)
 
-    def test_multiple_generic_deps_injected_correctly(
-        self, container: DIContainer
-    ) -> None:
+    def test_multiple_generic_deps_injected_correctly(self, container: DIContainer) -> None:
         """Two different generic deps in __init__ must each resolve to the right impl."""
 
         class Repo(Generic[T]):
@@ -648,9 +689,7 @@ class TestContainerGenericAnnotationInjection:
         assert isinstance(svc.users, UserRepo)
         assert isinstance(svc.orders, OrderRepo)
 
-    def test_get_by_generic_alias_returns_correct_type(
-        self, container: DIContainer
-    ) -> None:
+    def test_get_by_generic_alias_returns_correct_type(self, container: DIContainer) -> None:
         """container.get(Repo[User]) must return an instance of UserRepo,
         even when there is also a Repo[Order] in the registry."""
 
@@ -733,9 +772,7 @@ class TestContainerGenericWithABC:
 class TestContainerGenericMultiLevel:
     """Tests for multi-level inheritance with generic parameterisation."""
 
-    def test_parameterisation_on_grandparent_is_found(
-        self, container: DIContainer
-    ) -> None:
+    def test_parameterisation_on_grandparent_is_found(self, container: DIContainer) -> None:
         """If Repo[Item] is in a grandparent's __orig_bases__, the MRO walk
         must find it and the binding must be resolvable."""
 
@@ -1094,12 +1131,8 @@ class TestIsGenericSubtypeMultiParam:
         class SpecificMapper(Mapper[Input, Output, Context]):
             pass
 
-        assert (
-            _is_generic_subtype(SpecificMapper, Mapper[Input, Output, Context]) is True
-        )
-        assert (
-            _is_generic_subtype(SpecificMapper, Mapper[Output, Input, Context]) is False
-        )
+        assert _is_generic_subtype(SpecificMapper, Mapper[Input, Output, Context]) is True
+        assert _is_generic_subtype(SpecificMapper, Mapper[Output, Input, Context]) is False
 
     def test_four_param_generic_exact_match(self) -> None:
         """Four-parameter generic: all four args must match exactly."""
@@ -1215,9 +1248,7 @@ class TestContainerMultiParamGeneric:
 
         assert isinstance(result, EntityRepo)
 
-    def test_two_param_multiple_specialisations_disambiguated(
-        self, container: DIContainer
-    ) -> None:
+    def test_two_param_multiple_specialisations_disambiguated(self, container: DIContainer) -> None:
         """Two repos that share one type arg but differ in the other must each
         resolve to their own implementation — (Entity, UserModel) ≠ (Entity, AdminModel).
         """
@@ -1254,9 +1285,7 @@ class TestContainerMultiParamGeneric:
         with pytest.raises(LookupError):
             container.get(Repo[AdminModel, Entity])  # wrong arg order
 
-    def test_wrong_arg_combination_raises_lookup_error(
-        self, container: DIContainer
-    ) -> None:
+    def test_wrong_arg_combination_raises_lookup_error(self, container: DIContainer) -> None:
         """get(Repo[Entity, WrongModel]) must raise LookupError when only
         Repo[Entity, RightModel] is registered."""
 
@@ -1361,9 +1390,7 @@ class TestContainerMultiParamGeneric:
         with pytest.raises(LookupError):
             container.get(Mapper[Output, Input, Context])
 
-    def test_three_param_plain_annotation_injection(
-        self, container: DIContainer
-    ) -> None:
+    def test_three_param_plain_annotation_injection(self, container: DIContainer) -> None:
         """mapper: Mapper[Input, Output, Context] in __init__ must be injected."""
 
         class Mapper(Generic[T, S, U]):

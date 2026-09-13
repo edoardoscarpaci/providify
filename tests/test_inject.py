@@ -80,9 +80,7 @@ class TestInject:
 
         assert isinstance(svc.store, FileStorage)
 
-    def test_inject_with_qualifier_selects_named_binding(
-        self, container: DIContainer
-    ) -> None:
+    def test_inject_with_qualifier_selects_named_binding(self, container: DIContainer) -> None:
         """Inject(T, qualifier='cloud') should resolve only the 'cloud' qualified binding."""
 
         @Component
@@ -101,9 +99,7 @@ class TestInject:
 
         assert isinstance(svc.store, CloudStorage)
 
-    def test_inject_with_priority_selects_exact_priority(
-        self, container: DIContainer
-    ) -> None:
+    def test_inject_with_priority_selects_exact_priority(self, container: DIContainer) -> None:
         """Inject(T, priority=2) should resolve only the binding with priority=2."""
 
         @Component
@@ -122,9 +118,7 @@ class TestInject:
 
         assert isinstance(svc.store, HigherPriorityStorage)
 
-    def test_inject_optional_returns_none_when_absent(
-        self, container: DIContainer
-    ) -> None:
+    def test_inject_optional_returns_none_when_absent(self, container: DIContainer) -> None:
         """Inject(T, optional=True) should inject None when no binding is registered."""
 
         @Component
@@ -141,9 +135,7 @@ class TestInject:
 
         assert svc.store is None
 
-    def test_inject_optional_false_raises_when_absent(
-        self, container: DIContainer
-    ) -> None:
+    def test_inject_optional_false_raises_when_absent(self, container: DIContainer) -> None:
         """Inject(T, optional=False) should raise LookupError when binding is missing."""
 
         @Component
@@ -186,9 +178,7 @@ class TestInject:
 class TestInjectInstances:
     """Tests for the InjectInstances[T] multi-binding injection."""
 
-    def test_receives_all_matching_bindings_as_list(
-        self, container: DIContainer
-    ) -> None:
+    def test_receives_all_matching_bindings_as_list(self, container: DIContainer) -> None:
         """InjectInstances[T] should inject a list containing every bound implementation."""
 
         @Component
@@ -258,9 +248,7 @@ class TestClassVarInjection:
     on instances *after* the constructor runs but before @PostConstruct fires.
     """
 
-    def test_inject_classvar_resolved_after_construction(
-        self, container: DIContainer
-    ) -> None:
+    def test_inject_classvar_resolved_after_construction(self, container: DIContainer) -> None:
         """A class-level Inject[T] annotation should be set on the instance."""
 
         @Component
@@ -308,9 +296,7 @@ class TestClassVarInjection:
         # Proxy resolves lazily on first .get() call
         assert isinstance(svc.store.get(), FileStorage)
 
-    def test_mixed_classvar_and_constructor_injection(
-        self, container: DIContainer
-    ) -> None:
+    def test_mixed_classvar_and_constructor_injection(self, container: DIContainer) -> None:
         """Class-level and constructor-level Inject[T] are both resolved independently."""
 
         class Logger:
@@ -374,9 +360,7 @@ class TestClassVarInjection:
 
         assert isinstance(svc.store, CloudStorage)
 
-    def test_classvar_optional_returns_none_when_absent(
-        self, container: DIContainer
-    ) -> None:
+    def test_classvar_optional_returns_none_when_absent(self, container: DIContainer) -> None:
         """Class-level Inject(T, optional=True) injects None when no binding exists."""
 
         @Component
@@ -389,9 +373,7 @@ class TestClassVarInjection:
 
         assert svc.store is None
 
-    def test_plain_classvar_annotation_is_not_injected(
-        self, container: DIContainer
-    ) -> None:
+    def test_plain_classvar_annotation_is_not_injected(self, container: DIContainer) -> None:
         """Plain class-level annotations without Inject[T] are NOT auto-injected."""
 
         @Component
@@ -462,16 +444,16 @@ class TestInjectTypeAliasExpansion:
         result = Inject[Storage]
 
         # Must be Annotated — the container dispatches on get_origin(hint) is Annotated
-        assert (
-            get_origin(result) is Annotated
-        ), f"Inject[T] must expand to Annotated[T, InjectMeta()]; got {result!r}"
+        assert get_origin(result) is Annotated, (
+            f"Inject[T] must expand to Annotated[T, InjectMeta()]; got {result!r}"
+        )
         args = get_args(result)
         # First arg is the wrapped type
         assert args[0] is Storage
         # Second arg is the InjectMeta marker — container reads qualifier/optional from it
-        assert isinstance(
-            args[1], InjectMeta
-        ), f"Second Annotated arg must be InjectMeta; got {type(args[1])!r}"
+        assert isinstance(args[1], InjectMeta), (
+            f"Second Annotated arg must be InjectMeta; got {type(args[1])!r}"
+        )
         # Default expansion: no qualifier, not optional, not all
         assert args[1].qualifier is None
         assert args[1].optional is False
@@ -579,8 +561,7 @@ class TestInjectTypeAliasExpansion:
 
         # Must resolve to Annotated[Storage, InjectMeta()] — not the raw string
         assert get_origin(store_hint) is Annotated, (
-            f"get_type_hints must resolve Inject[Storage] to Annotated; "
-            f"got {store_hint!r}"
+            f"get_type_hints must resolve Inject[Storage] to Annotated; got {store_hint!r}"
         )
         inner_type, meta = get_args(store_hint)[:2]
         assert inner_type is Storage
@@ -767,9 +748,7 @@ class TestUnionOptionalInjection:
         c = container.get(Consumer)
         assert isinstance(c.dep, _UnionDep)
 
-    def test_pipe_syntax_injects_none_when_not_bound(
-        self, container: DIContainer
-    ) -> None:
+    def test_pipe_syntax_injects_none_when_not_bound(self, container: DIContainer) -> None:
         """T | None with T NOT registered → parameter receives None."""
 
         @Component
@@ -783,9 +762,7 @@ class TestUnionOptionalInjection:
         c = container.get(Consumer)
         assert c.dep is None
 
-    def test_union_resolves_first_candidate_when_t1_bound(
-        self, container: DIContainer
-    ) -> None:
+    def test_union_resolves_first_candidate_when_t1_bound(self, container: DIContainer) -> None:
         """Union[T1, T2] — T1 registered, T2 not → T1 instance returned."""
 
         @Component
@@ -815,9 +792,7 @@ class TestUnionOptionalInjection:
         c = container.get(Consumer)
         assert isinstance(c.dep, _UnionT2)
 
-    def test_union_raises_when_no_candidate_resolves(
-        self, container: DIContainer
-    ) -> None:
+    def test_union_raises_when_no_candidate_resolves(self, container: DIContainer) -> None:
         """Union[T1, T2] — neither registered → LookupError raised."""
 
         @Component
@@ -849,16 +824,12 @@ class TestUnionOptionalInjection:
         c = container.get(Consumer)
         assert c.dep is None
 
-    def test_union_with_none_resolves_first_bound_candidate(
-        self, container: DIContainer
-    ) -> None:
+    def test_union_with_none_resolves_first_bound_candidate(self, container: DIContainer) -> None:
         """Union[T1, T2, None] — T1 registered → T1 instance returned (not None)."""
 
         @Component
         class Consumer:
-            def __init__(
-                self, dep: _UnionT1 | _UnionUnresolvable1 | None = None
-            ) -> None:
+            def __init__(self, dep: _UnionT1 | _UnionUnresolvable1 | None = None) -> None:
                 self.dep = dep
 
         container.register(_UnionT1)

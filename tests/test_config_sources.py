@@ -48,9 +48,7 @@ class TestDictSource:
     def test_load_returns_nested_mapping_unchanged_besides_key_case(self) -> None:
         source = DictSource({"DB": {"URL": "x"}})
 
-        assert source.load() == {"db": {"URL": "x"}} or source.load() == {
-            "db": {"url": "x"}
-        }
+        assert source.load() == {"db": {"URL": "x"}} or source.load() == {"db": {"url": "x"}}
         # DictSource itself only need normalise its own top-level keys;
         # deep normalisation is a separate concern (Step 5) — both shapes
         # are acceptable here, this test only pins non-crashing behaviour.
@@ -121,17 +119,13 @@ class TestJsonSource:
 
         assert result == {}
 
-    def test_missing_file_required_true_raises_config_binding_error(
-        self, tmp_path
-    ) -> None:
+    def test_missing_file_required_true_raises_config_binding_error(self, tmp_path) -> None:
         path = tmp_path / "missing.json"
 
         with pytest.raises(ConfigBindingError):
             JsonSource(path, required=True).load()
 
-    def test_malformed_json_raises_config_binding_error_naming_path(
-        self, tmp_path
-    ) -> None:
+    def test_malformed_json_raises_config_binding_error_naming_path(self, tmp_path) -> None:
         path = tmp_path / "bad.json"
         path.write_text("{not valid json")
 
@@ -170,17 +164,13 @@ class TestTomlSource:
 
         assert result == {}
 
-    def test_missing_file_required_true_raises_config_binding_error(
-        self, tmp_path
-    ) -> None:
+    def test_missing_file_required_true_raises_config_binding_error(self, tmp_path) -> None:
         path = tmp_path / "missing.toml"
 
         with pytest.raises(ConfigBindingError):
             TomlSource(path, required=True).load()
 
-    def test_malformed_toml_raises_config_binding_error_naming_path(
-        self, tmp_path
-    ) -> None:
+    def test_malformed_toml_raises_config_binding_error_naming_path(self, tmp_path) -> None:
         path = tmp_path / "bad.toml"
         path.write_text("not = = valid")
 
@@ -211,17 +201,13 @@ class TestYamlSource:
 
         assert result == {}
 
-    def test_missing_file_required_true_raises_config_binding_error(
-        self, tmp_path
-    ) -> None:
+    def test_missing_file_required_true_raises_config_binding_error(self, tmp_path) -> None:
         path = tmp_path / "missing.yaml"
 
         with pytest.raises(ConfigBindingError):
             YamlSource(path, required=True).load()
 
-    def test_malformed_yaml_raises_config_binding_error_naming_path(
-        self, tmp_path
-    ) -> None:
+    def test_malformed_yaml_raises_config_binding_error_naming_path(self, tmp_path) -> None:
         path = tmp_path / "bad.yaml"
         path.write_text("db: [unclosed")
 

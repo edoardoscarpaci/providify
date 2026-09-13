@@ -6,11 +6,12 @@ import dataclasses
 import functools
 import inspect
 import logging
+import os
 import threading
 import types
 import warnings
 import weakref
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, replace
 from time import perf_counter_ns
@@ -55,6 +56,7 @@ from .descriptor import DIContainerDescriptor
 from .exceptions import (
     AnnotationResolutionError,
     CircularDependencyError,
+    ConditionEvaluationError,
     LiveInjectionRequiredError,
     ScopeViolationDetectedError,
     ShutdownError,
@@ -63,6 +65,7 @@ from .exceptions import (
 from .field import Advised
 from .metadata import (
     LiveInjectionViolation,
+    RequiresMarker,
     Scope,
     ScopeLeak,
     _get_config_properties,
@@ -104,7 +107,7 @@ from .type import (
     _providify,
     _unwrap_classvar,
 )
-from .utils import _interface_matches, _type_name
+from .utils import _closing_args, _interface_matches, _type_arg_param, _type_name
 
 if TYPE_CHECKING:
     # Only needed for validate()'s -> ValidationReport return annotation and
@@ -225,6 +228,72 @@ class ContainerSnapshot:
 
 
 # ─────────────────────────────────────────────────────────────────
+#  _DisposerWiringIssue — one @Disposes wiring defect found at install time
+#  (Plan 014, gap P24-DISPOSES-FIRSTMATCH)
+# ─────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class _DisposerWiringIssue:
+    """One defect found while wiring a module's ``@Disposes`` methods.
+
+    Recorded by ``_register_module_providers()`` at install time and later
+    turned into a ``ValidationIssue`` by ``validate()``'s pass 3 (plan 014).
+    The wiring loop is the *only* place that knows which bindings are a
+    module's own, whether a match already had a disposer, and whether a
+    ``@Disposes`` matched nothing — none of that is re-derivable later from
+    ``self._bindings`` alone (see plan 014 §Design, rejected alternative
+    "derive at validate() time").
+
+    Thread safety:  ✅ Frozen — safe to share once built.
+    Async safety:   ✅ Pure data — no shared mutable state.
+
+    Attributes:
+        kind: ``"overwritten"`` — two ``@Disposes`` on this module resolved
+            to the same own binding, the later one won. ``"unmatched"`` — a
+            ``@Disposes`` matched none of this module's own bindings.
+        module_name: The ``@Configuration`` class's ``__name__``, e.g.
+            ``"RedisLayeredCacheConfiguration"``.
+        disposer_name: The ``@Disposes`` method name being wired (the
+            winner, for ``"overwritten"``).
+        disposed_type: ``_type_name(marker.disposed_type)`` — the
+            ``@Disposes(...)`` argument, human-readable.
+        binding_owner: ``f"@Provider({fn_name})"`` for ``"overwritten"``
+            (same vocabulary as ``owner_of()``, kept in sync by comment at
+            both sites); ``None`` for ``"unmatched"`` (there is no own
+            binding to name).
+        replaced_disposer: The method name that lost, for ``"overwritten"``;
+            ``None`` for ``"unmatched"``.
+
+    # DESIGN: strings only — no ProviderBinding references stored here.
+    #
+    # Tradeoffs:
+    #   ✅ reset_binding()/override()/restore() all replace self._bindings;
+    #      a stored binding reference would go stale, and re-deriving
+    #      owner_of(binding) later would describe a binding no longer in
+    #      the container. Strings computed at wiring time cannot go stale.
+    #   ✅ copy() inherits records via replace() — the copy holds the same
+    #      (shallow-copied) bindings with the same disposers, so inheriting
+    #      the warnings as-is is correct.
+    #   ❌ duplicates owner_of()'s f"@Provider({b.fn.__name__})" format
+    #      (see owner_of() below) — accepted, it is one f-string; both
+    #      sites carry a comment pointing at the other so they stay in sync.
+    #
+    # Edge case: after reset_binding()/override()/restore(), a record may
+    # describe a binding that no longer exists (plan 014 §Risks E15). This
+    # is accepted — the diagnostic describes the install event, not the
+    # current graph, exactly like UNREACHABLE_PRE_DESTROY's own caveat.
+    """
+
+    kind: Literal["overwritten", "unmatched"]
+    module_name: str
+    disposer_name: str
+    disposed_type: str
+    binding_owner: str | None
+    replaced_disposer: str | None
+
+
+# ─────────────────────────────────────────────────────────────────
 #  _ModuleRecord — one entry per installed @Configuration module (Plan 008)
 # ─────────────────────────────────────────────────────────────────
 
@@ -263,11 +332,18 @@ class _ModuleRecord:
             at shutdown — makes ``shutdown()``/``ashutdown()`` idempotent:
             a second ``shutdown()`` call skips every already-disposed
             record instead of re-running its hook.
+        disposer_issues: ``@Disposes`` wiring defects found for this module
+            at install time (plan 014) — empty for a cleanly-wired module.
+            Reported by ``validate()``'s pass 3. Defaulted (and kept last)
+            so every existing ``_ModuleRecord(instance=..., owned=...,
+            disposed=...)`` call and ``replace(rec, owned=False)`` in
+            ``copy()`` remain valid without touching every call site.
     """
 
     instance: object
     owned: bool
     disposed: bool
+    disposer_issues: tuple[_DisposerWiringIssue, ...] = ()
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -440,6 +516,86 @@ def _find_advised_fields(cls: type) -> list[str]:
     return found
 
 
+def _owner_label(b: AnyBinding) -> str:
+    """Return a human-readable owner name for *b* — the same vocabulary
+    ``validate()``'s ``owner_of`` closure uses (`"ClassName"` /
+    `"@Provider(fn_name)"`).
+
+    Deliberately a standalone module-level helper rather than a refactor of
+    ``owner_of`` itself (`container.py:5477-5484`) — Plan 017 also edits
+    ``validate()`` in the same region, and duplicating this two-line body
+    keeps both plans' diffs additive instead of forcing a shared refactor
+    across two in-flight plans (plan 015 §Design).
+
+    Args:
+        b: Any registered binding — ``ClassBinding`` or ``ProviderBinding``.
+
+    Returns:
+        ``b.implementation.__name__`` for a ``ClassBinding``;
+        ``f"@Provider({b.fn.__name__})"`` for a ``ProviderBinding``; falls
+        back to ``_type_name(b.interface)`` for any other ``AnyBinding``
+        member (exhaustive guard, not expected to be reached today).
+
+    Thread safety: ✅ Pure function, no shared state.
+    Async safety:  ✅ No await points.
+    """
+    if isinstance(b, ClassBinding):
+        return b.implementation.__name__
+    if isinstance(b, ProviderBinding):
+        return f"@Provider({b.fn.__name__})"
+    return _type_name(b.interface)  # pragma: no cover — exhaustive guard
+
+
+def _conditions_hold(b: AnyBinding) -> bool:
+    """Return whether every ``@Requires`` marker on *b* is currently satisfied.
+
+    AND of ``marker.is_satisfied()`` across ``b.conditions`` — the third
+    conjunct :meth:`DIContainer._binding_is_active` consults, evaluated
+    last (after ``@Profile``/``@Alternative`` have already excluded a
+    binding, its predicate never runs at all — plan 015 §Design "Why the
+    condition is evaluated last").
+
+    Args:
+        b: Any registered binding — ``ClassBinding`` or ``ProviderBinding``.
+            ``b.conditions`` is the registration-time cache set by
+            ``ClassBinding.__init__``/``ProviderBinding.__init__``
+            (`binding.py`), never re-read here.
+
+    Returns:
+        ``True`` iff every marker in ``b.conditions`` is satisfied (or
+        ``b.conditions`` is empty — vacuously ``True``, though callers
+        should prefer the cheaper ``not b.conditions`` short-circuit before
+        even calling this function on the hot path).
+
+    Raises:
+        ConditionEvaluationError: A marker's ``is_satisfied()`` raised.
+            Wraps the original exception via ``raise ... from exc`` so
+            ``exc.__cause__`` preserves the real type/traceback — a broken
+            predicate is a programming error, not a legitimate "off" state
+            (plan 015 §Design "ConditionEvaluationError").
+
+    Thread safety: ✅ Pure w.r.t. container state — reads only ``b.conditions``,
+        writes nothing. ⚠️ The predicate itself is user code; this function
+        makes no thread-safety guarantee about what ``condition()`` does.
+    Async safety:  ✅ No await points; conditions must be plain sync callables.
+
+    Example:
+        >>> _conditions_hold(unconditional_binding)
+        True
+    """
+    for marker in b.conditions:
+        try:
+            satisfied = marker.is_satisfied()
+        except Exception as exc:
+            # A broken predicate is a programming error, not "inactive" —
+            # swallowing it here would silently hide a bug (plan 015
+            # §Design, "Alternatives considered").
+            raise ConditionEvaluationError(_owner_label(b), marker, exc) from exc
+        if not satisfied:
+            return False
+    return True
+
+
 def _unreachable_pre_destroy(binding: AnyBinding) -> LifecycleMarker | None:
     """Return the ``@PreDestroy`` hook that *binding* will never invoke, if any.
 
@@ -506,6 +662,52 @@ def _unreachable_pre_destroy(binding: AnyBinding) -> LifecycleMarker | None:
         return _find_pre_destroy(produced)
     except TypeError:
         return None
+
+
+def _prefer_closed(candidates: list[AnyBinding]) -> list[AnyBinding]:
+    """Row 2 (plan 016) — drop every open binding when a closed one also matches.
+
+    A closed binding (concrete class, or an alias with no free TypeVars) is
+    always MORE SPECIFIC than an open binding (``Repo[T]``) serving the same
+    request, regardless of ``@Priority`` or registration order — an explicit
+    "here is exactly what to build for this type" always beats a generic
+    factory. Used by :meth:`DIContainer._get_best_candidate`, both
+    ``DelegateMeta`` resolution branches, and ``validate()``'s
+    ambiguity/edge-pick logic, so the runtime pick and the validation report
+    always agree (plan 016 §Design "Order relative to @Fallback").
+
+    Args:
+        candidates: The already-``_filter()``ed candidate list for one
+            request — i.e. AFTER plan 017's fallback-drop has already run
+            (fallback-drop is an explicit user declaration; this is a
+            structural inference, so explicit intent must not be overridden
+            by inference — see plan 016 §Design for the ``@Fallback``
+            ordering justification and its two worked examples).
+
+    Returns:
+        Every candidate with an empty ``type_params`` (closed) when at least
+        one exists; otherwise *candidates* unchanged (all-open, or a
+        non-``ProviderBinding`` with no ``type_params`` attribute at all —
+        ``getattr`` defaults it to ``()``, so a ``ClassBinding`` is always
+        "closed" here).
+
+    Edge cases:
+        - Empty input → ``[]``.
+        - All candidates open → returned unchanged (nothing to prefer).
+        - Mixed closed + open → only the closed ones survive, e.g.
+          ``get_all``'s specificity is DELIBERATELY not filtered this way —
+          this helper is applied only at single-pick sites (see callers),
+          never inside ``_filter()`` itself.
+
+    Thread safety:  ✅ Pure function — no shared state.
+    Async safety:   ✅ No awaits.
+
+    Example:
+        _prefer_closed([open_repo_t, closed_repo_user]) → [closed_repo_user]
+        _prefer_closed([open_repo_t])                   → [open_repo_t]
+    """
+    closed = [c for c in candidates if not getattr(c, "type_params", ())]
+    return closed or candidates
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1045,11 +1247,15 @@ class DIContainer:
         self._invalidate_type_caches()  # new binding — localns/hints must be rebuilt
         self._bindings.append(ClassBinding(cls, cls))
 
-    def provide(self, fn: Callable[..., Any], *, returns: Any = None) -> None:
+    def provide(self, fn: Callable[..., Any], *, returns: Any = None) -> ProviderBinding:
         """Register a provider function (sync or async) as a binding.
 
         The function's return type annotation is used as the resolved
         interface, unless overridden — see ``returns`` below.
+
+        New in 2.1.0: this method returns the ``ProviderBinding`` it just
+        registered (was ``None`` before). Additive — a caller that discards
+        the result is unaffected.
 
         Interface resolution priority (highest wins):
             1. ``returns`` — this call's override.
@@ -1067,28 +1273,93 @@ class DIContainer:
                     return InMemoryRepo(model)
                 container.provide(repo_factory, returns=Repository[model])
 
+        Open-generic example (plan 016) — ONE registration replacing a
+        per-type loop, when every closed type shares one factory shape::
+
+            T = TypeVar("T")
+
+            def repo_factory(entity: type[T]) -> Repository[T]:
+                return InMemoryRepo(entity)
+
+            container.provide(repo_factory, returns=Repository[T])   # open
+            container.get(Repository[User])    # -> InMemoryRepo(User)
+            container.get(Repository[Order])   # -> InMemoryRepo(Order)
+
+        An OPEN binding — ``returns=`` (or ``-> Repository[T]``) with args
+        that are ALL plain ``TypeVar``s — is served, at resolve time, by any
+        CLOSED request sharing its origin. The eight governing rules (see
+        ``plans/016-open-generic-binding.md`` for the full semantics table):
+
+            1. **Match** — a ``TypeVar`` on the BINDING side is a wildcard
+               against a closed request; a ``TypeVar`` on the REQUEST side
+               (``get(Repository[T])``) is still literal, never a wildcard.
+               A bare request (``get(Repository)``) never matches either.
+            2. **Specificity** — a closed binding for the same interface
+               always beats an open one, regardless of ``@Priority`` or
+               registration order.
+            3. **Type-arg delivery** — a factory parameter annotated exactly
+               ``type[T]`` receives the closed type argument, matched by
+               TypeVar NAME (not identity — PEP 695-safe). An ANNOTATED
+               parameter that does not use this exact shape (or whose
+               ``TypeVar`` name does not match) silently gets no type info.
+               EXCEPTION: a factory with exactly one un-delivered closing
+               value and a completely UNANNOTATED, no-default parameter
+               (``lambda entity: Repo(entity)``) gets it positionally —
+               the ergonomic "positional by TypeVar" idiom, unambiguous
+               only for a single-``TypeVar`` open binding (see
+               ``DIContainer._collect_kwargs_sync``'s docstring for the
+               exact rule; never fires once any parameter matched by name,
+               or with 2+ un-delivered closing values).
+            4. **Singleton caching** — ``singleton=True`` caches ONE instance
+               PER CLOSED ALIAS, never one instance shared across every
+               closed type — the "dangerous anti-pattern" a naive
+               implementation would default to.
+            5. **Enumeration** — ``get_all(Repository[User])`` /
+               ``InjectInstances[Repository[User]]`` include the open
+               binding once; a bare ``get_all(Repository)`` never expands it.
+            6. **validate()** — the ``type[T]`` parameter is never flagged
+               missing; a closed request IS checked against open bindings.
+            7. **bound=/constraints** — a violation is a non-match (a
+               sibling binding may still serve the request), never a
+               resolve-time error.
+            8. **All-or-nothing** — every arg must be a plain ``TypeVar``
+               (open) or fully concrete (closed); a mixed alias
+               (``Repository[list[T]]``) raises ``TypeError`` here, at
+               registration.
+
         Args:
             fn: A callable that creates and returns the dependency.
                 May be a regular function or an ``async def``.
             returns: Explicit interface override for this registration. A
-                type, a parameterised generic alias (e.g. ``Repository[User]``),
-                an ``Annotated[...]`` wrapper (unwrapped automatically), or a
+                type, a parameterised generic alias (e.g. ``Repository[User]``,
+                or an OPEN alias like ``Repository[T]`` — plan 016), an
+                ``Annotated[...]`` wrapper (unwrapped automatically), or a
                 zero-arg callable evaluated once, right now, to produce one of
                 the above. See ``binding._normalize_explicit_interface`` for
                 the full accepted-shapes table.
 
         Returns:
-            None
+            The ``ProviderBinding`` just registered — useful for callers
+            that need to attach post-registration state (the ``@Disposes``
+            wiring in ``_register_module_providers`` is the in-package
+            consumer). Callers may ignore it.
 
         Raises:
             TypeError: If no override is in effect and *fn* has no return
-                type annotation (or it is unresolvable); or if a given
+                type annotation (or it is unresolvable); if a given
                 ``returns`` value cannot be resolved to a type or generic
-                alias.
+                alias; or if the resolved interface is a PARTIALLY-open
+                alias (plan 016 row 8 — some but not all type args are
+                ``TypeVar``s, e.g. ``Repository[list[T]]`` or
+                ``Pair[str, T]``) — there is no substitution mechanism for
+                that shape, so it would register a binding that can never
+                match any request.
         """
         self._validated = False
         self._invalidate_type_caches()  # new binding — localns/hints must be rebuilt
-        self._bindings.append(ProviderBinding(fn, returns=returns))
+        binding = ProviderBinding(fn, returns=returns)
+        self._bindings.append(binding)
+        return binding
 
     def multibind(self, cls: type, *, qualifier: str | type | None = None) -> None:
         """Declare *cls* as a multibinding collection point (plan 010 §Design F7).
@@ -1256,6 +1527,12 @@ class DIContainer:
             - Async provider anywhere in results  → raises before any instantiation ✅.
             - Binding already cached              → _instantiate_sync returns cached
                                                     instance — no double-construction.
+            - An open ``@Provider(singleton=True)`` binding (plan 016,
+              ``returns=Repo[T]``) is SKIPPED silently — ``_filter_singleton``
+              excludes it. There is no closed alias to hand its factory, and
+              no registry of "every ``Repo[X]`` that will be requested" to
+              pre-create instances for; a closed singleton registered
+              alongside it is still warmed normally.
 
         Thread safety:  ⚠️ Conditional — safe if called before the app goes
                             multi-threaded.
@@ -1297,6 +1574,9 @@ class DIContainer:
             - Binding already cached         → returns cached — no double-construction.
             - Async provider raises          → exception propagates; singletons
                                                resolved before the failure ARE cached ⚠️.
+            - An open ``@Provider(singleton=True)`` binding is SKIPPED
+              silently — same rationale as :meth:`warm_up`'s matching Edge
+              case (plan 016).
 
         Thread safety:  ⚠️ Conditional — assumes a single event loop drives warm-up.
         Async safety:   ✅ Must be called from within a running event loop.
@@ -1374,7 +1654,10 @@ class DIContainer:
         if not self._validated:
             self.validate_bindings()
             self._validated = True
-        return self._instantiate_sync(best)  # type: ignore[return-value]
+        # requested=cls (plan 016) — the closed alias an open binding needs
+        # to fill its type[T] parameter and to key its per-alias cache; a
+        # no-op for every other binding kind (_instantiate_sync ignores it).
+        return self._instantiate_sync(best, requested=cls)  # type: ignore[return-value]
 
     def get_all(
         self,
@@ -1396,6 +1679,11 @@ class DIContainer:
             LookupError:  If no binding is found for *cls*.
             RuntimeError: If any matching binding is an async provider —
                           use :meth:`aget_all` instead.
+
+        Note:
+            Shadowed ``@Fallback`` bindings are excluded (plan 017) — a
+            fallback whose request is also matched by an active
+            non-fallback binding never appears in the returned list.
         """
         candidates = self._filter(cls, qualifier=qualifier)
         if not candidates:
@@ -1412,8 +1700,9 @@ class DIContainer:
         if not self._validated:
             self.validate_bindings()
             self._validated = True
+        # requested=cls (plan 016) — see get()'s matching comment.
         return [
-            self._instantiate_sync(b)  # type: ignore[misc]
+            self._instantiate_sync(b, requested=cls)  # type: ignore[misc]
             for b in sorted(candidates, key=lambda b: b.priority)
         ]
 
@@ -1500,8 +1789,9 @@ class DIContainer:
         if not self._validated:
             self.validate_bindings()
             self._validated = True
+        # requested=inner (plan 016) — see get()'s matching comment.
         return [
-            self._instantiate_sync(b)  # type: ignore[misc]
+            self._instantiate_sync(b, requested=inner)  # type: ignore[misc]
             for b in sorted(candidates, key=lambda b: b.priority)
         ]
 
@@ -1521,8 +1811,9 @@ class DIContainer:
         if not self._validated:
             self.validate_bindings()
             self._validated = True
+        # requested=inner (plan 016) — see get()'s matching comment.
         return [
-            await self._instantiate_async(b)  # type: ignore[misc]
+            await self._instantiate_async(b, requested=inner)  # type: ignore[misc]
             for b in sorted(candidates, key=lambda b: b.priority)
         ]
 
@@ -1565,7 +1856,8 @@ class DIContainer:
         if not self._validated:
             self.validate_bindings()
             self._validated = True
-        return await self._instantiate_async(best)  # type: ignore[return-value]
+        # requested=cls (plan 016) — see get()'s matching comment.
+        return await self._instantiate_async(best, requested=cls)  # type: ignore[return-value]
 
     async def aget_all(
         self,
@@ -1587,6 +1879,11 @@ class DIContainer:
         Raises:
             LookupError: If no binding is found for *cls*.
 
+        Note:
+            Shadowed ``@Fallback`` bindings are excluded (plan 017) — a
+            fallback whose request is also matched by an active
+            non-fallback binding never appears in the returned list.
+
         Example:
             services = await container.aget_all(NotificationService)
         """
@@ -1596,8 +1893,9 @@ class DIContainer:
         if not self._validated:
             self.validate_bindings()
             self._validated = True
+        # requested=cls (plan 016) — see get()'s matching comment.
         return [
-            await self._instantiate_async(b)  # type: ignore[misc]
+            await self._instantiate_async(b, requested=cls)  # type: ignore[misc]
             for b in sorted(candidates, key=lambda b: b.priority)
         ]
 
@@ -1608,12 +1906,13 @@ class DIContainer:
 
         Uniform activation predicate consulted by ``_filter()`` on every
         resolution — the single place that decides whether a binding exists
-        "right now", combining ``@Profile`` and ``@Alternative`` activation
-        (plan 005 §Design):
+        "right now", combining ``@Profile``, ``@Alternative``, and
+        ``@Requires`` activation (plan 005 §Design; ``@Requires`` added by
+        plan 015 as the third conjunct):
 
         ::
 
-            _binding_is_active(b) <=> profile_ok(b) AND alternative_ok(b)
+            _binding_is_active(b) <=> profile_ok(b) AND alternative_ok(b) AND condition_ok(b)
 
             profile_ok(b)      : b.profiles == ()      -> True   (unprofiled)
                                   any expr in b.profiles matches self._active_profiles
@@ -1621,6 +1920,9 @@ class DIContainer:
             alternative_ok(b)  : b.source not @Alternative -> True
                                   b.profiles != ()          -> True  (@Profile is the activator)
                                   b.source in self._enabled_alternatives
+
+            condition_ok(b)    : not b.conditions           -> True   (unconditional)
+                                  _conditions_hold(b)                  (else)
 
         ``b.source`` is ``ClassBinding.implementation`` or
         ``ProviderBinding.fn`` — both ``@Alternative`` and ``@Profile``
@@ -1638,15 +1940,23 @@ class DIContainer:
             True if *b* should be visible to ``get()``/``get_all()``/
             ``is_resolvable()``/``validate()`` right now.
 
+        Raises:
+            ConditionEvaluationError: ``b`` carries an ``@Requires`` marker
+                whose predicate raised. Propagates from ``_conditions_hold``
+                unchanged — this method adds no handling of its own.
+
         Thread safety: ⚠️ Conditional — safe only if ``_active_profiles`` /
             ``_enabled_alternatives`` are not mutated concurrently with a
-            resolution (same caveat as ``_filter()``).
+            resolution (same caveat as ``_filter()``). The ``@Requires``
+            predicate is user code — no thread-safety guarantee is made
+            about what it does.
         Async safety:  ✅ No await points; no shared mutable state written.
 
         Edge cases:
-            - No ``@Profile`` and no ``@Alternative`` anywhere -> always True
-              (short-circuits on ``not b.profiles``, falls through to the
-              unchanged ``@Alternative`` rule for the rare marked case).
+            - No ``@Profile``, ``@Alternative``, or ``@Requires`` anywhere ->
+              always True (short-circuits on ``not b.profiles``, falls
+              through to the unchanged ``@Alternative`` rule, then
+              short-circuits again on ``not b.conditions``).
             - ``@Alternative`` + matching ``@Profile`` + inactive in
               ``_enabled_alternatives`` -> still active; the profile is the
               activator and ``_enabled_alternatives`` membership is not
@@ -1654,6 +1964,15 @@ class DIContainer:
             - ``@Alternative`` + ``@Profile`` that does NOT match -> inactive,
               even after ``enable_alternative()`` — the profile is a hard
               gate (AND), not overridable imperatively.
+            - ``@Requires`` is evaluated **last**, only once
+              ``profile_ok``/``alternative_ok`` both hold — a
+              profile-inactive binding's (possibly raising) predicate never
+              runs during ``get()`` (E14). ``os.environ`` is read fresh on
+              every call — no memoisation anywhere in this chain.
+            - A ``@Singleton`` resolved while its condition was ``True``
+              stays cached even after the condition flips ``False`` — not
+              evicted; see :meth:`activate_profile`'s note for the same
+              caveat applied to ``@Profile``.
         """
         from .binding import ClassBinding as _ClassBinding
         from .metadata import _is_alternative
@@ -1668,12 +1987,66 @@ class DIContainer:
 
         source = b.implementation if isinstance(b, _ClassBinding) else b.fn
         if not _is_alternative(source):
-            return True
-        # @Profile is the declarative activator for @Alternative — once a
-        # profile expression is present, it alone governs eligibility.
-        if b.profiles:
-            return True
-        return source in self._enabled_alternatives
+            alternative_ok = True
+        elif b.profiles:
+            # @Profile is the declarative activator for @Alternative — once a
+            # profile expression is present, it alone governs eligibility.
+            alternative_ok = True
+        else:
+            alternative_ok = source in self._enabled_alternatives
+        if not alternative_ok:
+            return False
+
+        # @Requires evaluated LAST, and only now that profile/alternative
+        # state already includes this binding — see the Edge cases note
+        # above (E14) and plan 015 §Design "Why the condition is evaluated
+        # last". `not b.conditions` short-circuits the overwhelmingly common
+        # unconditional binding before ever touching _conditions_hold.
+        return not b.conditions or _conditions_hold(b)
+
+    def _binding_serves(self, b: AnyBinding, requested: Any) -> bool:
+        """Lookup-layer predicate (plan 016, row 1): can *b* actually produce
+        an instance for *requested*?
+
+        A STRICTER sibling of :func:`_interface_matches` used only by the two
+        lookup entry points (:meth:`_filter`, :meth:`_is_resolvable`) — never
+        by structural code (``@Disposes`` wiring, ``reset_binding()``), which
+        must keep matching a bare ``Repo`` against an open ``Repo[T]``
+        binding (see :func:`_interface_matches`'s docstring, "Where the bare
+        guard lives"). An open binding's factory needs CLOSING ARGS to run
+        at all — a bare ``Repo`` or a still-open ``Repo[T]`` request has none
+        to give it, so neither should ever reach ``get()``/``is_resolvable()``
+        even though they satisfy the plain structural match.
+
+        Args:
+            b:         The candidate binding.
+            requested: The type or alias being looked up.
+
+        Returns:
+            For an open binding (``b.type_params`` non-empty): ``True`` only
+            when :func:`_closing_args` finds a mapping — i.e. *requested* is
+            a fully closed alias this binding can actually build. For every
+            other binding: the plain :func:`_interface_matches` result,
+            unchanged.
+
+        Edge cases:
+            - *b* is a ``ClassBinding`` (no ``type_params`` attribute at all)
+              → ``getattr(b, "type_params", ())`` is ``()`` → falls straight
+              through to ``_interface_matches`` — zero behaviour change for
+              every binding kind this plan does not touch.
+            - *requested* is bare ``Repo`` against open ``Repo[T]`` → closing
+              args is ``None`` (arg-count mismatch) → ``False`` (E2/E8).
+            - *requested* is ``Repo[T]`` (still open) against open ``Repo[T]``
+              → closing args is ``None`` (request not closed) → ``False`` (E3).
+
+        Thread safety:  ✅ Pure function of ``self._bindings``-independent
+                        inputs — no shared state read or written.
+        Async safety:   ✅ No awaits.
+        """
+        type_params = getattr(b, "type_params", ())
+        if type_params:
+            return _closing_args(b.interface, requested) is not None
+        return _interface_matches(b.interface, requested)
 
     def _filter(
         self,
@@ -1686,7 +2059,8 @@ class DIContainer:
         Optionally narrows the result by *qualifier* and/or *priority*.
         The same logic is shared by both the sync and async resolution paths.
 
-        Activation rules (plan 005) applied via ``_binding_is_active()``:
+        Activation rules (plan 005; ``@Requires`` rows added by plan 015)
+        applied via ``_binding_is_active()``:
 
         | condition                                   | included? |
         |----------------------------------------------|-----------|
@@ -1696,6 +2070,19 @@ class DIContainer:
         | @Profile matches active set                    | yes       |
         | @Profile does not match active set              | no        |
         | @Profile matches + @Alternative (any enable state) | yes   |
+        | <any "yes" row above> + every @Requires satisfied        | yes |
+        | <any "yes" row above> + any @Requires not satisfied      | no  |
+        | @Requires predicate raises                                | ConditionEvaluationError propagates |
+
+        Fallback rule (plan 017): after every row above has already
+        narrowed the candidate set by interface, ``exact_only``, qualifier,
+        priority, and activation, a **post-filter** step drops every
+        ``@Fallback``-marked candidate **iff** the remaining set still
+        contains at least one non-fallback candidate. This must run
+        **last** — a fallback that lost to interface/qualifier/priority/
+        activation narrowing is simply gone, same as any other binding;
+        only a fallback that survives every other rule can be shadowed by
+        a sibling that also survived every other rule.
 
         Args:
             cls:       The base type to match against ``binding.interface``.
@@ -1704,6 +2091,34 @@ class DIContainer:
 
         Returns:
             A (possibly empty) list of matching bindings.
+
+        Edge cases (plan 017):
+            - Qualifier request-relativity (E3/E4): an unqualified request
+              matches both a qualified and an unqualified candidate (see
+              the ``qualifier is None or ...`` row above), so an unqualified
+              ``@Fallback`` yields to a *qualified* non-fallback sibling —
+              and a qualified ``@Fallback`` request is unaffected by an
+              unqualified non-fallback that does not match that qualifier.
+            - Bare-origin sweep (E8): ``get_all(Repo)`` / ``get(Repo)``
+              treats every generic-parameterised binding under ``Repo`` as
+              one candidate set, so a ``Repo[User]`` fallback yields to a
+              ``Repo[Post]`` non-fallback even though they serve different
+              concrete types — a documented consequence of the rule being
+              request-relative, not a special case.
+            - Priority narrowing (E14): ``_filter(cls, priority=FLOOR)``
+              can leave an all-fallback set even when a higher-priority
+              non-fallback also exists, because that non-fallback was
+              already excluded by the ``priority is None or ...`` row above
+              — an explicit "give me the default" request.
+            - Open binding + closed request (plan 016): included — e.g.
+              ``get_all(Repo[User])`` includes an open ``Repo[T]`` binding
+              exactly once, via :meth:`_binding_serves`'s closing-args check.
+            - Open binding + bare/still-open request (plan 016): excluded —
+              ``get_all(Repo)`` / ``get_all(Repo[T])`` never include an open
+              ``Repo[T]`` binding, even though the STRUCTURAL
+              ``_interface_matches(Repo[T], Repo)`` is ``True`` — see
+              :meth:`_binding_serves`'s docstring for why this lookup-layer
+              guard is separate from the structural predicate.
         """
         from .decorator.scope import Default as _Default
 
@@ -1711,13 +2126,16 @@ class DIContainer:
         if qualifier is _Default:
             qualifier = None
 
-        return [
+        candidates = [
             b
             for b in self._bindings
-            # DESIGN: _interface_matches replaces plain issubclass so that generic
-            # aliases like Repository[User] are matched correctly — issubclass does
-            # not accept parameterised types as its second argument.
-            if _interface_matches(b.interface, cls)
+            # DESIGN: _binding_serves (plan 016) replaces a direct
+            # _interface_matches call — it adds the "open binding needs
+            # closing args" lookup-layer guard on top of the same structural
+            # match (plain issubclass would not even accept a parameterised
+            # type as its second argument, which _interface_matches already
+            # handles for generic aliases like Repository[User]).
+            if self._binding_serves(b, cls)
             # DESIGN: exact_only bindings are self-bindings auto-generated to make
             # a concrete class resolvable by its own type.  They must NOT participate
             # in supertype sweeps (e.g. get_all(BaseClass)) because they would surface
@@ -1728,9 +2146,28 @@ class DIContainer:
             and (not getattr(b, "exact_only", False) or b.interface is cls)
             and (qualifier is None or b.qualifier == qualifier)
             and (priority is None or b.priority == priority)
-            # @Profile / @Alternative activation — see _binding_is_active().
+            # @Profile / @Alternative / @Requires activation — see _binding_is_active().
             and self._binding_is_active(b)
         ]
+        # DESIGN: fallback rule is request-relative — it needs the sibling
+        # list, which only exists here (plan 017 §Design). Runs AFTER every
+        # other narrowing above so an inactive/other-qualifier/
+        # other-priority sibling never shadows a fallback it could never
+        # actually compete with.
+        #   ✅ zero new container state; _binding_is_active()'s signature
+        #      is untouched (plan 015 owns that function, not this plan)
+        #   ✅ one change site covers every lookup path that calls
+        #      _filter(): get/aget/get_all/aget_all/is_resolvable/
+        #      get_binding/get_all_bindings/_collect_sync/_collect_async/
+        #      validate()'s memo_filter
+        #   ❌ one extra any() scan + a possible list rebuild per call —
+        #      still O(len(candidates)), already bounded by
+        #      O(len(self._bindings)) above; no per-candidate marker read
+        #      (b.fallback is a plain attribute cached at construction,
+        #      binding.py — not a live isinstance/getattr marker check)
+        if any(not b.fallback for b in candidates):
+            candidates = [b for b in candidates if not b.fallback]
+        return candidates
 
     def is_resolvable(
         self,
@@ -1758,6 +2195,14 @@ class DIContainer:
                     ``get(cls, qualifier=qualifier, priority=priority)``
                     will not raise ``LookupError``.
             False — no binding matches; ``get()`` would raise.
+
+        Raises:
+            ConditionEvaluationError: A candidate's ``@Requires`` predicate
+                raised while ``_filter()`` evaluated ``_binding_is_active()``
+                (plan 015). "Side-effect-free" above refers to instantiation
+                and caching, not to the user-supplied predicate — a broken
+                condition is a programming error the caller wrote, not a
+                side effect this method introduces.
 
         Thread safety:  ⚠️ Conditional — safe only if ``_bindings`` is not
                         mutated concurrently.  See class-level safety note.
@@ -1865,7 +2310,16 @@ class DIContainer:
             - A ``@Profile``d singleton already resolved under the OLD
               profile set is **not** evicted from ``_singleton_cache`` —
               profiles are a startup-time concern; ``override()`` /
-              ``reset_binding()`` remain the eviction tools.
+              ``reset_binding()`` remain the eviction tools. The same
+              non-eviction applies to a ``@Requires`` condition flipping
+              ``False`` after a ``@Singleton`` was resolved under it (plan
+              015, E12) — activation state changing never evicts a cache.
+              The same holds for a ``@Fallback`` singleton cached before its
+              shadowing binding was registered (plan 017, E24): the cached
+              fallback instance keeps being served to any dependent that
+              already holds a reference to it, and is still torn down at
+              ``shutdown()`` — only ``get(T)`` on a fresh request sees the
+              new winner, because the cache is keyed per binding source.
 
         Example:
             container.activate_profile("prod")
@@ -2338,6 +2792,11 @@ class DIContainer:
         Edge cases:
             - qualifier=None and priority=None → returns all SINGLETON bindings.
             - No bindings match               → returns an empty list.
+            - An OPEN binding (plan 016, ``type_params`` non-empty) is NEVER
+              returned, even if ``singleton=True`` — there is no registry of
+              "every closed alias that will eventually be requested" to
+              pre-create instances for (plan 016 §Non-goals); see
+              :meth:`warm_up`'s Edge cases.
 
         Thread safety:  ⚠️ Conditional — safe only if self._bindings is not mutated
                         concurrently.
@@ -2347,6 +2806,7 @@ class DIContainer:
             b
             for b in self._bindings
             if b.scope == Scope.SINGLETON
+            and not getattr(b, "type_params", ())
             and (qualifier is None or b.qualifier == qualifier)
             and (priority is None or b.priority == priority)
         ]
@@ -2371,8 +2831,19 @@ class DIContainer:
         Raises:
             LookupError: No binding is registered for ``cls`` with the given
                          qualifier and priority.
+
+        Note:
+            Specificity (plan 016, row 2): after ``_filter()`` has already
+            applied interface/qualifier/priority/activation narrowing AND
+            plan 017's fallback-drop, :func:`_prefer_closed` runs — a closed
+            binding (concrete class, or a closed alias) always beats an open
+            ``Repo[T]`` binding serving the same request, regardless of
+            ``@Priority``. Fallback-drop must run first (inside ``_filter()``)
+            because it is an explicit user declaration; specificity is a
+            structural inference, and explicit intent must not be overridden
+            by an inference (plan 016 §Design "Order relative to @Fallback").
         """
-        candidates = self._filter(cls, qualifier=qualifier, priority=priority)
+        candidates = _prefer_closed(self._filter(cls, qualifier=qualifier, priority=priority))
         if not candidates:
             raise LookupError(
                 f"No binding found for '{_type_name(cls)}'"
@@ -2429,21 +2900,48 @@ class DIContainer:
                 # DEPENDENT — no cache, new instance every time
                 return None
 
-    def _get_cache_key(self, binding: AnyBinding) -> Any:
+    def _get_cache_key(self, binding: AnyBinding, requested: Any = None) -> Any:
         """Return a hashable cache key for *binding*.
 
         Uses the implementation class for :class:`~providify.binding.ClassBinding`
         and the provider callable for :class:`~providify.binding.ProviderBinding`,
         so the key is stable and unique regardless of binding type.
 
+        Row 4 (plan 016): an OPEN ``ProviderBinding`` (``binding.type_params``
+        non-empty) is keyed by ``(binding.fn, requested)`` instead of bare
+        ``binding.fn`` — one cache entry PER CLOSED ALIAS, never one shared
+        instance across every ``get(Repo[X])`` for every ``X``.
+        **[R016:18]** names the naive "cache by binding alone" default a
+        "dangerous anti-pattern" for exactly this reason: a ``Repo[User]``
+        singleton and a ``Repo[Order]`` singleton must never collapse into
+        the same cache slot.
+
         Args:
-            binding: The binding to derive a key for.
+            binding:   The binding to derive a key for.
+            requested: The closed alias being resolved — only consulted when
+                       ``binding.type_params`` is non-empty (plan 016).
 
         Returns:
-            The concrete class (``type``) or provider function (``Callable``).
+            The concrete class (``type``) for a ``ClassBinding``; the
+            provider function (``Callable``) for a closed ``ProviderBinding``;
+            ``(fn, requested)`` for an open ``ProviderBinding``.
+
+        Edge cases:
+            - Open binding, *requested* is ``None`` or does not close it →
+              still returns ``(fn, requested)`` — the caller
+              (:meth:`_instantiate_sync`/:meth:`_instantiate_async`) is
+              responsible for raising ``TypeError`` BEFORE trusting this key
+              for a cache write; this method itself never validates closure.
+            - A tuple key is hashable (**[R001:99-103]**: ``Repo[User] ==
+              Repo[User]``, hash from ``(__origin__, __args__)``) and works
+              unchanged as the per-key lock key, the re-entrancy key, and the
+              ``_singleton_order`` entry — no other code needed to change to
+              support it.
         """
         if isinstance(binding, ClassBinding):
             return binding.implementation
+        if getattr(binding, "type_params", ()):
+            return (binding.fn, requested)
         return binding.fn
 
     def _record_singleton_creation(self, key: Any, binding: AnyBinding) -> None:
@@ -2556,7 +3054,50 @@ class DIContainer:
             return binding.fn
         return None
 
-    def _instantiate_sync(self, binding: AnyBinding) -> Any:
+    @staticmethod
+    def _event_interface(binding: AnyBinding, key: Any) -> Any:
+        """Return the ``interface`` field for an ``InstanceCreated``/``InstanceDisposed`` event.
+
+        Row 4 (plan 016): an open binding's OWN ``.interface`` is the open
+        alias (``Repo[T]``) — never what was actually built. The cache *key*
+        for an open binding is ``(fn, closed_alias)`` (see
+        :meth:`_get_cache_key`), so the closed alias a caller actually cares
+        about ("which instance was this?") is sitting right there in
+        ``key[1]`` — this centralises reading it so both event kinds (a
+        creation-time emission using the freshly-computed key, and a
+        shutdown-time emission reading the recorded key) agree.
+
+        Args:
+            binding: The binding that produced (or is disposing) the instance.
+            key:     The singleton cache key from :meth:`_get_cache_key` —
+                     either a plain ``fn``/``implementation``, or an open
+                     binding's ``(fn, closed_alias)`` tuple.
+
+        Returns:
+            ``key[1]`` (the closed alias) when *key* is a tuple — i.e. an
+            open binding; ``binding.interface`` otherwise, unchanged from
+            pre-plan-016 behaviour for every other binding kind.
+
+        Edge cases:
+            - Non-singleton scope (REQUEST/SESSION/DEPENDENT) open binding →
+              *key* is still the ``(fn, closed_alias)`` tuple
+              (``_get_cache_key`` does not special-case scope), so this
+              still resolves correctly even though there is no singleton
+              cache entry involved.
+            - A hypothetical future binding kind whose OWN cache key happens
+              to be a tuple for an unrelated reason → would be
+              misinterpreted as "open" here. Not reachable today: only
+              open ``ProviderBinding``s produce tuple keys (see
+              :meth:`_get_cache_key`'s Returns).
+
+        Thread safety:  ✅ Pure function — no shared state.
+        Async safety:   ✅ No awaits.
+        """
+        if isinstance(key, tuple):
+            return key[1]
+        return binding.interface
+
+    def _instantiate_sync(self, binding: AnyBinding, requested: Any = None) -> Any:
         """Instantiate *binding* synchronously, respecting scope caching.
 
         For SINGLETON scope, uses per-key double-check locking to guarantee
@@ -2576,9 +3117,22 @@ class DIContainer:
 
         Args:
             binding: The binding to instantiate.
+            requested: The closed alias being resolved (plan 016) — e.g.
+                ``Repo[User]``. Required when ``binding.type_params`` is
+                non-empty (an open binding); ignored otherwise.
 
         Returns:
             The (possibly cached) resolved instance.
+
+        Raises:
+            TypeError: *binding* is an open binding (``binding.type_params``
+                non-empty) and *requested* is ``None`` or does not close it.
+                A programmer-error guard, not a lookup miss — every real
+                resolution path (``get()``, ``get_all()``, ...) reaches this
+                method only via :meth:`_get_best_candidate`/:meth:`_filter`,
+                which never hand out an open binding without a request that
+                closes it (:meth:`_binding_serves`). Reachable only by
+                calling this private method directly with the wrong shape.
 
         Thread safety:  ✅ SINGLETON: double-check lock ensures one creation.
                         REQUEST/SESSION: ContextVar-isolated — no shared state.
@@ -2594,8 +3148,21 @@ class DIContainer:
               :meth:`_check_singleton_reentry`. The per-key lock is not
               reentrant, so without that guard the call would block forever on a
               lock it already holds.
+            - Open binding (plan 016) → cache key is
+              ``(binding.fn, requested)``, one entry per closed alias — see
+              :meth:`_get_cache_key`.
         """
-        key = self._get_cache_key(binding)
+        # Row 3 programmer-error guard (plan 016) — see Raises above.
+        if getattr(binding, "type_params", ()) and (
+            requested is None or _closing_args(binding.interface, requested) is None
+        ):
+            raise TypeError(
+                f"{binding!r} is an open generic binding and cannot be "
+                f"instantiated without a 'requested=' closed alias it can "
+                f"actually close (e.g. Repo[User] for a Repo[T] binding); "
+                f"got requested={requested!r}."
+            )
+        key = self._get_cache_key(binding, requested)
         cache = self._get_cache(binding)
 
         # ── Fast path: already in cache (no lock needed) ─────────────────────
@@ -2635,7 +3202,7 @@ class DIContainer:
                 started = perf_counter_ns() if self._hooks else 0
                 token = _singleton_in_progress.set(_singleton_in_progress.get() | {(id(self), key)})
                 try:
-                    instance = binding.create(self)
+                    instance = binding.create(self, requested=requested)
                     if isinstance(binding, ClassBinding):
                         self._register_observers(instance, binding.implementation)
                         instance = self._apply_interceptors(instance, binding.implementation)
@@ -2655,7 +3222,7 @@ class DIContainer:
             if self._hooks:
                 self._emit(
                     InstanceCreated(
-                        interface=binding.interface,
+                        interface=self._event_interface(binding, key),
                         implementation=self._instance_created_implementation(binding),
                         scope=binding.scope,
                         qualifier=binding.qualifier,
@@ -2667,7 +3234,7 @@ class DIContainer:
 
         # ── Non-singleton path (REQUEST, SESSION, DEPENDENT) ─────────────────
         started = perf_counter_ns() if self._hooks else 0
-        instance = binding.create(self)
+        instance = binding.create(self, requested=requested)
         if isinstance(binding, ClassBinding):
             self._register_observers(instance, binding.implementation)
             instance = self._apply_interceptors(instance, binding.implementation)
@@ -2684,7 +3251,7 @@ class DIContainer:
         if self._hooks:
             self._emit(
                 InstanceCreated(
-                    interface=binding.interface,
+                    interface=self._event_interface(binding, key),
                     implementation=self._instance_created_implementation(binding),
                     scope=binding.scope,
                     qualifier=binding.qualifier,
@@ -2694,7 +3261,7 @@ class DIContainer:
             )
         return instance
 
-    async def _instantiate_async(self, binding: AnyBinding) -> Any:
+    async def _instantiate_async(self, binding: AnyBinding, requested: Any = None) -> Any:
         """Instantiate *binding* asynchronously, respecting scope caching.
 
         Mirrors :meth:`_instantiate_sync` but delegates to ``binding.acreate()``.
@@ -2707,9 +3274,15 @@ class DIContainer:
 
         Args:
             binding: The binding to instantiate.
+            requested: The closed alias being resolved (plan 016) — see
+                :meth:`_instantiate_sync`'s matching Args entry.
 
         Returns:
             The (possibly cached) resolved instance.
+
+        Raises:
+            TypeError: See :meth:`_instantiate_sync`'s matching Raises entry
+                — identical guard, async mirror.
 
         Async safety:   ✅ SINGLETON: asyncio.Lock ensures one creation per key
                         per event loop.  REQUEST/SESSION: ContextVar-isolated.
@@ -2724,7 +3297,18 @@ class DIContainer:
               :meth:`_check_singleton_reentry`; ``asyncio.Lock`` is not reentrant
               either, so the await would otherwise never complete.
         """
-        key = self._get_cache_key(binding)
+        # Row 3 programmer-error guard (plan 016) — see _instantiate_sync's
+        # matching guard for the full rationale.
+        if getattr(binding, "type_params", ()) and (
+            requested is None or _closing_args(binding.interface, requested) is None
+        ):
+            raise TypeError(
+                f"{binding!r} is an open generic binding and cannot be "
+                f"instantiated without a 'requested=' closed alias it can "
+                f"actually close (e.g. Repo[User] for a Repo[T] binding); "
+                f"got requested={requested!r}."
+            )
+        key = self._get_cache_key(binding, requested)
         cache = self._get_cache(binding)
 
         # ── Fast path ─────────────────────────────────────────────────────────
@@ -2757,7 +3341,7 @@ class DIContainer:
                 started = perf_counter_ns() if self._hooks else 0
                 token = _singleton_in_progress.set(_singleton_in_progress.get() | {(id(self), key)})
                 try:
-                    instance = await binding.acreate(self)
+                    instance = await binding.acreate(self, requested=requested)
                     if isinstance(binding, ClassBinding):
                         self._register_observers(instance, binding.implementation)
                         instance = self._apply_interceptors(instance, binding.implementation)
@@ -2772,7 +3356,7 @@ class DIContainer:
             if self._hooks:
                 self._emit(
                     InstanceCreated(
-                        interface=binding.interface,
+                        interface=self._event_interface(binding, key),
                         implementation=self._instance_created_implementation(binding),
                         scope=binding.scope,
                         qualifier=binding.qualifier,
@@ -2784,7 +3368,7 @@ class DIContainer:
 
         # ── Non-singleton path ────────────────────────────────────────────────
         started = perf_counter_ns() if self._hooks else 0
-        instance = await binding.acreate(self)
+        instance = await binding.acreate(self, requested=requested)
         if isinstance(binding, ClassBinding):
             self._register_observers(instance, binding.implementation)
             instance = self._apply_interceptors(instance, binding.implementation)
@@ -2797,7 +3381,7 @@ class DIContainer:
         if self._hooks:
             self._emit(
                 InstanceCreated(
-                    interface=binding.interface,
+                    interface=self._event_interface(binding, key),
                     implementation=self._instance_created_implementation(binding),
                     scope=binding.scope,
                     qualifier=binding.qualifier,
@@ -2820,8 +3404,13 @@ class DIContainer:
         Returns:
             ``True`` if a matching binding exists, ``False`` otherwise.
         """
-        # _interface_matches replaces issubclass — handles generic aliases safely
-        if any(_interface_matches(b.interface, hint) for b in self._bindings):
+        # _binding_serves (plan 016) replaces a direct _interface_matches
+        # call — see _filter()'s matching DESIGN comment. Without this,
+        # is_resolvable(Repo) would report True for a bare request an open
+        # Repo[T] binding cannot actually serve, and the plain-annotation
+        # constructor path (which trusts is_resolvable) would then call
+        # get(Repo) and hit a LookupError it never expected to see.
+        if any(self._binding_serves(b, hint) for b in self._bindings):
             return True
         # F7 (plan 010 §Design F7.3, rule 2) — deliberately checked AFTER the
         # literal-binding scan above so a literal list[T] binding still wins
@@ -3055,6 +3644,8 @@ class DIContainer:
         self,
         fn: Callable[..., Any],
         owner_name: str,
+        *,
+        type_args: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build a ``kwargs`` dict by resolving every providify parameter of *fn*.
 
@@ -3067,6 +3658,12 @@ class DIContainer:
         Args:
             fn:         The callable whose parameters should be resolved.
             owner_name: A human-readable name used in error messages.
+            type_args:  ``{TypeVar.__name__: concrete}`` (plan 016) — an open
+                binding's closing args, keyed by NAME (not identity — see
+                :meth:`~providify.binding.ProviderBinding.type_args_for` for
+                why). ``None``/``{}`` for every closed provider — the
+                overwhelmingly common case pays exactly one ``get_origin``
+                call per parameter and changes nothing else.
 
         Returns:
             A dict mapping parameter names to resolved instances.
@@ -3079,6 +3676,29 @@ class DIContainer:
                 see :meth:`_resolve_params`. Unresolvable annotations on
                 parameters that are NOT injection points no longer affect
                 this call at all (Phase 7 — per-parameter resolution).
+
+        Edge cases:
+            - A parameter annotated exactly ``type[X]`` where ``X.__name__``
+              is a key in *type_args* → filled directly from *type_args*,
+              BEFORE any ``InjectionPoint``/container-lookup machinery runs
+              — this is a container-SUPPLIED value, not an injection point
+              (plan 016 row 3).
+            - ``type[X] | None`` — NOT recognised, even if the shape looks
+              close; :func:`_type_arg_param` requires the EXACT ``type[X]``
+              shape, so this still resolves (or fails) through the normal
+              union/plain-type path.
+            - A ``type[T]`` parameter on a CLOSED provider (``type_args`` is
+              ``{}``) → unchanged: resolves — or fails — exactly as before
+              this plan.
+            - A single-TypeVar open binding whose factory parameter carries
+              NO annotation at all (``lambda entity: Repo(entity)``, the
+              ergonomic idiom the GAP report's own proposed spelling names
+              "positional by TypeVar") → the ONE remaining closing value
+              still fills the first still-unresolved, no-default parameter
+              positionally — see the fallback pass below. Unambiguous only
+              with exactly one TypeVar left undelivered; a multi-TypeVar
+              open binding (``Pair[A, B]``) MUST annotate both parameters
+              (``a: type[A], b: type[B]``) or this fallback never fires.
         """
         hints = self._resolve_params(fn, owner_name)
 
@@ -3088,8 +3708,35 @@ class DIContainer:
         # Declaring class for InjectionPoint — outermost class on the resolution stack.
         declaring_class = _current_stack()[-1] if _current_stack() else None
 
+        # Row 3 (plan 016) — read-only view of the closing args; NEVER
+        # popped, because a repeated TypeVar (Pair[T, T]) legitimately fills
+        # TWO parameters (a: type[T], b: type[T]) from the SAME one-entry
+        # dict — popping after the first use would starve the second.
+        remaining_type_args: dict[str, Any] = dict(type_args) if type_args else {}
+        # Did ANY parameter get filled by an explicit type[X] name match?
+        # Gates the positional fallback below: an author who annotated even
+        # ONE parameter correctly has opted into the explicit, name-based
+        # contract — the positional fallback exists only for a factory that
+        # annotated NONE of its parameters at all (plan 016 row 3's
+        # "positional by TypeVar" idiom, GAP report's original proposed
+        # spelling), never as a silent second chance for a half-annotated one.
+        any_named_match = False
+
         for param_name, hint in hints.items():
             param = sig.parameters.get(param_name)
+
+            # Row 3 (plan 016) — a type[X] parameter closing an open binding
+            # is CONTAINER-SUPPLIED, not resolved from a binding: no
+            # InjectionPoint context, no _resolve_hint_sync call, no cost
+            # beyond one get_origin() check when type_args is empty (every
+            # closed provider, every constructor — the hot path).
+            if remaining_type_args:
+                type_arg_tp = _type_arg_param(hint)
+                if type_arg_tp is not None and type_arg_tp.__name__ in remaining_type_args:
+                    resolved[param_name] = remaining_type_args[type_arg_tp.__name__]
+                    any_named_match = True
+                    continue
+
             # Build InjectionPoint context so InjectionPoint-typed params resolve correctly.
             ip = InjectionPoint(
                 declaring_class=declaring_class,
@@ -3113,12 +3760,44 @@ class DIContainer:
             else:
                 resolved[param_name] = resolved_value
 
+        # Row 3 positional fallback (plan 016) — an UNANNOTATED parameter
+        # never enters the loop above at all (it is absent from `hints` —
+        # `_resolve_params` only reports parameters with a raw annotation).
+        # When NOTHING was delivered by name and exactly one closing value
+        # exists, hand it to the first still-unfilled, no-default parameter
+        # positionally — the unambiguous single-TypeVar case
+        # (`lambda entity: Repo(entity)`). Never fires for a closed provider
+        # (`remaining_type_args` starts empty), a multi-TypeVar open binding
+        # with 2+ values, or a factory that already used the name-based
+        # contract for at least one parameter.
+        if not any_named_match and len(remaining_type_args) == 1:
+            (sole_value,) = remaining_type_args.values()
+            for param_name, param in sig.parameters.items():
+                if param_name in resolved or param_name in ("self", "cls"):
+                    continue
+                if param.kind in (
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                ):
+                    continue
+                if param_name in hints:
+                    # Annotated but not a type[X] match — a real injection
+                    # point the loop above already tried (and either
+                    # resolved or raised); never silently overwritten here.
+                    continue
+                if param.default is not inspect.Parameter.empty:
+                    continue  # has its own default — leave it alone
+                resolved[param_name] = sole_value
+                break  # one TypeVar, one slot — never fill a second parameter
+
         return resolved
 
     async def _collect_kwargs_async(
         self,
         fn: Callable[..., Any],
         owner_name: str,
+        *,
+        type_args: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build a ``kwargs`` dict by resolving every providify parameter, asynchronously.
 
@@ -3128,6 +3807,7 @@ class DIContainer:
         Args:
             fn:         The callable whose parameters should be resolved.
             owner_name: A human-readable name used in error messages.
+            type_args:  See :meth:`_collect_kwargs_sync`'s matching Args entry.
 
         Returns:
             A dict mapping parameter names to resolved instances.
@@ -3144,8 +3824,21 @@ class DIContainer:
 
         declaring_class = _current_stack()[-1] if _current_stack() else None
 
+        # Row 3 (plan 016) — see _collect_kwargs_sync's matching comment.
+        remaining_type_args: dict[str, Any] = dict(type_args) if type_args else {}
+        any_named_match = False
+
         for param_name, hint in hints.items():
             param = sig.parameters.get(param_name)
+
+            # Row 3 (plan 016) — see _collect_kwargs_sync's matching comment.
+            if remaining_type_args:
+                type_arg_tp = _type_arg_param(hint)
+                if type_arg_tp is not None and type_arg_tp.__name__ in remaining_type_args:
+                    resolved[param_name] = remaining_type_args[type_arg_tp.__name__]
+                    any_named_match = True
+                    continue
+
             ip = InjectionPoint(
                 declaring_class=declaring_class,
                 param_name=param_name,
@@ -3166,6 +3859,25 @@ class DIContainer:
                     )
             else:
                 resolved[param_name] = resolved_value
+
+        # Row 3 positional fallback (plan 016) — see _collect_kwargs_sync's
+        # matching comment for the full rationale; identical rule, async mirror.
+        if not any_named_match and len(remaining_type_args) == 1:
+            (sole_value,) = remaining_type_args.values()
+            for param_name, param in sig.parameters.items():
+                if param_name in resolved or param_name in ("self", "cls"):
+                    continue
+                if param.kind in (
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                ):
+                    continue
+                if param_name in hints:
+                    continue
+                if param.default is not inspect.Parameter.empty:
+                    continue
+                resolved[param_name] = sole_value
+                break
 
         return resolved
 
@@ -3386,15 +4098,17 @@ class DIContainer:
                 # Resolve the delegate: the inner bean that the @Decorator wraps.
                 # Exclude the class currently being constructed to avoid self-injection.
                 current_cls = _current_stack()[-1] if _current_stack() else None
-                candidates = [
-                    b
-                    for b in self._filter(effective_base_type)
-                    if not (isinstance(b, ClassBinding) and b.implementation is current_cls)
-                ]
+                candidates = _prefer_closed(
+                    [
+                        b
+                        for b in self._filter(effective_base_type)
+                        if not (isinstance(b, ClassBinding) and b.implementation is current_cls)
+                    ]
+                )
                 if not candidates:
                     return _UNRESOLVED
                 best = max(candidates, key=lambda b: b.priority or 0)
-                return self._instantiate_sync(best)
+                return self._instantiate_sync(best, requested=effective_base_type)
             elif event_meta:
                 return EventProxy(self, effective_base_type)
 
@@ -3526,15 +4240,17 @@ class DIContainer:
                     return _UNRESOLVED
             elif delegate_meta:
                 current_cls = _current_stack()[-1] if _current_stack() else None
-                candidates = [
-                    b
-                    for b in self._filter(effective_base_type)
-                    if not (isinstance(b, ClassBinding) and b.implementation is current_cls)
-                ]
+                candidates = _prefer_closed(
+                    [
+                        b
+                        for b in self._filter(effective_base_type)
+                        if not (isinstance(b, ClassBinding) and b.implementation is current_cls)
+                    ]
+                )
                 if not candidates:
                     return _UNRESOLVED
                 best = max(candidates, key=lambda b: b.priority or 0)
-                return await self._instantiate_async(best)
+                return await self._instantiate_async(best, requested=effective_base_type)
             elif event_meta:
                 return EventProxy(self, effective_base_type)
 
@@ -3740,24 +4456,44 @@ class DIContainer:
         finally:
             _resolution_stack.reset(token)
 
-    def _call_provider(self, fn: Callable[..., Any]) -> Any:
+    def _call_provider(
+        self,
+        fn: Callable[..., Any],
+        *,
+        type_args: Mapping[str, Any] | None = None,
+        cycle_key: Any = None,
+    ) -> Any:
         """Call a sync provider function with all dependencies injected.
 
         If the provider declares a return type, that type is used as the cycle-
-        detection key (same semantics as :meth:`_resolve_constructor`).
+        detection key (same semantics as :meth:`_resolve_constructor`) —
+        UNLESS *cycle_key* overrides it (plan 016, open bindings).
 
         Args:
             fn: The provider callable to invoke.
+            type_args: ``{TypeVar.__name__: concrete}`` (plan 016) — forwarded
+                to :meth:`_collect_kwargs_sync` so a ``type[T]``-annotated
+                parameter is filled from the closing args BEFORE any
+                container lookup is attempted. ``None``/``{}`` for every
+                closed binding — the overwhelmingly common case.
+            cycle_key: When given, OVERRIDES the return-type-derived cycle
+                key (plan 016). An open binding's own interface (``Repo[T]``)
+                would otherwise be pushed for every closed request it
+                serves, so a ``Repo[User]`` factory that legitimately
+                resolves ``Repo[Order]`` through the SAME binding would trip
+                a false ``CircularDependencyError`` — the closed alias
+                (``Repo[Order]``) is the correct, request-specific key.
 
         Returns:
             The value returned by *fn*.
 
         Raises:
-            CircularDependencyError: If the provider's return type is already
+            CircularDependencyError: If the effective cycle key (*cycle_key*
+                if given, else the provider's return type) is already
                 present in the current resolution stack.
             LookupError: If any required parameter of *fn* cannot be resolved.
         """
-        return_type = self._get_provider_return_type(fn)
+        return_type = cycle_key if cycle_key is not None else self._get_provider_return_type(fn)
 
         if return_type is not None:
             self._check_cycle(return_type)
@@ -3767,13 +4503,19 @@ class DIContainer:
             token = None
 
         try:
-            resolved_kwargs = self._collect_kwargs_sync(fn, fn.__name__)
+            resolved_kwargs = self._collect_kwargs_sync(fn, fn.__name__, type_args=type_args)
             return fn(**resolved_kwargs)
         finally:
             if token is not None:
                 _resolution_stack.reset(token)
 
-    async def _call_provider_async(self, fn: Callable[..., Any]) -> Any:
+    async def _call_provider_async(
+        self,
+        fn: Callable[..., Any],
+        *,
+        type_args: Mapping[str, Any] | None = None,
+        cycle_key: Any = None,
+    ) -> Any:
         """Call a provider function (sync or async) with all dependencies injected.
 
         Async mirror of :meth:`_call_provider`. The result is awaited if *fn*
@@ -3781,16 +4523,19 @@ class DIContainer:
 
         Args:
             fn: The provider callable to invoke.
+            type_args: See :meth:`_call_provider`'s matching Args entry —
+                forwarded to :meth:`_collect_kwargs_async`.
+            cycle_key: See :meth:`_call_provider`'s matching Args entry.
 
         Returns:
             The resolved value — awaited if *fn* is ``async def``.
 
         Raises:
-            CircularDependencyError: If the provider's return type is already
-                present in the current resolution stack.
+            CircularDependencyError: See :meth:`_call_provider`'s matching
+                Raises entry — identical override rule.
             LookupError: If any required parameter of *fn* cannot be resolved.
         """
-        return_type = self._get_provider_return_type(fn)
+        return_type = cycle_key if cycle_key is not None else self._get_provider_return_type(fn)
 
         if return_type is not None:
             self._check_cycle(return_type)
@@ -3800,7 +4545,7 @@ class DIContainer:
             token = None
 
         try:
-            resolved_kwargs = await self._collect_kwargs_async(fn, fn.__name__)
+            resolved_kwargs = await self._collect_kwargs_async(fn, fn.__name__, type_args=type_args)
             result = fn(**resolved_kwargs)
             return await result if inspect.iscoroutinefunction(fn) else result
         finally:
@@ -4228,6 +4973,18 @@ class DIContainer:
               still in ``_singleton_cache`` but unseen by the main walk is
               appended at the end (reverse ``_bindings`` order), so it is
               torn down last rather than silently skipped.
+            - The fallback tail's ``key_to_binding = {self._get_cache_key(b):
+              b for b in self._bindings}`` (plan 016) does NOT recognise an
+              open binding's tuple keys: ``_get_cache_key(b)`` with no
+              ``requested=`` produces ``(fn, None)`` for an open binding,
+              which never matches its real instance keys
+              ``(fn, Repo[User])``/``(fn, Repo[Order])``/.... Acceptable
+              because this tail is already documented above as UNREACHABLE
+              in today's codebase (every write to ``_singleton_cache`` goes
+              through the main walk via ``_singleton_order``) — fixing it
+              for a code path nothing exercises would add complexity with no
+              observable benefit; noted here so a future caller of this
+              defensive tail is not surprised.
 
         Thread safety: ⚠️ Reads ``_singleton_order``/``_singleton_cache``/
             ``_bindings`` without a lock. Shutdown is expected to run once,
@@ -4444,7 +5201,7 @@ class DIContainer:
                     if self._hooks and has_hook:
                         self._emit(
                             InstanceDisposed(
-                                interface=binding.interface,
+                                interface=self._event_interface(binding, key),
                                 implementation=self._instance_created_implementation(binding),
                                 scope=binding.scope,
                                 owner=self._owner_label(binding),
@@ -4456,7 +5213,7 @@ class DIContainer:
                 if self._hooks and has_hook:
                     self._emit(
                         InstanceDisposed(
-                            interface=binding.interface,
+                            interface=self._event_interface(binding, key),
                             implementation=self._instance_created_implementation(binding),
                             scope=binding.scope,
                             owner=self._owner_label(binding),
@@ -4599,7 +5356,7 @@ class DIContainer:
                     if self._hooks and has_hook:
                         self._emit(
                             InstanceDisposed(
-                                interface=binding.interface,
+                                interface=self._event_interface(binding, key),
                                 implementation=self._instance_created_implementation(binding),
                                 scope=binding.scope,
                                 owner=self._owner_label(binding),
@@ -4611,7 +5368,7 @@ class DIContainer:
                 if self._hooks and has_hook:
                     self._emit(
                         InstanceDisposed(
-                            interface=binding.interface,
+                            interface=self._event_interface(binding, key),
                             implementation=self._instance_created_implementation(binding),
                             scope=binding.scope,
                             owner=self._owner_label(binding),
@@ -5274,32 +6031,76 @@ class DIContainer:
            ``UNRESOLVED_ANNOTATION`` in pass 1, since
            ``ProviderBinding.interface`` is resolved independently at
            registration time.
+        1c. **Condition tier** (plan 015) — a binding carrying ``@Requires``
+           whose condition currently evaluates ``False`` contributes one
+           ``CONDITION_INACTIVE`` **info** issue per binding (naming every
+           unsatisfied clause) — the feature working as declared, not a
+           defect; see :class:`~providify.validation.Severity`. Runs
+           unfiltered, exactly like pass 1/1b — a ``@Profile``-inactive
+           binding's inactive ``@Requires`` is still reported (E13). A
+           raising predicate propagates
+           :class:`~providify.exceptions.ConditionEvaluationError` out of
+           this method (E14) — the intended asymmetry with ``get()``, which
+           never evaluates a profile-excluded binding's condition at all.
+        1d. **Fallback tier** (plan 017) — an ACTIVE ``@Fallback`` binding
+           whose own natural request (its ``(interface, qualifier, None)``)
+           would be won by an active non-fallback sibling contributes one
+           ``FALLBACK_SHADOWED`` **info** issue naming that sibling via the
+           new ``shadowed_by`` field — the feature working as declared, not
+           a defect. Runs through :meth:`_filter` (post-shadowing set), so
+           an inactive fallback (profile off, ``@Alternative`` not enabled,
+           ``@Requires`` unsatisfied) is never reported here (E27) — that is
+           pass 1c's / plan 015's story. A qualified fallback is evaluated
+           against its own qualifier only (E28). Two tied fallbacks with no
+           non-fallback sibling are reported by the existing
+           ``AMBIGUOUS_BINDING`` in pass 2, never by this kind (E12).
         2. **Graph tier** — :meth:`_iter_injection_points` yields every
            statically-classified injection point; each is resolved against a
            call-local candidate memo (wrapping :meth:`_filter`) to detect
            missing/ambiguous bindings and to record adjacency edges for
-           :meth:`_find_cycles`.
+           :meth:`_find_cycles`. Plan 016 (open generics): (a) a factory
+           parameter closing an open binding's TypeVar (``type[T]`` matched
+           by name) is never yielded by :meth:`_iter_injection_points` in
+           the first place — container-supplied, not a graph edge; (b)
+           :func:`_prefer_closed` is applied to each candidate list before
+           both the ambiguity check and the edge pick, mirroring
+           :meth:`_get_best_candidate` exactly — a closed+open pair for the
+           same request is never a false ``AMBIGUOUS_BINDING``, and the
+           recorded edge always points at the binding ``get()`` would
+           actually pick; (c) a ``MISSING_BINDING`` whose requested type has
+           no serving binding at all, but DOES have a same-origin open
+           binding rejected only on a ``bound=``/constraint violation, gets
+           its message enriched with that near-miss (no new ``IssueKind`` —
+           see :class:`~providify.validation.IssueKind`'s module docstring).
+        3. **Module teardown tier** (plan 014) — reports the ``@Disposes``
+           wiring defects recorded on each ``_ModuleRecord`` at install
+           time: ``DISPOSER_OVERWRITTEN`` (two ``@Disposes`` in one module
+           resolved to the same own binding) and ``UNMATCHED_DISPOSER`` (a
+           ``@Disposes`` matched none of its module's own bindings), both
+           **warnings**.
 
         A binding whose annotations fail to resolve (``AnnotationResolutionError``)
         contributes its ``UNRESOLVED_ANNOTATION`` issue and is **skipped**
         for edge-building — a partial graph, never a false "no dependencies".
 
-        ⚠️ Profile-aware (plan 005): candidate resolution goes through
-        :meth:`_filter` / :meth:`_binding_is_active`, the same predicate
-        ``get()`` uses — so this method validates the graph **as it will
-        actually be wired under the container's current** ``active_profiles``,
-        not the graph you'd get by ignoring ``@Profile``. A binding whose only
-        provider of some interface is gated by ``@Profile("prod")`` is
-        reported as ``MISSING_BINDING`` when ``"prod"`` is not currently
-        active, even though the binding is registered — call
-        :meth:`activate_profile` (or construct with ``profiles=...``) before
-        validating each deployment configuration you care about.
+        ⚠️ Profile- and condition-aware (plans 005, 015): candidate
+        resolution goes through :meth:`_filter` / :meth:`_binding_is_active`,
+        the same predicate ``get()`` uses — so this method validates the
+        graph **as it will actually be wired under the container's current**
+        ``active_profiles`` **and** ``@Requires`` state, not the graph you'd
+        get by ignoring either. A binding whose only provider of some
+        interface is gated by ``@Profile("prod")`` — or whose ``@Requires``
+        currently evaluates ``False`` — is reported as ``MISSING_BINDING``
+        for its dependents even though the binding is registered — call
+        :meth:`activate_profile` (or construct with ``profiles=...``) or
+        satisfy the condition (env var / flag) before validating each
+        deployment configuration you care about.
 
         Args:
             raise_on_error: When ``True`` (default), raises
                 :class:`~providify.exceptions.ContainerValidationError` if
                 the report contains any ``ERROR``-severity issue. Warnings
-                never raise, regardless of this flag.
+                and INFO issues never raise, regardless of this flag.
 
         Returns:
             The full :class:`~providify.validation.ValidationReport` —
@@ -5308,6 +6109,10 @@ class DIContainer:
         Raises:
             ContainerValidationError: ``raise_on_error`` is ``True`` and
                 ``report.errors`` is non-empty.
+            ConditionEvaluationError: Some registered binding's
+                ``@Requires`` predicate raised during pass 1c. Evaluated for
+                every registered binding regardless of profile state — even
+                one that ``get()`` would never evaluate the condition for.
 
         Thread safety:  ⚠️ Not safe for concurrent binding mutation — call
                         before the app goes multi-threaded, same caveat as
@@ -5331,6 +6136,29 @@ class DIContainer:
               is wired during ``install()``; calling ``validate()`` before
               ``install()`` produces false-positive warnings for providers
               whose ``@Disposes`` has not been wired up yet.
+            - **Module teardown tier** (plan 014) reads ``_installed_modules``,
+              so it reports nothing for providers registered via bare
+              :meth:`provide` — same caveat as the ``UNREACHABLE_PRE_DESTROY``
+              bullet above; it requires :meth:`install`/:meth:`ainstall` to
+              have run. :meth:`copy` inherits the records, so a copy's
+              ``validate()`` reports the same wiring warnings as its source.
+            - **Condition tier** (plan 015) conditions are evaluated for
+              EVERY registered binding regardless of profile/alternative
+              state — pass 1c iterates ``self._bindings`` unfiltered, same
+              as pass 1b — so a raising predicate on a profile-inactive
+              binding surfaces here even though ``get()`` would never
+              evaluate it. ``_validated`` is **not** set when only
+              ``CONDITION_INACTIVE`` (INFO) issues are present — the same
+              conservative "zero issues of any severity" rule below.
+            - **Fallback tier** (plan 017): inactive fallbacks are never
+              reported (E27) — only an ACTIVE ``@Fallback`` can be
+              shadowed. Qualified fallbacks are evaluated for their own
+              qualifier (E28), never the winner's. Two tied fallbacks with
+              no non-fallback sibling are reported by ``AMBIGUOUS_BINDING``
+              in pass 2, never by ``FALLBACK_SHADOWED`` (E12). Like pass 1c,
+              ``raise_on_error`` never raises on this ``INFO`` issue, and
+              ``_validated`` is **not** set when only ``FALLBACK_SHADOWED``
+              issues are present.
 
         Example:
             container.scan("myapp")
@@ -5396,6 +6224,34 @@ class DIContainer:
                 return c.fn.__name__
             return _type_name(c.interface)  # pragma: no cover — exhaustive guard
 
+        def near_miss_suffix(requested: Any) -> str:
+            # Row 7 near-miss (plan 016) — appended to a MISSING_BINDING
+            # message when NOTHING served *requested* (memo_filter found
+            # zero candidates) but an open binding sharing its origin DOES
+            # exist and was rejected purely on a bound=/constraint
+            # violation. No new IssueKind (plan §Non-goals: MISSING_BINDING
+            # already reports the consequence) — this only enriches its
+            # message with the reason a reader would otherwise have to
+            # rediscover by hand.
+            req_origin = get_origin(requested)
+            if req_origin is None:
+                return ""
+            parts: list[str] = []
+            for b in self._bindings:
+                type_params = getattr(b, "type_params", ())
+                if not type_params:
+                    continue
+                if get_origin(b.interface) is not req_origin:
+                    continue
+                if _closing_args(b.interface, requested) is not None:
+                    continue  # would have served it — not a near-miss
+                parts.append(
+                    f" An open binding {_type_name(b.interface)} "
+                    f"({owner_of(b)}) exists but {_type_name(requested)} "
+                    f"does not satisfy its TypeVar bound/constraints."
+                )
+            return "".join(parts)
+
         def unreachable_pre_destroy_issue(b: AnyBinding) -> ValidationIssue | None:
             # See module-level `_unreachable_pre_destroy` (plan 012 §Design)
             # for the four load-bearing guards this dispatches through.
@@ -5421,6 +6277,166 @@ class DIContainer:
                 param_name=hook.fn_name,
                 requested=produced_name,
                 qualifier=b.qualifier,
+            )
+
+        def render_failed_marker(m: RequiresMarker) -> str:
+            # "What is the variable ACTUALLY set to" is the first thing an
+            # operator asks — so an env= marker's rendering names the
+            # current state, not just the declaration (plan 015 §Design).
+            rendered = m.describe()
+            if m.env is not None:
+                actual = os.environ.get(m.env)
+                if actual is None:
+                    state = "unset"
+                else:
+                    state = f"'{actual}'"
+                return f"{rendered} ({m.env} is {state})"
+            return f"{rendered} returned False"
+
+        def condition_inactive_issue(b: AnyBinding) -> ValidationIssue | None:
+            # Pass 1c (plan 015) — mirrors unreachable_pre_destroy_issue's
+            # shape exactly: a pure closure over `owner_of`, called once per
+            # binding, returning None when nothing to report.
+            if not b.conditions:
+                return None
+            # DESIGN: skip the synthetic exact_only self-binding bind()
+            # appends for `interface is not implementation` (container.py's
+            # `bind()`). Both ClassBindings read @Requires off the SAME
+            # implementation class, so without this guard every condition-
+            # gated `bind(Iface, Impl)` would report CONDITION_INACTIVE
+            # twice for the one underlying marker — pure noise, since the
+            # self-binding's `requested` (== owner) carries no information
+            # the interface-binding's issue didn't already give. Unlike
+            # MISSING_BINDING (a real per-injection-point finding that
+            # happens to also double up today — a pre-existing, separate
+            # characteristic of `validate()`'s per-binding walk, not
+            # something plan 015 is chartered to fix), an inactive-condition
+            # report about the exact same marker is genuinely redundant.
+            if getattr(b, "exact_only", False):
+                return None
+            # Evaluate via marker.is_satisfied() per marker (not
+            # _conditions_hold) so the message can list EVERY unsatisfied
+            # clause, not just the first — a raising predicate still
+            # propagates as ConditionEvaluationError, same as _conditions_hold.
+            failed: list[RequiresMarker] = []
+            for marker in b.conditions:
+                try:
+                    satisfied = marker.is_satisfied()
+                except Exception as exc:
+                    raise ConditionEvaluationError(owner_of(b), marker, exc) from exc
+                if not satisfied:
+                    failed.append(marker)
+            if not failed:
+                return None
+            clauses = "; ".join(render_failed_marker(m) for m in failed)
+            return ValidationIssue(
+                kind=IssueKind.CONDITION_INACTIVE,
+                severity=Severity.INFO,
+                owner=owner_of(b),
+                message=(
+                    f"{owner_of(b)} is registered but currently inactive: "
+                    f"{clauses}. It is excluded from get()/get_all()/"
+                    f"is_resolvable() and from candidate resolution in this "
+                    f"report until the condition holds, so any injection "
+                    f"point that only this binding could satisfy is "
+                    f"reported as MISSING_BINDING. Nothing to fix unless "
+                    f"you expected it to be active."
+                ),
+                requested=_type_name(b.interface),
+                qualifier=b.qualifier,
+            )
+
+        def fallback_shadowed_issue(b: AnyBinding) -> ValidationIssue | None:
+            # Pass 1d (plan 017) — mirrors condition_inactive_issue's shape:
+            # a pure closure over `owner_of`/`memo_filter`, called once per
+            # binding, returning None when nothing to report.
+            #
+            # Only an ACTIVE fallback can be shadowed; an inactive one
+            # (profile off, @Alternative not enabled, @Requires unsatisfied)
+            # is simply invisible — that is @Profile's / plan 015's story,
+            # not this one's (E27).
+            if not b.fallback or not self._binding_is_active(b):
+                return None
+            # "Would the most natural request for this binding be
+            # shadowed?" — (b.interface, b.qualifier, None), i.e. the exact
+            # interface/qualifier this binding was registered under, no
+            # priority narrowing (E28). `b` is always in the RAW candidate
+            # set for that request — _interface_matches(X, X) is True,
+            # qualifier equal by construction, no priority filter, and `b`
+            # is already known active above — so its ABSENCE from the
+            # post-filtered list means exactly one thing: an active
+            # non-fallback binding also matches that request and won the
+            # post-filter step in _filter() (plan 017 §Design).
+            candidates = memo_filter(b.interface, b.qualifier, None)
+            if any(c is b for c in candidates):
+                return None
+            # What get() would pick for this request today — same `max()`
+            # tie-break _get_best_candidate() uses (unchanged by this plan).
+            winner = max(candidates, key=lambda c: c.priority or 0)
+            qualifier_part = f" qualifier={b.qualifier!r}" if b.qualifier else ""
+            return ValidationIssue(
+                kind=IssueKind.FALLBACK_SHADOWED,
+                severity=Severity.INFO,
+                owner=owner_of(b),
+                message=(
+                    f"@Fallback {owner_of(b)} for {_type_name(b.interface)}"
+                    f"{qualifier_part} is shadowed by "
+                    f"{owner_of(winner)} ({_type_name(winner.interface)}, "
+                    f"qualifier={winner.qualifier!r}, priority={winner.priority}): "
+                    f"the fallback is never resolved while that binding is "
+                    f"active. Expected for a default — no action needed. To "
+                    f"use the fallback instead, remove or deactivate "
+                    f"{owner_of(winner)}."
+                ),
+                requested=_type_name(b.interface),
+                qualifier=b.qualifier,
+                shadowed_by=owner_of(winner),
+            )
+
+        def disposer_wiring_issue(w: _DisposerWiringIssue) -> ValidationIssue:
+            # Turns a recorded install-time fact (plan 014) into a report
+            # issue. Kept a two-branch function, not two closures, since the
+            # two kinds share every field except owner/message.
+            module = w.module_name
+            disposed = w.disposed_type
+            if w.kind == "overwritten":
+                winner = w.disposer_name
+                loser = w.replaced_disposer
+                owner = w.binding_owner
+                return ValidationIssue(
+                    kind=IssueKind.DISPOSER_OVERWRITTEN,
+                    severity=Severity.WARNING,
+                    owner=owner,
+                    message=(
+                        f"@Disposes '{winner}' on {module} replaced @Disposes "
+                        f"'{loser}' on the same binding {owner} (interface "
+                        f"{disposed}): both methods match it, and only one "
+                        f"disposer can be attached, so '{loser}' will never "
+                        f"run. Fix: keep a single @Disposes per produced "
+                        f"interface in {module}, or split the providers into "
+                        f"separate @Configuration classes."
+                    ),
+                    param_name=winner,
+                    requested=disposed,
+                )
+            # kind == "unmatched" — no own binding to name, so the owner is
+            # the disposer method itself (see _DisposerWiringIssue docstring).
+            name = w.disposer_name
+            return ValidationIssue(
+                kind=IssueKind.UNMATCHED_DISPOSER,
+                severity=Severity.WARNING,
+                owner=f"{module}.{name}",
+                message=(
+                    f"@Disposes '{name}' on {module} matches no @Provider "
+                    f"declared by {module} (interface {disposed}), so it is "
+                    f"attached to nothing and will never run. A @Disposes "
+                    f"only tears down instances produced by its own "
+                    f"@Configuration. Fix: add a @Provider returning "
+                    f"{disposed} to {module}, or move the @Disposes to the "
+                    f"@Configuration that provides {disposed}."
+                ),
+                param_name=name,
+                requested=disposed,
             )
 
         for idx, binding in enumerate(self._bindings):
@@ -5488,6 +6504,24 @@ class DIContainer:
             pre_destroy_issue = unreachable_pre_destroy_issue(binding)
             if pre_destroy_issue is not None:
                 issues.append(pre_destroy_issue)
+
+            # ── Pass 1c: @Requires tier — a currently-inactive condition ──
+            # Runs unfiltered like pass 1/1b (plan 005 §Design, "pass 1 is
+            # unfiltered") — a @Profile-inactive binding still gets its
+            # CONDITION_INACTIVE reported here (E13); a raising predicate
+            # propagates ConditionEvaluationError out of validate() itself
+            # (E14), the intended asymmetry with get()'s "never evaluated"
+            # behaviour for the same profile-excluded binding.
+            condition_issue = condition_inactive_issue(binding)
+            if condition_issue is not None:
+                issues.append(condition_issue)
+
+            # ── Pass 1d: fallback tier — an active @Fallback that is shadowed ──
+            # Runs after 1c so the fallback's own condition is known-active
+            # before we ask whether it is shadowed (plan 017 §Design).
+            shadowed_issue = fallback_shadowed_issue(binding)
+            if shadowed_issue is not None:
+                issues.append(shadowed_issue)
 
             if unresolved:
                 continue
@@ -5605,6 +6639,17 @@ class DIContainer:
                         )
                     ]
 
+                # Specificity (plan 016, row 2) — mirrors _get_best_candidate
+                # exactly: a closed binding beats an open one for the same
+                # request, so a closed+open pair reported here is never a
+                # false AMBIGUOUS_BINDING, and the edge pick below always
+                # points at what get() would actually pick. Applied AFTER
+                # excludes_self (self-exclusion narrows the raw set first)
+                # and BEFORE the empty check, so an all-open-shadowed-by-
+                # closed situation reduces to the SAME single candidate
+                # get() would resolve to.
+                candidates = _prefer_closed(candidates)
+
                 if not candidates:
                     if spec.optional:
                         pass  # T | None / InjectMeta(optional=True) — legal None
@@ -5638,6 +6683,13 @@ class DIContainer:
                                     f"value exists. Fix: "
                                     f"container.bind({_type_name(spec.base_type)}, "
                                     f"...) or give the parameter a default."
+                                    # Row 7 near-miss (plan 016) — "" when no
+                                    # open binding of the same origin exists,
+                                    # or the closest one WOULD have served it
+                                    # (impossible here, memo_filter already
+                                    # found zero candidates — kept as a
+                                    # defensive no-op, not an invariant).
+                                    + near_miss_suffix(spec.base_type)
                                 ),
                                 param_name=param_name,
                                 requested=_type_name(spec.base_type),
@@ -5681,6 +6733,13 @@ class DIContainer:
                     c_idx = binding_index.get(id(best))
                     if c_idx is not None:
                         adjacency[idx].add(c_idx)
+
+        # ── Pass 3: module teardown tier — @Disposes wiring defects ────────
+        # Recorded by _register_module_providers() at install time (plan
+        # 014); validate() is the reporting surface, same as pass 1b.
+        for module_cls, rec in self._installed_modules.items():
+            for w in rec.disposer_issues:
+                issues.append(disposer_wiring_issue(w))
 
         # ── Cycle detection — colour-marked DFS over the adjacency map ────
         for cycle in self._find_cycles(adjacency):
@@ -5935,6 +6994,16 @@ class DIContainer:
               not have to trace into ``_annotations.py`` to confirm it.
             - A parameter/class-attribute with no providify marker → not
               yielded (``_classify_hint`` returns ``None`` for it).
+            - Open binding (plan 016, row 6) — a ``ProviderBinding`` whose
+              ``type_params`` is non-empty and a factory parameter annotated
+              exactly ``type[X]`` where ``X.__name__`` names one of them →
+              NOT yielded. It is filled from the closing args at resolve
+              time (:meth:`_collect_kwargs_sync`'s matching mechanism), not
+              looked up from the container — ``validate()`` must not treat
+              it as a graph edge or a candidate for ``MISSING_BINDING``. A
+              ``type[T]`` parameter on a CLOSED binding is unaffected (the
+              guard's own set is empty for it) and is still checked exactly
+              as before this plan.
         """
         # Import here (not at module top) to avoid a real circular import —
         # validation.py never imports container.py, but container.py's
@@ -5975,7 +7044,22 @@ class DIContainer:
             provider_owner = f"@Provider({binding.fn.__name__})"
             fn_hints = self._resolve_params(binding.fn, provider_owner)
             sig = inspect.signature(binding.fn)
+            # Row 6 (plan 016) — an open binding's type_params name the
+            # TypeVars its factory's type[T] parameter(s) are filled from at
+            # resolve time (container-supplied, never a container LOOKUP —
+            # see _collect_kwargs_sync's matching comment). Reading it once,
+            # outside the loop, keeps the closed-binding hot path (the
+            # overwhelmingly common case, `open_type_param_names` empty) at
+            # zero extra cost per parameter beyond the `in` check below.
+            open_type_param_names = {tp.__name__ for tp in binding.type_params}
             for param_name, hint in fn_hints.items():
+                if open_type_param_names and _type_arg_param(hint) is not None:
+                    tp = _type_arg_param(hint)
+                    if tp is not None and tp.__name__ in open_type_param_names:
+                        # Not a graph edge, not a "missing binding" candidate
+                        # — the container fills it directly from the closing
+                        # args, the same way _collect_kwargs_sync does.
+                        continue
                 spec = _classify_hint(hint, self._is_collection_point)
                 if spec is None:
                     continue
@@ -6119,6 +7203,10 @@ class DIContainer:
         ordering/dedup logic in ``install()`` stays readable and this single
         class's install steps are unit-testable in isolation if needed.
 
+        The ``_ModuleRecord`` this method stores now also carries any
+        ``@Disposes`` wiring diagnostics found for *cls* (plan 014) — see
+        :meth:`_register_module_providers`.
+
         Args:
             cls: A ``@Configuration`` class, not yet in ``_installed_modules``.
 
@@ -6132,16 +7220,24 @@ class DIContainer:
         """
         instance = self._resolve_constructor(cls)
         self._run_post_construct_sync(instance, _find_post_construct(cls))
-        self._register_module_providers(cls, instance)
+        # disposer_issues (plan 014): @Disposes wiring defects found while
+        # registering this module's own providers — carried onto the record
+        # below so validate()'s pass 3 can report them later.
+        disposer_issues = self._register_module_providers(cls, instance)
         # Recorded AFTER providers are registered — matches the "install
         # order == dict insertion order" contract other code relies on
         # (_installed_modules docstring, role 2/3); registration itself
         # cannot fail once construction/PostConstruct succeeded, so ordering
         # here vs. before registration is not otherwise observable.
-        self._installed_modules[cls] = _ModuleRecord(instance=instance, owned=True, disposed=False)
+        self._installed_modules[cls] = _ModuleRecord(
+            instance=instance, owned=True, disposed=False, disposer_issues=disposer_issues
+        )
 
     async def _ainstall_one(self, cls: type) -> None:
         """Async mirror of :meth:`_install_one`.
+
+        The stored ``_ModuleRecord`` carries ``@Disposes`` wiring
+        diagnostics identically to the sync path (plan 014).
 
         Args:
             cls: A ``@Configuration`` class, not yet in ``_installed_modules``.
@@ -6154,25 +7250,75 @@ class DIContainer:
         """
         instance = await self._resolve_constructor_async(cls)
         await self._run_post_construct_async(instance, _find_post_construct(cls))
-        self._register_module_providers(cls, instance)
-        self._installed_modules[cls] = _ModuleRecord(instance=instance, owned=True, disposed=False)
+        # See _install_one's sync twin for why disposer_issues is threaded
+        # onto the record here (plan 014).
+        disposer_issues = self._register_module_providers(cls, instance)
+        self._installed_modules[cls] = _ModuleRecord(
+            instance=instance, owned=True, disposed=False, disposer_issues=disposer_issues
+        )
 
-    def _register_module_providers(self, module_cls: type, instance: object) -> None:
+    def _register_module_providers(
+        self, module_cls: type, instance: object
+    ) -> tuple[_DisposerWiringIssue, ...]:
         """Register every ``@Provider``-decorated method from a module instance.
 
         Iterates over the class's own attributes (not inherited ones) to find
         ``@Provider``-decorated methods. ``vars()`` gives the raw unbound functions,
         which carry ``ProviderMetadata`` directly on their ``__dict__``.
 
-        Also wires ``@Disposes`` methods to their corresponding ``ProviderBinding``.
+        Also wires ``@Disposes`` methods to their corresponding ``ProviderBinding``
+        — but **only** to a binding this same call registered (plan 014, gap
+        P24-DISPOSES-FIRSTMATCH). See the ``# DESIGN:`` block below.
 
         Args:
             module_cls: The ``@Configuration`` class to inspect.
             instance:   The live module instance — getattr returns bound methods.
 
         Returns:
-            None
+            One ``_DisposerWiringIssue`` per wiring defect found (empty tuple
+            if the module's ``@Disposes`` methods were all cleanly wired).
+            Passed by the caller into ``_ModuleRecord(disposer_issues=...)``
+            for ``validate()``'s pass 3 to report later.
+
+        Edge cases:
+            - A property provider (``@Provider @property``) is collected
+              identically to a plain method — both go through the same
+              ``self.provide(...)`` return, so ownership is exact either way.
+            - A module with zero providers and a ``@Disposes`` yields one
+              ``"unmatched"`` record — there is nothing in ``own`` to match.
+            - Two ``@Disposes`` hitting one own binding yields one
+              ``"overwritten"`` record; last-wins is unchanged (the
+              assignment below is still unconditional).
+
+        Raises:
+            TypeError: Propagated from :meth:`provide` if a ``@Provider``
+                method has no return-type annotation and no ``returns=``
+                override is in effect (see :meth:`provide`'s ``Raises``).
+
+        # DESIGN: scope the disposer search to `own`, not `self._bindings`.
+        #
+        # Tradeoffs (return-value approach vs. positional slice
+        # self._bindings[start:], plan 014 §Design):
+        #   ✅ ownership is explicit — the exact ProviderBinding objects this
+        #      call registered, not "whatever got appended after some index".
+        #   ✅ robust to provide() growing a dedupe/insert-not-append/
+        #      conditional-skip path (plans 015/016 territory) — a None/skip
+        #      return would simply not be collected, a slice would silently
+        #      include or miss the wrong bindings.
+        #   ❌ one extra list + a `-> ProviderBinding` signature change on
+        #      provide() (accepted: additive, the one `def provide(` in the
+        #      package, verified by grep — no subclass override to break).
+        #
+        # Without this scoping, the pre-fix loop scanned the WHOLE container
+        # and attached to the first interface match anywhere, regardless of
+        # which module registered it — module B's @Disposes could silently
+        # hijack module A's binding (overwriting A's real disposer) while
+        # B's own binding was left with disposer=None, leaking B's instance
+        # past shutdown(). See plan 014 §Design "The defect, precisely".
         """
+        # NEW: collect exactly the bindings THIS call registers, so the
+        # disposer loop below never reaches into another module's bindings.
+        own: list[ProviderBinding] = []
         for name, fn in vars(module_cls).items():
             if name == "__init__":
                 continue
@@ -6193,12 +7339,15 @@ class DIContainer:
 
                     # Copy provider metadata (stamped in __dict__ by @Provider)
                     _prop_provider.__dict__.update(effective_fn.__dict__)
-                    self.provide(_prop_provider)
+                    own.append(self.provide(_prop_provider))
                 else:
                     # getattr returns a bound method — self is the live module instance.
-                    self.provide(getattr(instance, name))
+                    own.append(self.provide(getattr(instance, name)))
 
-        # Wire @Disposes teardown methods to their ProviderBinding
+        # Wire @Disposes teardown methods to their ProviderBinding — scoped
+        # to `own` (this module's bindings only), recording every overwrite
+        # or miss for validate() to report (plan 014).
+        issues: list[_DisposerWiringIssue] = []
         for name, fn in vars(module_cls).items():
             if not callable(fn):
                 continue
@@ -6206,12 +7355,44 @@ class DIContainer:
             if disposes_marker is None:
                 continue
             disposed_type = disposes_marker.disposed_type
-            for binding in self._bindings:
-                if isinstance(binding, ProviderBinding) and _interface_matches(
-                    binding.interface, disposed_type
-                ):
+            disposed_name = _type_name(disposed_type)
+            for binding in own:
+                if _interface_matches(binding.interface, disposed_type):
+                    if binding.disposer is not None:
+                        # Same-module overwrite: a second own @Disposes hit a
+                        # binding that an earlier own @Disposes already wired.
+                        # Last-wins is kept (unconditional assignment below,
+                        # unchanged from pre-fix) — only the report is new.
+                        issues.append(
+                            _DisposerWiringIssue(
+                                kind="overwritten",
+                                module_name=module_cls.__name__,
+                                disposer_name=name,
+                                disposed_type=disposed_name,
+                                # Mirrors owner_of()'s f"@Provider({b.fn.__name__})"
+                                # format (container.py, validate()) — keep both
+                                # in sync if either format ever changes.
+                                binding_owner=f"@Provider({binding.fn.__name__})",
+                                replaced_disposer=binding.disposer.__name__,
+                            )
+                        )
                     binding.disposer = getattr(instance, name)
                     break
+            else:
+                # No own binding matched this @Disposes — pre-fix this used
+                # to fall through to a FOREIGN binding (the bug); post-fix it
+                # is simply unattached, and that silent no-op is reported.
+                issues.append(
+                    _DisposerWiringIssue(
+                        kind="unmatched",
+                        module_name=module_cls.__name__,
+                        disposer_name=name,
+                        disposed_type=disposed_name,
+                        binding_owner=None,
+                        replaced_disposer=None,
+                    )
+                )
+        return tuple(issues)
 
     # ── Describe ──────────────────────────────────────────────────
 
@@ -6539,6 +7720,18 @@ class DIContainer:
                                                          a fresh instance (if
                                                          re-bound before then).
             - Both ClassBinding and ProviderBinding entries are removed.
+            - Open binding (plan 016, ``type_params`` non-empty) → EVERY
+              closed-alias instance it ever cached is evicted too — every
+              tuple key ``(fn, closed_alias)`` in ``_singleton_cache``/
+              ``_singleton_locks``/``_async_singleton_locks`` whose first
+              element is that binding's ``fn``, not just a single ``fn`` key
+              (there never was one — see :meth:`_get_cache_key`).
+              ``reset_binding(Repo[User])`` removes the OPEN ``Repo[T]``
+              binding entirely (not just its ``Repo[User]`` instance) —
+              consistent with the existing rule that ``reset_binding(Base)``
+              removes every binding whose interface satisfies ``Base``
+              (``_interface_matches``-based); documented here as the
+              plan-016 edge case of that pre-existing rule.
 
         Thread safety:  ⚠️ Not safe for concurrent use.
         Async safety:   ✅ No await points.
@@ -6565,6 +7758,18 @@ class DIContainer:
         for b in to_remove:
             if isinstance(b, ClassBinding):
                 to_evict.append(b.implementation)
+            elif getattr(b, "type_params", ()):
+                # Open binding (plan 016) — its cache keys are tuples
+                # (b.fn, closed_alias), one per closed alias ever resolved;
+                # `b.fn` alone was never a real key (see _get_cache_key), so
+                # scan every key store for every tuple whose fn matches.
+                fn = b.fn  # type: ignore[union-attr]
+                for store in (
+                    self._singleton_cache,
+                    self._singleton_locks,
+                    self._async_singleton_locks,
+                ):
+                    to_evict.extend(k for k in store if isinstance(k, tuple) and k[0] is fn)
             else:
                 to_evict.append(b.fn)  # type: ignore[union-attr]
 

@@ -216,14 +216,10 @@ class TestInstanceProxyUnit:
         """
 
         class RaisingContainer:
-            def get_all(
-                self_, tp: type, *, qualifier: str | None = None
-            ) -> list:  # noqa: N805
+            def get_all(self_, tp: type, *, qualifier: str | None = None) -> list:  # noqa: N805
                 raise LookupError("no bindings")
 
-            async def aget_all(
-                self_, tp: type, *, qualifier: str | None = None
-            ) -> list:  # noqa: N805
+            async def aget_all(self_, tp: type, *, qualifier: str | None = None) -> list:  # noqa: N805
                 raise LookupError("no bindings")
 
         return RaisingContainer()  # type: ignore[return-value]
@@ -414,9 +410,7 @@ class TestInstanceProxyIntegration:
     interaction with the container's binding registry.
     """
 
-    def test_proxy_get_returns_single_best_priority_instance(
-        self, container: DIContainer
-    ) -> None:
+    def test_proxy_get_returns_single_best_priority_instance(self, container: DIContainer) -> None:
         """proxy.get() must return the highest-priority matching binding."""
 
         @Singleton
@@ -434,9 +428,7 @@ class TestInstanceProxyIntegration:
         # priority=2 (HighPriorityNotifier) beats priority=1 (LowPriorityNotifier)
         assert isinstance(svc.n.get(), HighPriorityNotifier)
 
-    def test_proxy_get_all_returns_all_sorted_by_priority(
-        self, container: DIContainer
-    ) -> None:
+    def test_proxy_get_all_returns_all_sorted_by_priority(self, container: DIContainer) -> None:
         """proxy.get_all() must return all bindings sorted by ascending priority."""
 
         @Singleton
@@ -456,9 +448,7 @@ class TestInstanceProxyIntegration:
         assert isinstance(all_n[0], LowPriorityNotifier)
         assert isinstance(all_n[1], HighPriorityNotifier)
 
-    def test_resolvable_true_when_binding_registered(
-        self, container: DIContainer
-    ) -> None:
+    def test_resolvable_true_when_binding_registered(self, container: DIContainer) -> None:
         """proxy.resolvable() must return True when at least one binding exists."""
 
         @Singleton
@@ -473,9 +463,7 @@ class TestInstanceProxyIntegration:
 
         assert svc.n.resolvable() is True
 
-    def test_resolvable_false_when_no_binding_registered(
-        self, container: DIContainer
-    ) -> None:
+    def test_resolvable_false_when_no_binding_registered(self, container: DIContainer) -> None:
         """proxy.resolvable() must return False when no bindings match."""
 
         @Singleton
@@ -490,9 +478,7 @@ class TestInstanceProxyIntegration:
 
         assert svc.n.resolvable() is False
 
-    def test_get_all_returns_empty_list_when_no_binding(
-        self, container: DIContainer
-    ) -> None:
+    def test_get_all_returns_empty_list_when_no_binding(self, container: DIContainer) -> None:
         """proxy.get_all() must return [] when no bindings are registered — not raise."""
 
         @Singleton
@@ -509,9 +495,7 @@ class TestInstanceProxyIntegration:
 
         assert result == []
 
-    def test_proxy_resolves_concrete_class_directly(
-        self, container: DIContainer
-    ) -> None:
+    def test_proxy_resolves_concrete_class_directly(self, container: DIContainer) -> None:
         """proxy.get() works when T is a concrete class, not just an interface."""
 
         @Singleton
@@ -540,9 +524,7 @@ class TestInstanceProxyQualifierFiltering:
     component body — qualifiers are NOT baked into the annotation.
     """
 
-    def test_get_with_qualifier_selects_named_binding(
-        self, container: DIContainer
-    ) -> None:
+    def test_get_with_qualifier_selects_named_binding(self, container: DIContainer) -> None:
         """proxy.get(qualifier='sms') must return only the SMS-qualified binding."""
 
         @Singleton
@@ -596,9 +578,7 @@ class TestInstanceProxyQualifierFiltering:
 
         assert svc.n.resolvable(qualifier="email") is True
 
-    def test_resolvable_false_for_unknown_qualifier(
-        self, container: DIContainer
-    ) -> None:
+    def test_resolvable_false_for_unknown_qualifier(self, container: DIContainer) -> None:
         """proxy.resolvable(qualifier='fax') → False when that qualifier is not registered."""
 
         @Singleton
@@ -613,9 +593,7 @@ class TestInstanceProxyQualifierFiltering:
 
         assert svc.n.resolvable(qualifier="fax") is False
 
-    def test_same_proxy_used_with_multiple_qualifiers(
-        self, container: DIContainer
-    ) -> None:
+    def test_same_proxy_used_with_multiple_qualifiers(self, container: DIContainer) -> None:
         """The same Instance[T] proxy can serve different qualifiers in the same method.
 
         This is the core flexibility advantage over InjectInstances[T] with a
@@ -759,9 +737,7 @@ class TestInstanceProxyScopeSafety:
 
         assert isinstance(svc.n, InstanceProxy)
 
-    def test_instance_request_scoped_re_resolves_per_request(
-        self, container: DIContainer
-    ) -> None:
+    def test_instance_request_scoped_re_resolves_per_request(self, container: DIContainer) -> None:
         """proxy.get() inside different request blocks must return different instances.
 
         This proves that Instance[RequestScoped] is scope-safe: each call to
@@ -791,9 +767,7 @@ class TestInstanceProxyScopeSafety:
         assert first_ctx is not second_ctx
         assert first_ctx.index != second_ctx.index
 
-    def test_instance_get_all_re_resolves_per_request(
-        self, container: DIContainer
-    ) -> None:
+    def test_instance_get_all_re_resolves_per_request(self, container: DIContainer) -> None:
         """proxy.get_all() must return fresh instances in each new request scope.
 
         Verifies that get_all() does not cache results between calls — each call
@@ -956,9 +930,7 @@ class TestInstanceProxyClassLevel:
     and injects an InstanceProxy after __init__ returns.
     """
 
-    def test_class_level_instance_annotation_injects_proxy(
-        self, container: DIContainer
-    ) -> None:
+    def test_class_level_instance_annotation_injects_proxy(self, container: DIContainer) -> None:
         """A class-level Instance[T] annotation must be set to an InstanceProxy."""
 
         @Singleton
@@ -1042,14 +1014,14 @@ class TestInstanceTypeAliasExpansion:
 
         result = Instance[Notifier]
 
-        assert (
-            get_origin(result) is Annotated
-        ), f"Instance[T] must expand to Annotated[T, InstanceMeta()]; got {result!r}"
+        assert get_origin(result) is Annotated, (
+            f"Instance[T] must expand to Annotated[T, InstanceMeta()]; got {result!r}"
+        )
         args = get_args(result)
         assert args[0] is Notifier
-        assert isinstance(
-            args[1], InstanceMeta
-        ), f"Second Annotated arg must be InstanceMeta; got {type(args[1])!r}"
+        assert isinstance(args[1], InstanceMeta), (
+            f"Second Annotated arg must be InstanceMeta; got {type(args[1])!r}"
+        )
 
     def test_instance_meta_has_no_qualifier_or_priority_fields(self) -> None:
         """InstanceMeta must be an empty marker — no qualifier or priority attributes.
@@ -1060,12 +1032,12 @@ class TestInstanceTypeAliasExpansion:
         """
         meta = InstanceMeta()
 
-        assert not hasattr(
-            meta, "qualifier"
-        ), "InstanceMeta must not have a qualifier field — filtering is call-time"
-        assert not hasattr(
-            meta, "priority"
-        ), "InstanceMeta must not have a priority field — filtering is call-time"
+        assert not hasattr(meta, "qualifier"), (
+            "InstanceMeta must not have a qualifier field — filtering is call-time"
+        )
+        assert not hasattr(meta, "priority"), (
+            "InstanceMeta must not have a priority field — filtering is call-time"
+        )
 
     def test_instance_meta_instances_are_equal(self) -> None:
         """Two InstanceMeta() instances must be equal (dataclass __eq__ with no fields)."""
@@ -1092,9 +1064,9 @@ class TestInstanceTypeAliasExpansion:
         assert "n" in hints, "parameter 'n' must appear in resolved type hints"
         n_hint = hints["n"]
 
-        assert (
-            get_origin(n_hint) is Annotated
-        ), f"get_type_hints must resolve Instance[Notifier] to Annotated; got {n_hint!r}"
+        assert get_origin(n_hint) is Annotated, (
+            f"get_type_hints must resolve Instance[Notifier] to Annotated; got {n_hint!r}"
+        )
         inner_type, meta = get_args(n_hint)[:2]
         assert inner_type is Notifier
         assert isinstance(meta, InstanceMeta)
@@ -1186,9 +1158,7 @@ class TestContainerIsResolvable:
 
         assert container.is_resolvable(Notifier) is True
 
-    def test_false_after_no_qualifying_qualifier_combination(
-        self, container: DIContainer
-    ) -> None:
+    def test_false_after_no_qualifying_qualifier_combination(self, container: DIContainer) -> None:
         """is_resolvable with both qualifier AND priority returns False
         if no single binding matches both simultaneously.
         """
@@ -1200,9 +1170,7 @@ class TestContainerIsResolvable:
         # priority=1 exists, but not with qualifier='email'
         assert container.is_resolvable(Notifier, qualifier="email", priority=1) is False
 
-    def test_true_when_both_qualifier_and_priority_match(
-        self, container: DIContainer
-    ) -> None:
+    def test_true_when_both_qualifier_and_priority_match(self, container: DIContainer) -> None:
         """is_resolvable(T, qualifier='q', priority=p) → True when exact match exists."""
 
         @Singleton(qualifier="special", priority=7)
@@ -1211,9 +1179,7 @@ class TestContainerIsResolvable:
 
         container.bind(Notifier, SpecialNotifier)
 
-        assert (
-            container.is_resolvable(Notifier, qualifier="special", priority=7) is True
-        )
+        assert container.is_resolvable(Notifier, qualifier="special", priority=7) is True
         # Partial matches must also return True / False correctly
         assert container.is_resolvable(Notifier, qualifier="special") is True
         assert container.is_resolvable(Notifier, priority=7) is True
@@ -1266,9 +1232,7 @@ class TestClassVarInstanceAnnotation:
 
         assert isinstance(svc.notifiers.get(), EmailNotifier)
 
-    def test_classvar_instance_proxy_get_all_works(
-        self, container: DIContainer
-    ) -> None:
+    def test_classvar_instance_proxy_get_all_works(self, container: DIContainer) -> None:
         """proxy.get_all() on a ClassVar[Instance[T]] proxy must return all bindings."""
 
         @Singleton
@@ -1322,9 +1286,7 @@ class TestClassVarInstanceAnnotation:
             svc = container.get(ProcessingService)
             assert isinstance(svc.ctx, InstanceProxy)
 
-    async def test_classvar_instance_proxy_aget_works(
-        self, container: DIContainer
-    ) -> None:
+    async def test_classvar_instance_proxy_aget_works(self, container: DIContainer) -> None:
         """proxy.aget() on a ClassVar[Instance[T]] proxy must resolve asynchronously."""
 
         @Singleton

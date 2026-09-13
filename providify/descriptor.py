@@ -118,11 +118,7 @@ class BindingDescriptor:
             connector = "└── " if is_last else "├── "
 
         # ── Format the node label ─────────────────────────────────────────────
-        _q = (
-            getattr(self.qualifier, "__name__", str(self.qualifier))
-            if self.qualifier
-            else None
-        )
+        _q = getattr(self.qualifier, "__name__", str(self.qualifier)) if self.qualifier else None
         qualifier_str = f" ({_q})" if _q else ""
         priority_str = f"Priority({self.priority})" if self.priority else ""
         leak_flag = (

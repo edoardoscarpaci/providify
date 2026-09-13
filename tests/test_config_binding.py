@@ -258,16 +258,12 @@ class TestCoercionTable:
         assert result.value == {1, 2}
 
     def test_frozenset_int_from_real_sequence(self) -> None:
-        result = bind_config_object(
-            _FrozensetIntTarget, [DictSource({"value": [1, 2, 2]})]
-        )
+        result = bind_config_object(_FrozensetIntTarget, [DictSource({"value": [1, 2, 2]})])
 
         assert result.value == frozenset({1, 2})
 
     def test_dict_str_int_from_mapping(self) -> None:
-        result = bind_config_object(
-            _DictStrIntTarget, [DictSource({"value": {"a": "1", "b": 2}})]
-        )
+        result = bind_config_object(_DictStrIntTarget, [DictSource({"value": {"a": "1", "b": 2}})])
 
         assert result.value == {"a": 1, "b": 2}
 
@@ -303,9 +299,7 @@ class TestCoercionTable:
             bind_config_object(_LiteralTarget, [DictSource({"value": "z"})])
 
     def test_nested_dataclass_from_sub_mapping(self) -> None:
-        result = bind_config_object(
-            _NestedOuter, [DictSource({"inner": {"host": "x"}})]
-        )
+        result = bind_config_object(_NestedOuter, [DictSource({"inner": {"host": "x"}})])
 
         assert result.inner == _NestedInner(host="x")
 
@@ -314,9 +308,7 @@ class TestCoercionTable:
         issue raised — the target's problem, not providify's.
         """
         sentinel = _Uncoercible()
-        result = bind_config_object(
-            _UncoercibleTarget, [DictSource({"value": sentinel})]
-        )
+        result = bind_config_object(_UncoercibleTarget, [DictSource({"value": sentinel})])
 
         assert result.value is sentinel
 
@@ -391,9 +383,7 @@ class TestBindConfigObject:
         assert result == _RequiredField(required="hi", optional=1)
 
     def test_plain_class_with_annotated_init_binds(self) -> None:
-        result = bind_config_object(
-            _PlainAnnotatedInit, [DictSource({"host": "example.com"})]
-        )
+        result = bind_config_object(_PlainAnnotatedInit, [DictSource({"host": "example.com"})])
 
         assert result.host == "example.com"
         assert result.port == 80

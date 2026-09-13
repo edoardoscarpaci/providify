@@ -160,9 +160,7 @@ class TestEventDataclassesInIsolation:
 class TestHookRegistration:
     """add_hook / remove_hook contract, independent of instrumentation sites."""
 
-    def test_add_hook_returns_unsubscribe_callable(
-        self, container: DIContainer
-    ) -> None:
+    def test_add_hook_returns_unsubscribe_callable(self, container: DIContainer) -> None:
         """add_hook must return a zero-arg callable that removes the registration."""
         calls: list[InstanceCreated] = []
         unsubscribe = container.add_hook(InstanceCreated, calls.append)
@@ -177,24 +175,18 @@ class TestHookRegistration:
         container.get(Foo)
         assert calls == []
 
-    def test_remove_hook_returns_true_when_present(
-        self, container: DIContainer
-    ) -> None:
+    def test_remove_hook_returns_true_when_present(self, container: DIContainer) -> None:
         """remove_hook must return True when the callback was actually registered."""
         cb = lambda e: None  # noqa: E731
         container.add_hook(InstanceCreated, cb)
         assert container.remove_hook(InstanceCreated, cb) is True
 
-    def test_remove_hook_returns_false_when_absent(
-        self, container: DIContainer
-    ) -> None:
+    def test_remove_hook_returns_false_when_absent(self, container: DIContainer) -> None:
         """remove_hook for an unregistered pair must return False, not raise."""
         cb = lambda e: None  # noqa: E731
         assert container.remove_hook(InstanceCreated, cb) is False
 
-    def test_same_callback_registered_twice_fires_twice(
-        self, container: DIContainer
-    ) -> None:
+    def test_same_callback_registered_twice_fires_twice(self, container: DIContainer) -> None:
         """Registering one callback twice for the same event type fires it twice per event."""
         calls: list[InstanceCreated] = []
         container.add_hook(InstanceCreated, calls.append)
@@ -207,9 +199,7 @@ class TestHookRegistration:
         container.get(Foo)
         assert len(calls) == 2
 
-    def test_hook_for_unemitted_event_type_never_called(
-        self, container: DIContainer
-    ) -> None:
+    def test_hook_for_unemitted_event_type_never_called(self, container: DIContainer) -> None:
         """A hook registered for an event type nobody emits must never fire."""
         calls: list[ScopeEntered] = []
         container.add_hook(ScopeEntered, calls.append)
@@ -240,9 +230,7 @@ class TestHookRegistration:
         assert isinstance(instance, Foo)
         assert any(record.levelno == logging.WARNING for record in caplog.records)
 
-    def test_hook_registered_for_supertype_is_not_called(
-        self, container: DIContainer
-    ) -> None:
+    def test_hook_registered_for_supertype_is_not_called(self, container: DIContainer) -> None:
         """Exact-type dispatch: a hook for `object` must not receive InstanceCreated events."""
         calls: list[object] = []
         container.add_hook(object, calls.append)
@@ -263,9 +251,7 @@ class TestHookRegistration:
 class TestZeroOverheadRule:
     """No hooks registered → no timer call at all; one hook → timer is called."""
 
-    def test_no_hooks_means_perf_counter_never_called(
-        self, container: DIContainer
-    ) -> None:
+    def test_no_hooks_means_perf_counter_never_called(self, container: DIContainer) -> None:
         """With zero hooks registered, resolving 50 singletons must never call perf_counter_ns."""
 
         @Singleton
@@ -278,9 +264,7 @@ class TestZeroOverheadRule:
                 container.get(Foo)
             patched.assert_not_called()
 
-    def test_one_hook_means_perf_counter_is_called(
-        self, container: DIContainer
-    ) -> None:
+    def test_one_hook_means_perf_counter_is_called(self, container: DIContainer) -> None:
         """Registering a single hook must cause the timer to be used on creation."""
 
         @Singleton
@@ -302,9 +286,7 @@ class TestZeroOverheadRule:
 
 
 class TestInstanceCreatedEvents:
-    def test_singleton_emits_once_cache_hit_emits_nothing(
-        self, container: DIContainer
-    ) -> None:
+    def test_singleton_emits_once_cache_hit_emits_nothing(self, container: DIContainer) -> None:
         """One InstanceCreated per singleton key; a second get() (cache hit) emits nothing."""
         events: list[InstanceCreated] = []
         container.add_hook(InstanceCreated, events.append)
@@ -320,9 +302,7 @@ class TestInstanceCreatedEvents:
         assert events[0].interface is Foo
         assert events[0].scope == Scope.SINGLETON
 
-    def test_request_scoped_emits_once_per_scope_frame(
-        self, container: DIContainer
-    ) -> None:
+    def test_request_scoped_emits_once_per_scope_frame(self, container: DIContainer) -> None:
         """REQUEST scope: one event per request() frame, not per get() call within it."""
         events: list[InstanceCreated] = []
         container.add_hook(InstanceCreated, events.append)
@@ -399,9 +379,7 @@ class TestInstanceCreatedEvents:
         assert events[0].duration_ns > 0
         assert events[0].duration_ns >= 10_000_000
 
-    def test_implementation_qualifier_scope_match_binding(
-        self, container: DIContainer
-    ) -> None:
+    def test_implementation_qualifier_scope_match_binding(self, container: DIContainer) -> None:
         """implementation is the class for ClassBinding, the factory for ProviderBinding."""
         events: list[InstanceCreated] = []
         container.add_hook(InstanceCreated, events.append)
@@ -494,9 +472,7 @@ class TestInstanceDisposedEvents:
         assert len(events) == 1
         assert isinstance(events[0].error, ValueError)
 
-    def test_owner_matches_shutdown_failure_owner_format(
-        self, container: DIContainer
-    ) -> None:
+    def test_owner_matches_shutdown_failure_owner_format(self, container: DIContainer) -> None:
         """InstanceDisposed.owner must match ShutdownFailure.owner's `ClassName.hook_name` format."""
         events: list[InstanceDisposed] = []
         container.add_hook(InstanceDisposed, events.append)
@@ -549,9 +525,7 @@ class TestInstanceDisposedEvents:
         assert len(events) == 1
         assert events[0].scope == Scope.REQUEST
 
-    def test_binding_with_no_teardown_hook_emits_no_event(
-        self, container: DIContainer
-    ) -> None:
+    def test_binding_with_no_teardown_hook_emits_no_event(self, container: DIContainer) -> None:
         """A singleton with no @PreDestroy/@Disposes must not emit InstanceDisposed."""
         events: list[InstanceDisposed] = []
         container.add_hook(InstanceDisposed, events.append)
@@ -609,9 +583,7 @@ class TestScopeEvents:
         assert exited_ids == [inner_id, outer_id]
         assert outer_id != inner_id
 
-    def test_scope_exited_still_emitted_when_block_raises(
-        self, container: DIContainer
-    ) -> None:
+    def test_scope_exited_still_emitted_when_block_raises(self, container: DIContainer) -> None:
         """A request() block that raises must still emit ScopeExited."""
         events: list[ScopeExited] = []
         container.add_hook(ScopeExited, events.append)

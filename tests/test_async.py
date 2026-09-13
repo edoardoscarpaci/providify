@@ -94,9 +94,7 @@ class TestAget:
         with pytest.raises(LookupError, match="No binding found"):
             await container.aget(Cache)
 
-    async def test_aget_with_qualifier_selects_named_binding(
-        self, container: DIContainer
-    ) -> None:
+    async def test_aget_with_qualifier_selects_named_binding(self, container: DIContainer) -> None:
         """aget(T, qualifier=...) must return only the binding with the matching qualifier."""
 
         @Component(qualifier="fast")
@@ -119,9 +117,7 @@ class TestAget:
 class TestAgetAll:
     """Tests for async multi-instance resolution."""
 
-    async def test_aget_all_returns_all_matching_instances(
-        self, container: DIContainer
-    ) -> None:
+    async def test_aget_all_returns_all_matching_instances(self, container: DIContainer) -> None:
         """aget_all() should return all bound implementations of the requested type."""
         container.bind(Cache, MemoryCache)
         container.bind(Cache, SingletonCache)
@@ -130,9 +126,7 @@ class TestAgetAll:
 
         assert len(results) == 2
 
-    async def test_aget_all_mixes_sync_and_async_providers(
-        self, container: DIContainer
-    ) -> None:
+    async def test_aget_all_mixes_sync_and_async_providers(self, container: DIContainer) -> None:
         """aget_all() must handle a mix of sync and async providers transparently."""
 
         @Provider
@@ -151,16 +145,12 @@ class TestAgetAll:
         # Both async and sync providers should be resolved
         assert len(results) == 2
 
-    async def test_aget_all_raises_when_no_bindings(
-        self, container: DIContainer
-    ) -> None:
+    async def test_aget_all_raises_when_no_bindings(self, container: DIContainer) -> None:
         """aget_all() must raise LookupError when no bindings match."""
         with pytest.raises(LookupError, match="No bindings found"):
             await container.aget_all(Cache)
 
-    async def test_aget_all_results_sorted_by_priority(
-        self, container: DIContainer
-    ) -> None:
+    async def test_aget_all_results_sorted_by_priority(self, container: DIContainer) -> None:
         """aget_all() results must be sorted by ascending priority."""
 
         @Component(priority=1)
@@ -188,9 +178,7 @@ class TestAgetAll:
 class TestAsyncContextManager:
     """Tests for async with container: ... and async with DIContainer.scoped(): ..."""
 
-    async def test_async_context_manager_returns_self(
-        self, container: DIContainer
-    ) -> None:
+    async def test_async_context_manager_returns_self(self, container: DIContainer) -> None:
         """async with container should yield the same container instance."""
         async with container as c:
             assert c is container

@@ -133,9 +133,7 @@ class _DescCycleB:
 class TestClassBindingDescribe:
     """Tests for ClassBinding.describe() and the BindingDescriptor it produces."""
 
-    def test_describe_no_deps_returns_empty_dependencies(
-        self, container: DIContainer
-    ) -> None:
+    def test_describe_no_deps_returns_empty_dependencies(self, container: DIContainer) -> None:
         """A binding with no constructor params must produce an empty dependencies tuple.
 
         Edge cases: _DescLeaf has no __init__ parameters — dependencies must
@@ -149,9 +147,7 @@ class TestClassBindingDescribe:
         # No deps at all — tuple is empty, not None or []
         assert descriptor.dependencies == ()
 
-    def test_describe_interface_and_implementation_names(
-        self, container: DIContainer
-    ) -> None:
+    def test_describe_interface_and_implementation_names(self, container: DIContainer) -> None:
         """Descriptor must carry the correct interface and implementation names."""
         container.register(_DescLeaf)
         binding = ClassBinding(_DescLeaf, _DescLeaf)
@@ -207,9 +203,7 @@ class TestClassBindingDescribe:
         assert leaf.interface == "_DescLeaf"
         assert leaf.dependencies == ()
 
-    def test_describe_cycle_returns_cycle_detected_sentinel(
-        self, container: DIContainer
-    ) -> None:
+    def test_describe_cycle_returns_cycle_detected_sentinel(self, container: DIContainer) -> None:
         """A → B → A cycle must produce a [CYCLE DETECTED] sentinel instead of recursing.
 
         DESIGN: describe() maintains a frozenset of visited interfaces.  When
@@ -233,9 +227,7 @@ class TestClassBindingDescribe:
         cycle_sentinel = b_desc.dependencies[0]
         assert "CYCLE DETECTED" in cycle_sentinel.interface
 
-    def test_describe_qualifier_stored_on_descriptor(
-        self, container: DIContainer
-    ) -> None:
+    def test_describe_qualifier_stored_on_descriptor(self, container: DIContainer) -> None:
         """Qualifier from @Component(qualifier=...) must appear on the descriptor."""
         container.register(_DescQualified)
         binding = ClassBinding(_DescQualified, _DescQualified)
@@ -244,9 +236,7 @@ class TestClassBindingDescribe:
 
         assert descriptor.qualifier == "primary"
 
-    def test_describe_scope_leak_singleton_over_dependent(
-        self, container: DIContainer
-    ) -> None:
+    def test_describe_scope_leak_singleton_over_dependent(self, container: DIContainer) -> None:
         """SINGLETON depending on DEPENDENT dep must report scope_leak=True.
 
         DESIGN: scope_leak is a computed property on BindingDescriptor — it
@@ -263,9 +253,7 @@ class TestClassBindingDescribe:
         # _DescSingletonParent is SINGLETON, _DescLeaf is DEPENDENT — leak
         assert descriptor.scope_leak is True
 
-    def test_describe_no_scope_leak_for_same_scope(
-        self, container: DIContainer
-    ) -> None:
+    def test_describe_no_scope_leak_for_same_scope(self, container: DIContainer) -> None:
         """Same scope parent and dep must produce scope_leak=False."""
         container.register(_DescLeaf)
         container.register(_DescMiddle)
@@ -706,9 +694,7 @@ class TestGetDependenciesCycleSafety:
 
         assert deps == []
 
-    def test_visited_empty_frozenset_returns_all_deps(
-        self, container: DIContainer
-    ) -> None:
+    def test_visited_empty_frozenset_returns_all_deps(self, container: DIContainer) -> None:
         """An empty frozenset is equivalent to _visited=None — no filtering."""
         container.register(_DescLeaf)
         container.register(_DescMiddle)
@@ -718,9 +704,7 @@ class TestGetDependenciesCycleSafety:
 
         assert len(deps) == 1
 
-    def test_visited_does_not_filter_unrelated_types(
-        self, container: DIContainer
-    ) -> None:
+    def test_visited_does_not_filter_unrelated_types(self, container: DIContainer) -> None:
         """Types in _visited that are NOT deps of this binding are irrelevant."""
         container.register(_DescLeaf)
         container.register(_DescMiddle)
@@ -732,9 +716,7 @@ class TestGetDependenciesCycleSafety:
         assert len(deps) == 1
         assert deps[0].interface is _DescLeaf
 
-    def test_visited_enables_safe_recursive_graph_traversal(
-        self, container: DIContainer
-    ) -> None:
+    def test_visited_enables_safe_recursive_graph_traversal(self, container: DIContainer) -> None:
         """_visited allows a recursive graph walk to terminate on cycles.
 
         Simulates what an external tool might do to collect ALL unique dep

@@ -126,8 +126,7 @@ class LiveInjectionRequiredError(ValidationError):
             for v in violations
         ]
         super().__init__(
-            "Live[T] required for REQUEST/SESSION scoped dependencies:\n"
-            + "\n".join(lines)
+            "Live[T] required for REQUEST/SESSION scoped dependencies:\n" + "\n".join(lines)
         )
 
 
@@ -247,8 +246,7 @@ class ContainerValidationError(ValidationError):
             for issue in report.errors
         ]
         super().__init__(
-            f"Container validation failed with {len(report.errors)} error(s):\n"
-            + "\n".join(lines)
+            f"Container validation failed with {len(report.errors)} error(s):\n" + "\n".join(lines)
         )
 
 
@@ -316,10 +314,7 @@ class ShutdownError(providifyError):
         self.failures = failures
         # One line per failure — mirrors ContainerValidationError's message
         # shape so both aggregation errors read consistently in logs.
-        lines = [
-            f"  - {f.owner}: {type(f.exception).__name__}: {f.exception}"
-            for f in failures
-        ]
+        lines = [f"  - {f.owner}: {type(f.exception).__name__}: {f.exception}" for f in failures]
         super().__init__(
             f"Shutdown completed with {len(failures)} teardown failure(s); "
             f"all caches were cleared:\n" + "\n".join(lines)
@@ -368,6 +363,81 @@ class ModuleCycleError(providifyError):
             f"Circular @Configuration depends_on detected: {rendered}\n"
             f"Break the cycle by removing one of the depends_on= edges above, "
             f"or merging the mutually-dependent modules into one."
+        )
+
+
+class ConditionEvaluationError(providifyError):
+    """Raised when an `@Requires` predicate raises instead of returning a bool.
+
+    Surfaced from `get()`/`aget()`/`get_all()`/`aget_all()`/`is_resolvable()`
+    (via `DIContainer._binding_is_active()` -> the module-level
+    `_conditions_hold()` helper) and from `DIContainer.validate()`'s pass 1c
+    — both call sites wrap the SAME predicate call, so a broken condition
+    fails identically everywhere it is evaluated (plan 015 §Design).
+
+    Subclasses `providifyError` directly rather than `BindingError`
+    (`exceptions.py:24-45`):
+    DESIGN: not `BindingError`
+        `BindingError` subclasses all mean "registration was malformed" —
+        raised once, at `bind()`/`provide()` time, before anything is
+        resolved. This error is the opposite shape: registration succeeded;
+        the predicate itself, user code evaluated lazily at resolution
+        time, misbehaved. Reusing `BindingError` would make a caller with a
+        narrow `except BindingError` around registration start silently
+        swallowing a live resolution-time bug — the same "narrow except
+        clause starts catching unrelated failures" rationale `ModuleCycleError`
+        gives (`:340-345`) for not reusing `CircularDependencyError`.
+        ✅ Callers narrowly catching `BindingError` are unaffected by a
+           broken predicate.
+        ❌ One more top-level exception type to document — accepted, the
+           alternative (silently misclassifying a resolution bug as a
+           registration bug) is worse.
+
+    Attributes:
+        owner:  Human-readable owner of the binding whose condition raised —
+            same `"ClassName"` / `"@Provider(fn_name)"` vocabulary as
+            `validate()`'s `owner_of()` closure, produced by the
+            module-level `_owner_label()` helper.
+        marker: The `RequiresMarker` whose `is_satisfied()` raised. Typed
+            `Any` here (not `RequiresMarker`) deliberately — importing
+            `metadata.py` into `exceptions.py` would give this leaf module a
+            dependency the rest of the file avoids; every other attribute in
+            this module is either a builtin or already imported from
+            `metadata.py` for an unrelated reason (`LiveInjectionViolation`,
+            `ScopeLeak`), so adding one just for a type hint here is not
+            worth it.
+
+    The original exception is preserved via `__cause__` (`raise ... from
+    exc`), so `exc.__cause__` still carries the real type and traceback —
+    only the *message* is providify's, not the underlying failure.
+
+    DESIGN: alternatives considered
+        - "Re-raise the original exception unchanged" — rejected: the
+          original has no way to carry the binding's name, which is the one
+          thing a user needs to find the broken predicate.
+        - "Swallow and treat as inactive" — rejected: silently hides a
+          programming error; a broken predicate is a bug, not a legitimate
+          "off" state.
+
+    Example:
+        @Requires(condition=lambda: 1 / 0)
+        @Component
+        class Broken(Base): ...
+
+        container.bind(Base, Broken)
+        try:
+            container.get(Base)
+        except ConditionEvaluationError as exc:
+            assert isinstance(exc.__cause__, ZeroDivisionError)
+    """
+
+    def __init__(self, owner: str, marker: Any, exc: BaseException) -> None:
+        self.owner = owner
+        self.marker = marker
+        super().__init__(
+            f"@Requires condition on {owner} raised {type(exc).__name__}: {exc}. "
+            f"Conditions must be cheap, pure, and must not raise — fix the "
+            f"predicate ({marker.describe()}) rather than catching this error."
         )
 
 

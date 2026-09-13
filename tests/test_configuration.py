@@ -215,9 +215,7 @@ class TestInstall:
         with pytest.raises(TypeError, match="@Configuration"):
             container.install(BareClass)
 
-    def test_module_without_init_installed_correctly(
-        self, container: DIContainer
-    ) -> None:
+    def test_module_without_init_installed_correctly(self, container: DIContainer) -> None:
         """Module with no __init__ (default) must install without error."""
 
         @Configuration
@@ -264,9 +262,7 @@ class TestAinstall:
         with pytest.raises(TypeError, match="@Configuration"):
             await container.ainstall(BareClass)
 
-    async def test_ainstall_spring_style_with_async_dep(
-        self, container: DIContainer
-    ) -> None:
+    async def test_ainstall_spring_style_with_async_dep(self, container: DIContainer) -> None:
         """ainstall() enables modules with deps that require aget() to resolve.
 
         This is the main reason ainstall() exists: when the container has

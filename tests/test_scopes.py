@@ -106,9 +106,7 @@ class TestDependentScope:
         # Must be distinct objects — no caching for DEPENDENT scope
         assert first is not second
 
-    def test_dependent_provider_calls_factory_each_time(
-        self, container: DIContainer
-    ) -> None:
+    def test_dependent_provider_calls_factory_each_time(self, container: DIContainer) -> None:
         """@Provider(singleton=False) must invoke the factory on every resolution."""
         from providify.decorator.scope import Provider
 
@@ -218,9 +216,7 @@ class TestSessionScope:
 class TestScopeViolation:
     """Verifies that scope leaks (SINGLETON depending on REQUEST) are detected."""
 
-    def test_singleton_depending_on_request_scoped_raises(
-        self, container: DIContainer
-    ) -> None:
+    def test_singleton_depending_on_request_scoped_raises(self, container: DIContainer) -> None:
         """A SINGLETON that holds a REQUEST-scoped dep without Live[T] raises LiveInjectionRequiredError.
 
         DESIGN: Using Inject[T] or a bare type annotation for a REQUEST-scoped dep
@@ -252,9 +248,7 @@ class TestScopeViolation:
 class TestAsyncRequestScope:
     """Verifies arequest() async context manager isolates REQUEST-scoped instances."""
 
-    async def test_same_instance_within_async_request(
-        self, container: DIContainer
-    ) -> None:
+    async def test_same_instance_within_async_request(self, container: DIContainer) -> None:
         """Two aget() calls inside the same arequest() context must return the same instance."""
         container.register(RequestService)
 
@@ -264,9 +258,7 @@ class TestAsyncRequestScope:
 
         assert first is second
 
-    async def test_different_instances_across_async_requests(
-        self, container: DIContainer
-    ) -> None:
+    async def test_different_instances_across_async_requests(self, container: DIContainer) -> None:
         """Each arequest() context must produce a fresh, isolated instance."""
         container.register(RequestService)
 
@@ -278,9 +270,7 @@ class TestAsyncRequestScope:
 
         assert first is not second
 
-    async def test_async_request_cache_cleaned_up_on_exit(
-        self, container: DIContainer
-    ) -> None:
+    async def test_async_request_cache_cleaned_up_on_exit(self, container: DIContainer) -> None:
         """arequest() must remove its cache entry from _request_caches after the block.
 
         DESIGN: Each request context creates a new UUID keyed entry in
@@ -293,9 +283,7 @@ class TestAsyncRequestScope:
         # Cache entry must be gone after the context exits
         assert request_id not in container.scope_context._request_caches
 
-    async def test_nested_async_requests_are_isolated(
-        self, container: DIContainer
-    ) -> None:
+    async def test_nested_async_requests_are_isolated(self, container: DIContainer) -> None:
         """Nested arequest() contexts must each get their own independent cache.
 
         DESIGN: ContextVar.set() returns a Token used to restore the previous
@@ -327,9 +315,7 @@ class TestAsyncRequestScope:
 class TestAsyncSessionScope:
     """Verifies asession() async context manager isolates SESSION-scoped instances."""
 
-    async def test_same_instance_within_async_session(
-        self, container: DIContainer
-    ) -> None:
+    async def test_same_instance_within_async_session(self, container: DIContainer) -> None:
         """Two aget() calls in the same asession() context must return the same instance."""
         container.register(SessionService)
 
@@ -339,9 +325,7 @@ class TestAsyncSessionScope:
 
         assert first is second
 
-    async def test_different_instances_across_async_sessions(
-        self, container: DIContainer
-    ) -> None:
+    async def test_different_instances_across_async_sessions(self, container: DIContainer) -> None:
         """Different session IDs in asession() must produce different instances."""
         container.register(SessionService)
 
@@ -376,9 +360,7 @@ class TestAsyncSessionScope:
 class TestInvalidateSession:
     """Verifies that invalidate_session() clears the named session cache."""
 
-    def test_invalidate_session_removes_cached_instance(
-        self, container: DIContainer
-    ) -> None:
+    def test_invalidate_session_removes_cached_instance(self, container: DIContainer) -> None:
         """After invalidate_session(), the next get() in that session must create a fresh instance.
 
         DESIGN: This is the server-side logout pattern — destroy the session
@@ -398,9 +380,7 @@ class TestInvalidateSession:
         # Cache was cleared — second is a fresh instance
         assert first is not second
 
-    def test_invalidate_nonexistent_session_is_safe(
-        self, container: DIContainer
-    ) -> None:
+    def test_invalidate_nonexistent_session_is_safe(self, container: DIContainer) -> None:
         """invalidate_session() on an unknown session ID must not raise."""
         # Should not raise — idempotent / defensive behaviour
         container.scope_context.invalidate_session("no-such-session-id")
@@ -480,9 +460,7 @@ class TestClassVarScopeViolation:
             instance = container.get(GoodSingleton)
         assert isinstance(instance, GoodSingleton)
 
-    def test_mixed_init_and_classvar_violations_both_reported(
-        self, container: DIContainer
-    ) -> None:
+    def test_mixed_init_and_classvar_violations_both_reported(self, container: DIContainer) -> None:
         """Both __init__-param and class-var violations must be caught in one error.
 
         LiveInjectionRequiredError aggregates all violations so the developer
@@ -516,9 +494,7 @@ class TestClassVarScopeViolation:
 class TestInvalidateSessionPreDestroy:
     """Tests that invalidate_session() and ainvalidate_session() run @PreDestroy hooks."""
 
-    def test_invalidate_session_runs_sync_pre_destroy(
-        self, container: DIContainer
-    ) -> None:
+    def test_invalidate_session_runs_sync_pre_destroy(self, container: DIContainer) -> None:
         """invalidate_session() must call @PreDestroy on session-scoped instances."""
         destroyed: list[str] = []
 
@@ -564,16 +540,12 @@ class TestInvalidateSessionPreDestroy:
 
         assert "destroyed" in destroyed
 
-    def test_invalidate_session_noop_for_unknown_session(
-        self, container: DIContainer
-    ) -> None:
+    def test_invalidate_session_noop_for_unknown_session(self, container: DIContainer) -> None:
         """invalidate_session() on an unknown session_id must not raise."""
         # Should not raise even for completely unknown IDs
         container.invalidate_session("nonexistent-session-id")
 
-    async def test_ainvalidate_session_runs_async_pre_destroy(
-        self, container: DIContainer
-    ) -> None:
+    async def test_ainvalidate_session_runs_async_pre_destroy(self, container: DIContainer) -> None:
         """ainvalidate_session() must await async @PreDestroy on session-scoped instances."""
         destroyed: list[str] = []
 

@@ -245,9 +245,7 @@ class TestLocallyDefinedClassInjection:
     as long as they are registered in the container before get() is called.
     """
 
-    def test_locally_defined_dep_injected_into_constructor(
-        self, container: DIContainer
-    ) -> None:
+    def test_locally_defined_dep_injected_into_constructor(self, container: DIContainer) -> None:
         """A class defined inside this method must be providify via its type hint."""
 
         @Component

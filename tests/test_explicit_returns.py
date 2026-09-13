@@ -68,9 +68,7 @@ class SomeInstance:
 
 
 class TestHappyPaths:
-    def test_provide_returns_kwarg_with_unannotated_factory(
-        self, container: DIContainer
-    ) -> None:
+    def test_provide_returns_kwarg_with_unannotated_factory(self, container: DIContainer) -> None:
         """returns= on provide() works even when fn has no return annotation at all."""
 
         def make_foo():  # no return annotation whatsoever
@@ -80,9 +78,7 @@ class TestHappyPaths:
 
         assert isinstance(container.get(Foo), Foo)
 
-    def test_provider_returns_kwarg_on_any_annotated_factory(
-        self, container: DIContainer
-    ) -> None:
+    def test_provider_returns_kwarg_on_any_annotated_factory(self, container: DIContainer) -> None:
         """@Provider(returns=...) bypasses a useless `-> Any` annotation."""
 
         @Provider(returns=Repository[User])
@@ -127,9 +123,7 @@ class TestHappyPaths:
 
         assert binding.interface is Foo
 
-    async def test_async_factory_with_returns_kwarg(
-        self, container: DIContainer
-    ) -> None:
+    async def test_async_factory_with_returns_kwarg(self, container: DIContainer) -> None:
         """returns= on an async factory must still set is_async and resolve via aget()."""
 
         @Provider(returns=Foo)
@@ -143,9 +137,7 @@ class TestHappyPaths:
 
         assert isinstance(await container.aget(Foo), Foo)
 
-    def test_returns_combined_with_other_provider_kwargs(
-        self, container: DIContainer
-    ) -> None:
+    def test_returns_combined_with_other_provider_kwargs(self, container: DIContainer) -> None:
         """returns= must not disturb qualifier/priority/scope/singleton handling."""
 
         @Provider(returns=Foo, qualifier="q", priority=3, singleton=True)
@@ -163,9 +155,7 @@ class TestHappyPaths:
         second = container.get(Foo)
         assert first is second  # singleton identity across two get() calls
 
-    def test_motivating_case_generic_alias_per_loop_iteration(
-        self, container: DIContainer
-    ) -> None:
+    def test_motivating_case_generic_alias_per_loop_iteration(self, container: DIContainer) -> None:
         """The feature's raison d'être: one factory, distinct aliases per loop pass."""
         for model in (User, Order):
 
@@ -190,9 +180,7 @@ class TestHappyPaths:
 
 
 class TestPrecedence:
-    def test_provide_returns_wins_over_provider_returns(
-        self, container: DIContainer
-    ) -> None:
+    def test_provide_returns_wins_over_provider_returns(self, container: DIContainer) -> None:
         """provide(fn, returns=B) beats an already-decorated @Provider(returns=A)."""
 
         class A:

@@ -245,6 +245,126 @@ requiring an imperative `enable_alternative()` call — the profile is a hard AN
 
 ---
 
+## @Requires — condition-gated bindings
+
+`@Requires(...)` gates a class or `@Provider` function on a **predicate evaluated lazily at
+resolve time** — the third conjunct beside `@Profile` and `@Alternative`. Where `@Profile` gates
+on providify's own named deployment tokens, `@Requires` gates on *your* predicate over *your*
+configuration — anything from a feature flag to a reachability check.
+
+```python
+from providify import Component, DIContainer, Requires, Singleton
+
+flag = {"on": True}
+
+@Requires(condition=lambda: flag["on"])          # the primitive — any zero-arg predicate
+@Component
+class FeatureImpl(Feature): ...
+```
+
+The `env=`/`value=` sugar covers the 80% case — an OS environment variable check — without
+writing a lambda:
+
+```python
+@Requires(env="FEATURE_REDIS_CACHE")             # active iff set to a non-empty string
+@Singleton
+class RedisCache(Cache): ...
+
+@Requires(env="CACHE_BACKEND", value="redis")    # active iff set to exactly "redis"
+@Singleton
+class RedisCache(Cache): ...
+```
+
+`condition=` and `env=`/`value=` combine by AND on one marker, and stacking a second `@Requires`
+appends a second marker — every marker in the stack must be satisfied:
+
+```python
+@Requires(env="CACHE_BACKEND", value="redis")
+@Requires(condition=lambda: redis_is_reachable())
+@Singleton
+class RedisCache(Cache): ...                     # AND of both clauses
+```
+
+`@Requires` is AND'd with `@Profile`/`@Alternative` and is evaluated **last**, only once profile
+and alternative activation already include the binding — a `@Profile("prod")`-gated predicate
+that only makes sense in production never runs during a dev `get()`.
+
+The predicate contract is **cheap and pure, and must never raise** — evaluated fresh on every
+lookup, with no memoisation anywhere (same contract `@Profile` already has). A raising predicate
+propagates as `ConditionEvaluationError` from `get()`/`aget()`/`get_all()`/`aget_all()`/
+`is_resolvable()`, and from `container.validate()`.
+
+A `@Singleton` resolved while its condition was `True` is **not evicted** from the singleton
+cache when the condition later flips `False` — the same non-eviction caveat `activate_profile()`
+already documents; `override()`/`reset_binding()` remain the eviction tools.
+
+> **Validation reports inactive conditions**: `container.validate()` reports `MISSING_BINDING` for
+> dependents of a condition-inactive sole provider *and* a separate informational
+> `CONDITION_INACTIVE` issue explaining why — see the `validate()` section below.
+
+---
+
+## @Fallback — yield to any real binding
+
+`@Fallback` marks a class or `@Provider` function/method as a **default** — a candidate only when
+no active non-fallback binding matches the same request. Providify's own name for what Quarkus
+calls `@DefaultBean`, evaluated lazily at resolve time rather than at build time.
+
+```python
+from providify import Component, DIContainer, Fallback, Singleton
+
+@Fallback
+@Singleton
+class InMemoryCache(Cache): ...
+
+@Singleton
+class RedisCache(Cache): ...
+
+container = DIContainer()
+container.bind(Cache, InMemoryCache)
+container.get(Cache)              # -> InMemoryCache (sole candidate)
+
+container.bind(Cache, RedisCache)
+container.get(Cache)              # -> RedisCache (the fallback yields)
+```
+
+Because a request is `(interface, qualifier, priority)`, an unqualified fallback also yields to a
+*qualified* non-fallback sibling for an unqualified request — but a fallback that carries its own
+qualifier still wins when a caller asks for exactly that qualifier, the same `"in_memory"`-style
+escape hatch `@Profile`/priority already support:
+
+```python
+@Fallback
+@Singleton(qualifier="in_memory")
+class InMemoryRepo(Repo): ...
+
+@Singleton
+class SqlRepo(Repo): ...
+
+container.get(Repo)                              # -> SqlRepo
+container.get(Repo, qualifier="in_memory")        # -> InMemoryRepo (only match for that qualifier)
+```
+
+The rule is evaluated **lazily, at resolve time** — the same moment `@Profile`/`@Alternative`/
+`@Requires` are checked — so a shadowing binding registered *after* the fallback still wins on the
+very next lookup; there is no registration-order coupling to worry about.
+
+> **Not `@Default`**: `@Default` is a **qualifier** meaning "no named qualifier" — it answers *which*
+> binding a request selects among several qualified ones. `@Fallback` is an **activation rule** — it
+> answers *whether* a binding is even a candidate once a real one exists. The names sound similar;
+> the problems they solve are unrelated.
+
+> **Not evicted**: a `@Fallback` singleton resolved and cached *before* its shadowing binding is
+> registered stays cached — and any dependent constructed while it was still the winner keeps its
+> reference to it — mirroring `activate_profile()`'s documented non-eviction caveat.
+> `override()`/`reset_binding()` remain the eviction tools.
+
+`container.validate()` reports each active, shadowed fallback as `IssueKind.FALLBACK_SHADOWED` at
+`Severity.INFO` — never an error or warning, since shadowing is the feature working as designed;
+see the `validate()` section below.
+
+---
+
 ## @Stereotype — reusable composed annotations
 
 `@Stereotype` bundles scope, qualifier, priority, and inherited into a single reusable decorator — the Python equivalent of Jakarta CDI `@Stereotype`.
@@ -318,6 +438,10 @@ for model in (User, Order):
         return InMemoryRepo(model)
     container.provide(repo_factory, returns=Repository[model])
 ```
+
+That per-type loop can often collapse into a single **open-generic**
+registration — see [Open-generic providers](#open-generic-providers---returnsrepot)
+below.
 
 ---
 
@@ -1020,6 +1144,8 @@ container.shutdown()   # close_conn(conn) is called here ✅
 
 `@Disposes` is the teardown mechanism for provider-produced instances — `@PreDestroy` is never invoked on an object returned from a `@Provider` (see the note above). `container.validate()` flags the missing case: a singleton provider whose produced type carries `@PreDestroy` but has no `@Disposes` reports an `UNREACHABLE_PRE_DESTROY` warning.
 
+A `@Disposes` is wired **only** to a `@Provider` binding registered by the *same* `@Configuration` — never to another module's binding. Two `@Configuration`s can each provide `CacheBackend` with their own `@Disposes(CacheBackend)`; each tears down its own instance. `container.validate()` reports two more `WARNING` kinds for this wiring: `DISPOSER_OVERWRITTEN` (two `@Disposes` in one module resolved to the same provider — the later one silently wins) and `UNMATCHED_DISPOSER` (a `@Disposes(X)` with no own `X` provider — the method is attached to nothing and never runs).
+
 ### DEPENDENT scope tracking — `track=True`
 
 DEPENDENT beans (`@Component`) are not owned by the container and normally receive no teardown. Opt in with `track=True` to have the container collect them and call their `@PreDestroy` hooks on demand:
@@ -1467,6 +1593,67 @@ user_repo = container.get(Repository[User])   # UserRepository
 post_repo = container.get(Repository[Post])   # PostRepository
 ```
 
+### Open-generic providers — `returns=Repo[T]`
+
+The example above needs one class (and one `bind()` call) per model. When
+every model shares the same factory shape, register **one open binding**
+instead — it is served, at resolve time, by any closed request sharing its
+origin:
+
+```python
+from typing import TypeVar
+from providify import Provider
+
+T = TypeVar("T")
+
+@Provider(singleton=True)
+def repository(entity: type[T]) -> Repository[T]:
+    return InMemoryRepository(entity)
+
+container.provide(repository)                  # open registration
+
+user_repo = container.get(Repository[User])    # InMemoryRepository(User)
+post_repo = container.get(Repository[Post])    # InMemoryRepository(Post)
+```
+
+The `entity: type[T]` parameter receives the **closed** type argument
+(`User`, `Post`, ...) directly — it is never resolved from the container.
+Rules to know:
+
+- **Name-based delivery, with one positional convenience.** The parameter
+  must be annotated exactly `type[T]` (name-matched, not identity — PEP
+  695-safe) to receive the closed type argument by name. A single-`TypeVar`
+  open binding whose factory parameter carries **no annotation at all**
+  (`lambda entity: Repo(entity)`) is the one exception: the sole closing
+  value is handed to it positionally, since there is nothing else it could
+  mean. This never fires for a multi-`TypeVar` binding (`Pair[A, B]` must
+  annotate both `a: type[A]` and `b: type[B]`), and never fires once any
+  parameter has already matched by name.
+
+- **Closed beats open.** A binding registered for a specific closed alias
+  (`container.bind(Repository[User], UserRepository)`) always wins over the
+  open binding for the same request, regardless of `@Priority` or
+  registration order.
+- **One singleton per closed alias.** `singleton=True` on an open binding
+  caches one instance PER closed type — `get(Repository[User])` and
+  `get(Repository[Post])` never share a cached instance.
+- **`get_all()`/`InjectInstances[T]`** include the open binding once for a
+  closed request (`get_all(Repository[User])`); a **bare** request
+  (`get_all(Repository)`) never expands it — there is no registry of every
+  type that might be requested.
+- **`warm_up()` skips open bindings** — there is no closed alias to hand
+  the factory ahead of time. A closed singleton registered alongside one is
+  still warmed normally.
+- **`bound=`/constraints are a non-match, not an error.**
+  `TypeVar("T", bound=Entity)` on the open alias means a request violating
+  the bound (`get(Repository[NotAnEntity])`) simply finds no binding
+  (`LookupError`) unless another registered binding serves it — it never
+  raises from inside the bound check itself.
+- **Mixed aliases are rejected at registration.** Every type argument on
+  an open alias must be a plain `TypeVar` (`Repo[T]`, `Pair[A, B]`) — a
+  partially-open alias like `Repo[list[T]]` or `Pair[str, T]` raises
+  `TypeError` immediately, since there is no substitution mechanism for it.
+
 ---
 
 ## Warm-up — eager singleton instantiation
@@ -1499,7 +1686,11 @@ traffic.** It walks the entire declared dependency graph — every constructor
 parameter, class-level annotation, and `@Provider` parameter — without
 instantiating anything, and reports every wiring defect in one shot: missing
 bindings, ambiguous bindings, dependency cycles, scope leaks, `Live[T]`
-violations, and unresolvable annotations.
+violations, unresolvable annotations, condition-inactive bindings (INFO), and
+shadowed `@Fallback` defaults (INFO). An [open-generic](#open-generic-providers---returnsrepot)
+binding's `type[T]` parameter is never treated as an injection point (it is
+container-supplied, not looked up); a closed request IS validated against
+open bindings, exactly as `get()` resolves it.
 
 ```python
 from providify import DIContainer, ContainerValidationError
@@ -1519,6 +1710,8 @@ if not report.ok:
         log.error("%s", issue.message)
     for issue in report.warnings:
         log.warning("%s", issue.message)
+for issue in report.infos:
+    log.info("%s", issue.message)
 ```
 
 `validate()` is a superset of `validate_bindings()` / `validate_all()`: those
@@ -1532,10 +1725,19 @@ catch, and never mutates state (no `create()`, no cache write, no
 see the `validate()` docstring in `providify/container.py` for the full
 per-issue-kind breakdown (which forms are `ERROR` vs `WARNING` and why).
 
-`report.ok` is `False` for **any** issue, warnings included — but
-`validate(raise_on_error=True)` only raises on `ERROR`-severity issues.
-A gate that must also catch `WARNING` issues like `UNREACHABLE_PRE_DESTROY`
-needs to inspect `report.issues` (or `report.ok`), not just `report.errors`.
+`report.ok` is `False` only when `report.errors` is non-empty — `WARNING` and
+`INFO` issues never affect it, and neither ever makes
+`validate(raise_on_error=True)` raise. A gate that must also catch `WARNING`
+issues like `UNREACHABLE_PRE_DESTROY` and `@Disposes` wiring defects
+(`DISPOSER_OVERWRITTEN`, `UNMATCHED_DISPOSER`) needs to inspect
+`report.warnings` explicitly, not just `report.errors`/`report.ok`. A
+`CONDITION_INACTIVE` (`INFO`) issue records a `@Requires`-gated binding that
+is currently inactive — the feature working as declared, not a defect;
+inspect `report.infos` if you want a wiring report that explains why a
+candidate is not the live one. A `FALLBACK_SHADOWED` (`INFO`) issue records
+an active `@Fallback` binding that is currently shadowed by a real one — its
+`shadowed_by` field names the winner — same never-raises, never-flips-`ok`
+tier as `CONDITION_INACTIVE`.
 
 ---
 
@@ -2150,11 +2352,13 @@ Tests are organised by feature — one file per subsystem:
 | `test_events.py` | `fire()` reaches `@Observes` observer; `afire()` awaits async observer; subtype event matching; dead-ref cleanup |
 | `test_injection_point.py` | `InjectionPoint` injected in constructor; `param_name` / `declaring_class` / `annotation` fields correct |
 | `test_disposes.py` | `@Disposes` called on singleton shutdown; not called when instance never instantiated |
+| `test_disposes_scoped_wiring.py` | `@Disposes` wiring scoped to the installing module; `DISPOSER_OVERWRITTEN` / `UNMATCHED_DISPOSER` validation |
 | `test_dependent_track.py` | `@PreDestroy` fires on `flush_dependents()`; context manager flushes on exit |
 | `test_named_meta.py` | `NamedMeta("x")` resolves same binding as `qualifier="x"` |
 | `test_field_provider.py` | `@property @Provider` registered at `install()` time; singleton property shares instance |
 | `test_application_scoped.py` | `@ApplicationScoped` is identical to `@Singleton` |
 | `test_run_in_scope.py` | `run_in_request` activates scope; `@RequestScoped` beans resolve; scope torn down after fn returns |
+| `test_fallback.py` | `@Fallback` yields to any active non-fallback binding across `get`/`aget`/`get_all`/`aget_all`/`is_resolvable`/`get_binding`/multibinding; `FALLBACK_SHADOWED` (`INFO`) validation |
 
 ---
 

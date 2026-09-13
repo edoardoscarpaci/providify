@@ -263,7 +263,28 @@ def Disposes(disposed_type: type) -> Callable[[F], F]:
     `@PreDestroy` is never invoked on an object returned from a `@Provider`,
     `@Disposes` is the only way to run cleanup for it.
 
+    A `@Disposes` is matched only against the `@Provider` methods of the
+    **same** `@Configuration` (the ones registered by the same `install()`),
+    never against bindings from other modules. `container.validate()` reports
+    `UNMATCHED_DISPOSER` when nothing in the module matches, and
+    `DISPOSER_OVERWRITTEN` when two `@Disposes` in one module resolve to the
+    same provider (plan 014).
+
     Equivalent to Jakarta's @Disposes parameter annotation.
+
+    Args:
+        disposed_type: The type this method tears down — matched against the
+            return type of `@Provider` methods declared on the same
+            `@Configuration`, using the same `issubclass`-based matching as
+            regular resolution (a provider returning a subtype of
+            `disposed_type` still matches).
+
+    Returns:
+        A decorator that stamps a `DisposesMarker` onto the function's
+        `__dict__` (does not otherwise change the function) and returns it
+        unmodified; `_register_module_providers` looks up the marker at
+        `install()`/`ainstall()` time to wire the method to its module's own
+        matching `ProviderBinding`.
     """
 
     def decorator(fn: F) -> F:

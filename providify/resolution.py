@@ -79,12 +79,27 @@ def _format_cycle(stack: list[type], cls: type) -> str:
     Returns:
         A string like ``"A → B → C → A"`` where the last element is *cls*.
 
+    Edge cases:
+        - A stack entry is a parameterised generic alias (e.g. an open
+          binding's closed cycle-key override, ``Repo[User]`` — plan 016)
+          → rendered via ``_type_name`` as ``"Repo[User]"``, not bare
+          ``c.__name__`` — a generic alias delegates ``__name__`` to its
+          origin type via ``__getattr__``, so a plain ``c.__name__`` would
+          silently collapse ``Repo[User]`` and ``Repo[Order]`` to the same
+          misleading ``"Repo"`` in the message.
+
     Example:
         >>> _format_cycle([A, B], C)
         'A → B → C'
     """
+    # Local import — resolution.py is a low-level module imported by both
+    # container.py and utils.py; importing _type_name from utils here (not
+    # at module top) avoids inflating this tiny module's import surface for
+    # a helper used only in this one error-formatting path.
+    from .utils import _type_name
+
     chain = stack + [cls]
-    return " → ".join(c.__name__ for c in chain)
+    return " → ".join(_type_name(c) for c in chain)
 
 
 # ─────────────────────────────────────────────────────────────────

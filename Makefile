@@ -1,4 +1,16 @@
-.PHONY: install test lint format format-check build publish clean
+.PHONY: install test lint format format-check build publish clean help
+
+help:
+	@echo "Makefile commands:"
+	@echo "  install        - Install dependencies"
+	@echo "  test           - Run tests"
+	@echo "  lint           - Lint the code"
+	@echo "  format         - Format the code"
+	@echo "  format-check   - Check code formatting"
+	@echo "  build          - Build the project"
+	@echo "  publish        - Publish the project"
+	@echo "  publish-dry    - Dry run of publish"
+	@echo "  clean          - Clean build artifacts and caches"
 
 install:
 	uv sync

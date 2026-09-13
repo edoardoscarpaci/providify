@@ -59,9 +59,7 @@ class CachedNotifier(Notifier):
 class TestOverride:
     """Tests for DIContainer.override()."""
 
-    def test_override_replaces_existing_class_binding(
-        self, container: DIContainer
-    ) -> None:
+    def test_override_replaces_existing_class_binding(self, container: DIContainer) -> None:
         """override() must unregister the old binding and register the new one."""
         container.bind(Notifier, EmailNotifier)
         container.override(Notifier, SmsNotifier)
@@ -107,9 +105,7 @@ class TestOverride:
         # Validation state must be reset — next get() runs validate_bindings()
         assert container._validated is False
 
-    def test_override_unregistered_interface_still_registers(
-        self, container: DIContainer
-    ) -> None:
+    def test_override_unregistered_interface_still_registers(self, container: DIContainer) -> None:
         """override() on an unknown interface must not raise — just register the new binding.
 
         This is useful for 'unconditional swap' patterns where the caller
@@ -160,9 +156,7 @@ class TestOverride:
 class TestResetBinding:
     """Tests for DIContainer.reset_binding()."""
 
-    def test_reset_removes_all_bindings_for_interface(
-        self, container: DIContainer
-    ) -> None:
+    def test_reset_removes_all_bindings_for_interface(self, container: DIContainer) -> None:
         """reset_binding() with no qualifier removes every binding for the interface.
 
         bind(Interface, Impl) adds two entries:
@@ -236,9 +230,7 @@ class TestResetBinding:
         # Cache entry must be gone after reset
         assert CachedNotifier not in container._singleton_cache
 
-    def test_reset_returns_zero_for_unknown_interface(
-        self, container: DIContainer
-    ) -> None:
+    def test_reset_returns_zero_for_unknown_interface(self, container: DIContainer) -> None:
         """reset_binding() on an unregistered interface must return 0 without raising."""
 
         class UnknownService:
@@ -280,9 +272,7 @@ class TestGetBinding:
         # Verify no instance was created (DEPENDENT scope — would be new every time)
         assert binding.scope is not None  # just a structural check
 
-    def test_get_binding_does_not_trigger_validate_bindings(
-        self, container: DIContainer
-    ) -> None:
+    def test_get_binding_does_not_trigger_validate_bindings(self, container: DIContainer) -> None:
         """get_binding() is a pure read — must NOT trigger validate_bindings().
 
         Triggering validation would be a side-effect that callers don't expect
@@ -298,9 +288,7 @@ class TestGetBinding:
         # Must still be False — get_binding() is read-only
         assert container._validated is False
 
-    def test_get_binding_raises_lookup_error_when_absent(
-        self, container: DIContainer
-    ) -> None:
+    def test_get_binding_raises_lookup_error_when_absent(self, container: DIContainer) -> None:
         """get_binding() must raise LookupError when no binding is registered."""
 
         class UnknownService:
@@ -354,9 +342,7 @@ class TestGetAllBindings:
         assert EmailNotifier in implementations
         assert SmsNotifier in implementations
 
-    def test_get_all_bindings_returns_empty_list_when_absent(
-        self, container: DIContainer
-    ) -> None:
+    def test_get_all_bindings_returns_empty_list_when_absent(self, container: DIContainer) -> None:
         """get_all_bindings() must return [] (not raise) for unregistered interface.
 
         Callers can use `if not container.get_all_bindings(T)` safely without
@@ -381,9 +367,7 @@ class TestGetAllBindings:
 
         assert container._validated is False
 
-    def test_get_all_bindings_filters_by_qualifier(
-        self, container: DIContainer
-    ) -> None:
+    def test_get_all_bindings_filters_by_qualifier(self, container: DIContainer) -> None:
         """get_all_bindings(qualifier=...) must only return bindings with that qualifier."""
         from providify.decorator.scope import Named
 
@@ -400,9 +384,7 @@ class TestGetAllBindings:
         assert len(bindings) == 1
         assert bindings[0].implementation is FastNotifier  # type: ignore[union-attr]
 
-    def test_get_all_bindings_includes_provider_bindings(
-        self, container: DIContainer
-    ) -> None:
+    def test_get_all_bindings_includes_provider_bindings(self, container: DIContainer) -> None:
         """get_all_bindings() must include ProviderBinding entries, not just ClassBinding."""
 
         @Provider

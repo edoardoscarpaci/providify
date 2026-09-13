@@ -128,9 +128,7 @@ class _InjectedAlias:
     """
 
     @overload
-    def __getitem__(
-        self, tp: type[T]
-    ) -> type[T]: ...  # Injected[T] → type[T] for checker
+    def __getitem__(self, tp: type[T]) -> type[T]: ...  # Injected[T] → type[T] for checker
 
     @overload
     def __getitem__(self, tp: Any) -> Any: ...  # fallback for complex types
@@ -167,9 +165,7 @@ class _InjectedAlias:
         # metrics reporter that may not be wired in all environments).
         optional: bool = False,
     ) -> Any:
-        return Annotated[
-            tp, InjectMeta(qualifier=qualifier, priority=priority, optional=optional)
-        ]
+        return Annotated[tp, InjectMeta(qualifier=qualifier, priority=priority, optional=optional)]
 
 
 class _InjectedInstancesAlias:
@@ -200,15 +196,11 @@ class _InjectedInstancesAlias:
     ) -> type[list[T]]: ...  # InjectedInstances[T] → list[T] for checker
     @overload
     def __getitem__(self, tp: Any) -> Any: ...  # fallback
-    def __getitem__(
-        self, tp: Any
-    ) -> Any:  # Any — Annotated[list[T], ...] != Type[list[T]]
+    def __getitem__(self, tp: Any) -> Any:  # Any — Annotated[list[T], ...] != Type[list[T]]
         return Annotated[list[tp], InjectMeta(all=True)]
 
     @overload
-    def __call__(
-        self, tp: type[T], *, qualifier: str | type | None = ...
-    ) -> type[list[T]]: ...
+    def __call__(self, tp: type[T], *, qualifier: str | type | None = ...) -> type[list[T]]: ...
     @overload
     def __call__(self, tp: Any, *, qualifier: str | type | None = ...) -> Any: ...
 

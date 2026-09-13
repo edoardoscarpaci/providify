@@ -107,9 +107,7 @@ class TestConfigPropertiesDecorator:
 
 
 class TestBindConfigContainerIntegration:
-    def test_bind_config_then_get_returns_bound_instance(
-        self, container: DIContainer
-    ) -> None:
+    def test_bind_config_then_get_returns_bound_instance(self, container: DIContainer) -> None:
         @ConfigProperties(prefix="db", sources=(DictSource({"db": {"url": "x"}}),))
         @dataclass(frozen=True)
         class DbSettings:
@@ -140,17 +138,13 @@ class TestBindConfigContainerIntegration:
         class DbSettings:
             url: str
 
-        container.bind_config(
-            DbSettings, sources=[DictSource({"db": {"url": "overridden"}})]
-        )
+        container.bind_config(DbSettings, sources=[DictSource({"db": {"url": "overridden"}})])
 
         result = container.get(DbSettings)
 
         assert result.url == "overridden"
 
-    def test_factory_is_lazy_no_source_read_before_first_get(
-        self, container: DIContainer
-    ) -> None:
+    def test_factory_is_lazy_no_source_read_before_first_get(self, container: DIContainer) -> None:
         calls = []
 
         class CountingSource(DictSource):
@@ -198,9 +192,7 @@ class TestBindConfigContainerIntegration:
         assert isinstance(result, OverrideSettings)
         assert result.url == "overridden"
 
-    def test_validate_reports_config_binding_as_present(
-        self, container: DIContainer
-    ) -> None:
+    def test_validate_reports_config_binding_as_present(self, container: DIContainer) -> None:
         @ConfigProperties(prefix="db", sources=(DictSource({"db": {"url": "x"}}),))
         @dataclass(frozen=True)
         class DbSettings:

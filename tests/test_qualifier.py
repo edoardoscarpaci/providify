@@ -71,9 +71,7 @@ def test_inject_meta_with_type_qualifier(container: DIContainer):
 
     @Component
     class Consumer:
-        def __init__(
-            self, store: Annotated[Storage, InjectMeta(qualifier=Cloud)]
-        ) -> None:
+        def __init__(self, store: Annotated[Storage, InjectMeta(qualifier=Cloud)]) -> None:
             self.store = store
 
     container.register(Consumer)

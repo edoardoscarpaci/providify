@@ -218,9 +218,7 @@ class TestCircularDependencyDetection:
         a = container.get(_LazyA)
         assert isinstance(a, _LazyA)
 
-    def test_non_circular_graph_resolves_correctly(
-        self, container: DIContainer
-    ) -> None:
+    def test_non_circular_graph_resolves_correctly(self, container: DIContainer) -> None:
         """A linear _LinearA → _LinearB → _LinearC (no cycle) must resolve cleanly."""
         container.register(_LinearC)
         container.register(_LinearB)
@@ -232,9 +230,7 @@ class TestCircularDependencyDetection:
         assert isinstance(a.b, _LinearB)
         assert isinstance(a.b.c, _LinearC)
 
-    def test_diamond_dependency_resolves_correctly(
-        self, container: DIContainer
-    ) -> None:
+    def test_diamond_dependency_resolves_correctly(self, container: DIContainer) -> None:
         """Diamond pattern must not trigger a false CircularDependencyError.
 
         _DiamondD is a shared dependency — it appears twice in the resolution
@@ -356,9 +352,7 @@ class TestSelfReferentialSingletonDoesNotDeadlock:
     waited on a lock it already owned.
     """
 
-    def test_self_referential_singleton_class_sync(
-        self, container: DIContainer
-    ) -> None:
+    def test_self_referential_singleton_class_sync(self, container: DIContainer) -> None:
         """`container.get()` on a self-referential singleton class must raise."""
         container.bind(_SelfRefSingleton, _SelfRefSingleton)
 
@@ -367,9 +361,7 @@ class TestSelfReferentialSingletonDoesNotDeadlock:
         assert isinstance(exc, CircularDependencyError)
         assert "_SelfRefSingleton" in str(exc)
 
-    def test_self_referential_singleton_class_async(
-        self, container: DIContainer
-    ) -> None:
+    def test_self_referential_singleton_class_async(self, container: DIContainer) -> None:
         """`container.aget()` must fail the same way as the sync path."""
         container.bind(_SelfRefSingleton, _SelfRefSingleton)
 
@@ -378,9 +370,7 @@ class TestSelfReferentialSingletonDoesNotDeadlock:
         assert isinstance(exc, CircularDependencyError)
         assert "_SelfRefSingleton" in str(exc)
 
-    def test_self_referential_singleton_provider_sync(
-        self, container: DIContainer
-    ) -> None:
+    def test_self_referential_singleton_provider_sync(self, container: DIContainer) -> None:
         """A `@Provider(singleton=True)` resolving back to itself must raise."""
         container.provide(_self_ref_provider)
 
@@ -389,9 +379,7 @@ class TestSelfReferentialSingletonDoesNotDeadlock:
         assert isinstance(exc, CircularDependencyError)
         assert "_SelfRefProduct" in str(exc)
 
-    def test_self_referential_singleton_provider_async(
-        self, container: DIContainer
-    ) -> None:
+    def test_self_referential_singleton_provider_async(self, container: DIContainer) -> None:
         """Async mirror of the provider case."""
         container.provide(_self_ref_provider)
 
@@ -413,8 +401,6 @@ class TestSelfReferentialSingletonDoesNotDeadlock:
         container.bind(_ConcurrentSingleton, _ConcurrentSingleton)
 
         with ThreadPoolExecutor(max_workers=8) as pool:
-            instances = list(
-                pool.map(lambda _: container.get(_ConcurrentSingleton), range(8))
-            )
+            instances = list(pool.map(lambda _: container.get(_ConcurrentSingleton), range(8)))
 
         assert len({id(i) for i in instances}) == 1

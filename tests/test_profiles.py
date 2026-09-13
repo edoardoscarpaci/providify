@@ -249,9 +249,7 @@ class TestProfileMarker:
             return Widget()
 
         assert _get_profile_expressions(make_widget) == ("prod",)
-        assert hasattr(make_widget, "__di_provider__") or hasattr(
-            make_widget, "__di_scope__"
-        )
+        assert hasattr(make_widget, "__di_provider__") or hasattr(make_widget, "__di_scope__")
 
     def test_applied_twice_merges_expressions_order_preserving_deduped(self) -> None:
         from providify import Profile
@@ -284,9 +282,7 @@ class TestBindingProfilesAttribute:
         binding = ClassBinding(Plain, Plain)
         assert binding.profiles == ()
 
-    def test_profiled_class_carries_expressions_via_bind(
-        self, container: DIContainer
-    ) -> None:
+    def test_profiled_class_carries_expressions_via_bind(self, container: DIContainer) -> None:
         from providify import Profile, Singleton
 
         class Iface(ABC):
@@ -298,14 +294,10 @@ class TestBindingProfilesAttribute:
             pass
 
         container.bind(Iface, Impl)
-        binding = next(
-            b for b in container._bindings if getattr(b, "implementation", None) is Impl
-        )
+        binding = next(b for b in container._bindings if getattr(b, "implementation", None) is Impl)
         assert binding.profiles == ("prod",)
 
-    def test_profiled_class_carries_expressions_via_register(
-        self, container: DIContainer
-    ) -> None:
+    def test_profiled_class_carries_expressions_via_register(self, container: DIContainer) -> None:
         from providify import Profile, Singleton
 
         @Profile("prod")
@@ -315,9 +307,7 @@ class TestBindingProfilesAttribute:
 
         container.register(SelfBound)
         binding = next(
-            b
-            for b in container._bindings
-            if getattr(b, "implementation", None) is SelfBound
+            b for b in container._bindings if getattr(b, "implementation", None) is SelfBound
         )
         assert binding.profiles == ("prod",)
 
@@ -333,9 +323,7 @@ class TestBindingProfilesAttribute:
         binding = ProviderBinding(make_widget)
         assert binding.profiles == ("prod",)
 
-    def test_configuration_bound_method_carries_marker(
-        self, container: DIContainer
-    ) -> None:
+    def test_configuration_bound_method_carries_marker(self, container: DIContainer) -> None:
         from providify import Configuration, Profile, Provider
 
         @Configuration
@@ -346,9 +334,7 @@ class TestBindingProfilesAttribute:
                 return _ProfileWidget()
 
         container.install(Config)
-        binding = next(
-            b for b in container._bindings if getattr(b, "fn", None) is not None
-        )
+        binding = next(b for b in container._bindings if getattr(b, "fn", None) is not None)
         assert binding.profiles == ("prod",)
 
     def test_provider_property_carries_marker(self, container: DIContainer) -> None:
@@ -363,9 +349,7 @@ class TestBindingProfilesAttribute:
                 return _ProfileWidget()
 
         container.install(Config)
-        binding = next(
-            b for b in container._bindings if getattr(b, "fn", None) is not None
-        )
+        binding = next(b for b in container._bindings if getattr(b, "fn", None) is not None)
         assert binding.profiles == ("prod",)
 
 
@@ -383,16 +367,12 @@ class TestContainerProfileState:
         c = DIContainer(profiles=["prod"])
         assert c.active_profiles == frozenset({"prod"})
 
-    def test_env_var_used_when_no_explicit_profiles(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_env_var_used_when_no_explicit_profiles(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("PROVIDIFY_PROFILES", "prod,eu")
         c = DIContainer()
         assert c.active_profiles == frozenset({"prod", "eu"})
 
-    def test_explicit_empty_tuple_wins_over_env_var(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_explicit_empty_tuple_wins_over_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("PROVIDIFY_PROFILES", "prod,eu")
         c = DIContainer(profiles=())
         assert c.active_profiles == frozenset()
@@ -414,9 +394,7 @@ class TestContainerProfileState:
     def test_active_profiles_is_a_frozenset(self, container: DIContainer) -> None:
         assert isinstance(container.active_profiles, frozenset)
 
-    def test_active_profiles_snapshot_is_immutable(
-        self, container: DIContainer
-    ) -> None:
+    def test_active_profiles_snapshot_is_immutable(self, container: DIContainer) -> None:
         container.activate_profile("prod")
         snapshot = container.active_profiles
         with pytest.raises(AttributeError):
@@ -429,9 +407,7 @@ class TestContainerProfileState:
 
 
 class TestResolutionThroughFilter:
-    def test_unprofiled_binding_resolves_under_any_active_set(
-        self, container: DIContainer
-    ) -> None:
+    def test_unprofiled_binding_resolves_under_any_active_set(self, container: DIContainer) -> None:
         from providify import Singleton
 
         class Iface(ABC):
@@ -463,9 +439,7 @@ class TestResolutionThroughFilter:
         with pytest.raises(LookupError):
             container.get(Iface)
 
-    def test_profiled_class_resolvable_under_matching_profile(
-        self, container: DIContainer
-    ) -> None:
+    def test_profiled_class_resolvable_under_matching_profile(self, container: DIContainer) -> None:
         from providify import Profile, Singleton
 
         class Iface(ABC):
@@ -509,9 +483,7 @@ class TestResolutionThroughFilter:
         container2.bind(Iface, DevImpl)
         assert isinstance(container2.get(Iface), DevImpl)
 
-    def test_get_all_returns_only_active_candidates(
-        self, container: DIContainer
-    ) -> None:
+    def test_get_all_returns_only_active_candidates(self, container: DIContainer) -> None:
         from providify import Profile, Singleton
 
         class Iface(ABC):
@@ -552,9 +524,7 @@ class TestResolutionThroughFilter:
         container.activate_profile("prod")
         assert container.is_resolvable(Iface) is True
 
-    def test_negated_profile_provider_function_filtered_out(
-        self, container: DIContainer
-    ) -> None:
+    def test_negated_profile_provider_function_filtered_out(self, container: DIContainer) -> None:
         from providify import Profile, Provider
 
         @Profile("!prod")
@@ -597,9 +567,7 @@ class TestResolutionThroughFilter:
         second = container.get(Iface)
         assert isinstance(second, ProdImpl)
 
-    def test_cached_singleton_survives_profile_change(
-        self, container: DIContainer
-    ) -> None:
+    def test_cached_singleton_survives_profile_change(self, container: DIContainer) -> None:
         """A singleton created under an old profile is NOT evicted on profile change."""
         from providify import Profile, Singleton
 
@@ -785,9 +753,7 @@ class TestEndToEndEnvDrivenActivation:
         clone = container.copy()
         assert clone.active_profiles == frozenset({"prod"})
 
-    def test_copy_profile_set_is_independent_of_original(
-        self, container: DIContainer
-    ) -> None:
+    def test_copy_profile_set_is_independent_of_original(self, container: DIContainer) -> None:
         container.activate_profile("prod")
         clone = container.copy()
         clone.activate_profile("dev")

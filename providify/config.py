@@ -123,9 +123,7 @@ class DictSource:
         Returns:
             A shallow copy of `mapping`, top-level keys lower-cased.
         """
-        return {
-            (k.lower() if isinstance(k, str) else k): v for k, v in self.mapping.items()
-        }
+        return {(k.lower() if isinstance(k, str) else k): v for k, v in self.mapping.items()}
 
 
 @dataclass(frozen=True)
@@ -510,14 +508,10 @@ _FALSY_TOKENS = {"0", "false", "no", "off"}
 
 def _is_optional_hint(hint: Any) -> bool:
     """Return True if `hint` is `X | None` (or `Optional[X]`)."""
-    return typing.get_origin(hint) in _UNION_ORIGINS and type(None) in typing.get_args(
-        hint
-    )
+    return typing.get_origin(hint) in _UNION_ORIGINS and type(None) in typing.get_args(hint)
 
 
-def _coerce(
-    value: Any, hint: Any, path: str, source: str | None
-) -> tuple[Any, list[ConfigIssue]]:
+def _coerce(value: Any, hint: Any, path: str, source: str | None) -> tuple[Any, list[ConfigIssue]]:
     """Coerce `value` to `hint`, per plan §Design/"Coercion table".
 
     Never raises for a single field — every failure comes back as a
@@ -598,15 +592,11 @@ def _coerce(
         args = typing.get_args(hint)
         elem_hint = args[0] if args else Any
         if isinstance(value, str):
-            items: list[Any] = (
-                [v.strip() for v in value.split(",")] if value.strip() else []
-            )
+            items: list[Any] = [v.strip() for v in value.split(",")] if value.strip() else []
         elif isinstance(value, list | tuple | set | frozenset):
             items = list(value)
         else:
-            return None, [
-                ConfigIssue(path, f"expected a sequence, got {value!r}", source)
-            ]
+            return None, [ConfigIssue(path, f"expected a sequence, got {value!r}", source)]
         coerced: list[Any] = []
         issues: list[ConfigIssue] = []
         for i, item in enumerate(items):
@@ -623,9 +613,7 @@ def _coerce(
         args = typing.get_args(hint)
         val_hint = args[1] if len(args) > 1 else Any
         if not isinstance(value, Mapping):
-            return None, [
-                ConfigIssue(path, f"expected a mapping, got {value!r}", source)
-            ]
+            return None, [ConfigIssue(path, f"expected a mapping, got {value!r}", source)]
         coerced_map: dict[Any, Any] = {}
         issues = []
         for k, v in value.items():
@@ -648,9 +636,7 @@ def _coerce(
             if member.name.upper() == name:
                 return member, []
         return None, [
-            ConfigIssue(
-                path, f"invalid value {value!r} for enum {hint.__name__}", source
-            )
+            ConfigIssue(path, f"invalid value {value!r} for enum {hint.__name__}", source)
         ]
 
     if origin is Literal:
@@ -658,9 +644,7 @@ def _coerce(
         for a in allowed:
             if str(a) == str(value):
                 return a, []
-        return None, [
-            ConfigIssue(path, f"expected one of {allowed!r}, got {value!r}", source)
-        ]
+        return None, [ConfigIssue(path, f"expected one of {allowed!r}, got {value!r}", source)]
 
     if inspect.isclass(hint) and isinstance(value, Mapping):
         # Nested @ConfigProperties / dataclass / plain-class target — recurse.
@@ -722,9 +706,7 @@ def _construct_from_mapping(
         sig = inspect.signature(cls)
     except (TypeError, ValueError) as e:
         return None, [
-            ConfigIssue(
-                path_prefix or cls.__name__, f"cannot inspect {cls!r}: {e}", source
-            )
+            ConfigIssue(path_prefix or cls.__name__, f"cannot inspect {cls!r}: {e}", source)
         ]
 
     kwargs: dict[str, Any] = {}
@@ -762,11 +744,7 @@ def _construct_from_mapping(
     try:
         return cls(**kwargs), []
     except Exception as e:  # noqa: BLE001 — wrapped as a ConfigIssue, not swallowed
-        return None, [
-            ConfigIssue(
-                path_prefix or cls.__name__, f"construction failed: {e}", source
-            )
-        ]
+        return None, [ConfigIssue(path_prefix or cls.__name__, f"construction failed: {e}", source)]
 
 
 def _sources_label(sources: Sequence[Any]) -> str | None:
@@ -793,9 +771,7 @@ def _sources_label(sources: Sequence[Any]) -> str | None:
     return ", ".join(repr(s) for s in sources)
 
 
-def bind_config_object(
-    cls: type, sources: Sequence[Any], *, prefix: str | None = None
-) -> Any:
+def bind_config_object(cls: type, sources: Sequence[Any], *, prefix: str | None = None) -> Any:
     """Load, merge and bind `sources` into an instance of `cls`.
 
     The full pipeline described in this module's docstring: load every

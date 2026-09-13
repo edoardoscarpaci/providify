@@ -170,9 +170,7 @@ class TestEvalAnnotationPrimitive:
         "inject None if nothing is bound" — Phase 7 must feed it the exact same
         shape `get_type_hints` would have, not a pre-collapsed/simplified one.
         """
-        holder = type(
-            "_AnnotationHolder", (), {"__annotations__": {"x": "Live[Foo | None]"}}
-        )
+        holder = type("_AnnotationHolder", (), {"__annotations__": {"x": "Live[Foo | None]"}})
         expected = get_type_hints(holder, globals(), {}, include_extras=True)["x"]
 
         actual = _eval_annotation("Live[Foo | None]", globals(), {})
@@ -305,9 +303,7 @@ class TestPerParamIsolation:
             """Function-local — absent from the provider's __globals__ by construction."""
 
         @Provider(singleton=True)
-        async def make_widget(
-            dep: Inject[TracerX], junk: LocalOnly | None = None
-        ) -> WidgetX:
+        async def make_widget(dep: Inject[TracerX], junk: LocalOnly | None = None) -> WidgetX:
             return WidgetX(dep)
 
         container.bind(TracerX, TracerX)
@@ -317,9 +313,7 @@ class TestPerParamIsolation:
 
         assert isinstance(widget.dep, TracerX)
 
-    def test_unresolvable_param_in_middle_of_signature(
-        self, container: DIContainer
-    ) -> None:
+    def test_unresolvable_param_in_middle_of_signature(self, container: DIContainer) -> None:
         """Params BEFORE and AFTER an unresolvable one must both still be injected."""
 
         class LocalOnly:
@@ -414,9 +408,7 @@ class TestPerParamIsolation:
         assert isinstance(instance.good, TracerX)
         assert not hasattr(instance, "junk")
 
-    def test_no_future_annotations_module_still_works(
-        self, container: DIContainer
-    ) -> None:
+    def test_no_future_annotations_module_still_works(self, container: DIContainer) -> None:
         """Cross-module positive control: annotations that are real objects (no PEP 563).
 
         Exercises step 1 of `resolve_one` end to end via `tests/_annotations_no_future`,
@@ -565,9 +557,7 @@ class TestInjectionPointFailuresRaise:
             return dep
 
         make_thing.__annotations__["dep"] = "I[LocalOnly]"
-        globalns: dict[str, Any] = (
-            {}
-        )  # deliberately empty — "I" and "LocalOnly" both unbound
+        globalns: dict[str, Any] = {}  # deliberately empty — "I" and "LocalOnly" both unbound
 
         with pytest.raises(AnnotationResolutionError) as exc_info:
             resolve_params(make_thing, "make_thing", globalns, {})
@@ -800,9 +790,7 @@ class TestParityWithGetTypeHints:
     ) -> None:
         """`container._resolve_params(fn, ...)` must equal `get_type_hints`, minus `"return"`."""
         namespace: dict[str, Any] = dict(globals())
-        exec(
-            annotation_source, namespace
-        )  # noqa: S102 - controlled, module-level test data
+        exec(annotation_source, namespace)  # noqa: S102 - controlled, module-level test data
         fn = namespace["fn"]
 
         expected = {
@@ -826,9 +814,7 @@ class TestParityWithGetTypeHints:
             """Adds nothing — pure inheritance-order check."""
 
         expected = {
-            k: v
-            for k, v in get_type_hints(Sub, include_extras=True).items()
-            if k != "return"
+            k: v for k, v in get_type_hints(Sub, include_extras=True).items() if k != "return"
         }
 
         actual = container._resolve_class_annotations(Sub)
