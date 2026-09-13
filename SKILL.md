@@ -8,7 +8,7 @@
 
 **Providify** is a zero-dependency Python dependency injection (DI) container library inspired by Jakarta CDI and Spring Framework. It automates constructor injection via type hints, manages component lifecycles across multiple scopes, and supports both synchronous and asynchronous resolution patterns.
 
-- **Version:** 2.0.1 (see `pyproject.toml` for the current version)
+- **Version:** 2.1.0 (see `pyproject.toml` for the current version)
 - **Python:** 3.12+
 - **License:** Apache-2.0
 - **Dependencies:** None (stdlib only)
@@ -263,6 +263,34 @@ async def create_cache(config: Inject[Config]) -> Redis:
 def my_factory(...) -> MyType: ...
 ```
 
+### Activation Rules — `@Requires` / `@Fallback` *(2.1.0)*
+
+Both are evaluated **lazily at resolve time** (same moment as `@Profile` / `@Alternative`),
+never at registration — a binding registered later still affects the next lookup.
+
+```python
+from providify import Requires, Fallback
+
+# Gate on YOUR predicate over YOUR runtime state — AND'd with @Profile/@Alternative,
+# checked last. condition= and env=/value= AND together on one marker; stacking two
+# @Requires also ANDs.
+@Requires(condition=lambda: flag["on"])             # any zero-arg predicate
+@Requires(env="CACHE_BACKEND", value="redis")       # active iff env var == "redis"
+@Singleton
+class RedisCache(Cache): ...
+
+# Default binding: a candidate ONLY when no active non-fallback binding matches the
+# same (interface, qualifier, priority) request. Mirrors Quarkus @DefaultBean.
+@Fallback
+@Singleton
+class InMemoryCache(Cache): ...
+```
+
+- `validate()` reports `CONDITION_INACTIVE` / `FALLBACK_SHADOWED` at `Severity.INFO`
+  (`report.infos`) — never affects `report.ok`, never raises.
+- A predicate that *raises* surfaces as `ConditionEvaluationError` from every lookup path.
+- A `@Fallback` singleton cached **before** its shadowing binding registered is **not evicted**.
+
 ### Lifecycle Hooks
 
 ```python
@@ -503,6 +531,26 @@ class UserRepository(Repository[User]):
 repo = container.get(Repository[User])
 ```
 
+### Open-generic providers — `returns=Repo[T]` *(2.1.0)*
+
+One factory serves every closed request sharing its origin. Python cannot instantiate a
+closed generic with substituted params at runtime, so the factory receives the closed type
+as a *value* through a `type[T]` parameter, matched by TypeVar **name**.
+
+```python
+@Provider(returns=Repository[T], singleton=True)
+def make_repo(entity: type[T]) -> Repository[T]:
+    return SqlRepository(entity)
+
+container.get(Repository[User])    # entity=User
+container.get(Repository[Order])   # entity=Order — separate singleton PER closed alias
+container.get(Repository)          # LookupError — bare request never closes an open binding
+```
+
+Rules that bite: a closed binding (`Repository[User]`) always beats the open one; a mixed
+alias (`Repo[list[T]]`, `Pair[str, T]`) is a `TypeError` at registration; a `bound=`/constraint
+violation is a silent non-match, not an error.
+
 **How it works:** `utils.py` provides `_is_generic_subtype()` and `_interface_matches()` that handle all four matching cases: concrete↔concrete, concrete↔generic, generic↔generic, generic↔concrete.
 
 ---
@@ -576,6 +624,7 @@ print(json.dumps(descriptor.to_dict(), indent=2))
 | `ScopeViolationDetectedError` | Short-lived dep injected directly into long-lived component |
 | `LiveInjectionRequiredError` | REQUEST/SESSION dep injected into SINGLETON without `Live[T]` wrapper |
 | `AnnotationResolutionError` | An annotation on an actual injection point (`Inject[T]`/`Lazy[T]`/`Live[T]`/`Instance[T]`/`InjectInstances[T]`, or a `ClassVar` wrapping one) couldn't be resolved at runtime, naming the exact parameter — raised at construction/resolution time or during scope-leak validation. An unresolvable annotation on a non-injected, defaulted parameter never raises this. |
+| `ConditionEvaluationError` | A `@Requires` predicate raised while being evaluated — surfaced from every public lookup path and from `validate()` (2.1.0) |
 | `ClassBindingNotDecoratedError` | `register(cls)` called with an undecorated class |
 | `ProviderBindingNotDecoratedError` | `provide(fn)` called with an undecorated function |
 | `NotDecoratedError` | Generic "not decorated" base error |

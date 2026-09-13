@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-09-13
+
 ### Fixed
 
 - `@Disposes` wiring attached to the first matching `ProviderBinding` in the
@@ -770,7 +772,8 @@ deprecation policy in [CONTRIBUTING.md](CONTRIBUTING.md#versioning-and-deprecati
 
 ---
 
-[Unreleased]: https://github.com/edoardoscarpaci/providify/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/edoardoscarpaci/providify/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/edoardoscarpaci/providify/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/edoardoscarpaci/providify/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/edoardoscarpaci/providify/releases/tag/v2.0.0
 [0.1.7]: https://github.com/edoardoscarpaci/providify/compare/v0.1.6...v0.1.7
