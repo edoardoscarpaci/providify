@@ -725,3 +725,236 @@ class TestConditionInactiveValidation:
         container.validate(raise_on_error=False)
 
         assert container._validated is False
+
+
+# ─────────────────────────────────────────────────────────────────
+#  P34 (varco) — validate() must not graph-check an INACTIVE owner's
+#  own dependencies. Module-level sentinels: __init__/@Provider
+#  annotations are resolved via __globals__ under PEP 563.
+# ─────────────────────────────────────────────────────────────────
+
+
+from providify import Inject  # noqa: E402 — module scope so PEP 563 hints resolve
+
+
+class _OwnerMissing:
+    """Never bound — the unsatisfied dependency of an inactive owner."""
+
+
+class _OwnerPort(ABC):
+    """Interface an inactive owner is bound to."""
+
+
+class _OwnerProduct:
+    """Return type of a @Requires-gated @Provider."""
+
+
+class _OwnerDependent:
+    """Sentinel — an active class depending on _OwnerPort."""
+
+
+class TestInactiveOwnerDependencies:
+    """An inactive binding's OWN injection points are not graph-checked.
+
+    User reports (varco P34): validate() emits CONDITION_INACTIVE (INFO) for
+    a binding gated off by @Requires/@Profile and, in the same report, a
+    MISSING_BINDING ERROR for that binding's own unbound dependency. Correct
+    behaviour: no MISSING_BINDING for the inactive owner, because get() can
+    never construct it — validate()'s contract is "the graph as it will
+    actually be wired" (plans 005/015). Dependents of an inactive binding
+    keep reporting MISSING_BINDING exactly as before (candidate side).
+    """
+
+    @staticmethod
+    def _missing(report: object) -> list[object]:
+        from providify.validation import IssueKind
+
+        return [i for i in report.issues if i.kind is IssueKind.MISSING_BINDING]  # type: ignore[attr-defined]
+
+    def test_regression_validate_inactive_owner_deps_requires_class(
+        self, container: DIContainer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from providify import Requires, Singleton
+        from providify.validation import IssueKind
+
+        monkeypatch.delenv("P34_GATE_CLASS", raising=False)
+
+        @Singleton
+        @Requires(env="P34_GATE_CLASS", value="on")
+        class Gated(_OwnerPort):
+            def __init__(self, m: Inject[_OwnerMissing]) -> None:
+                self.m = m
+
+        container.bind(_OwnerPort, Gated)
+        report = container.validate(raise_on_error=False)
+
+        assert self._missing(report) == []
+        assert any(i.kind is IssueKind.CONDITION_INACTIVE for i in report.issues)
+        assert report.ok is True
+
+    def test_regression_validate_inactive_owner_deps_requires_provider(
+        self, container: DIContainer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from providify import Configuration, Provider, Requires
+        from providify.validation import IssueKind
+
+        monkeypatch.delenv("P34_GATE_PROVIDER", raising=False)
+
+        @Configuration
+        class Config:
+            @Requires(env="P34_GATE_PROVIDER", value="on")
+            @Provider(singleton=True)
+            def product(self, m: _OwnerMissing) -> _OwnerProduct:
+                return _OwnerProduct()
+
+        container.install(Config)
+        report = container.validate(raise_on_error=False)
+
+        assert self._missing(report) == []
+        assert any(i.kind is IssueKind.CONDITION_INACTIVE for i in report.issues)
+        assert report.ok is True
+
+    def test_regression_validate_inactive_owner_deps_profile_excluded_class(
+        self, container: DIContainer
+    ) -> None:
+        from providify import Profile, Singleton
+
+        @Profile("prod")
+        @Singleton
+        class ProdOnly(_OwnerPort):
+            def __init__(self, m: Inject[_OwnerMissing]) -> None:
+                self.m = m
+
+        container.bind(_OwnerPort, ProdOnly)
+        report = container.validate(raise_on_error=False)
+
+        assert self._missing(report) == []
+        assert report.ok is True
+
+    def test_not_enabled_alternative_owner_deps_not_checked(self, container: DIContainer) -> None:
+        """Same predicate (alternative_ok) — a not-enabled @Alternative owner."""
+        from providify import Alternative, Singleton
+
+        @Alternative
+        @Singleton
+        class Alt(_OwnerPort):
+            def __init__(self, m: Inject[_OwnerMissing]) -> None:
+                self.m = m
+
+        container.bind(_OwnerPort, Alt)
+        report = container.validate(raise_on_error=False)
+
+        assert self._missing(report) == []
+
+    def test_active_requires_class_with_missing_dep_still_errors(
+        self, container: DIContainer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from providify import Requires, Singleton
+        from providify.validation import IssueKind, Severity
+
+        monkeypatch.setenv("P34_GATE_ON", "on")
+
+        @Singleton
+        @Requires(env="P34_GATE_ON", value="on")
+        class Gated(_OwnerPort):
+            def __init__(self, m: Inject[_OwnerMissing]) -> None:
+                self.m = m
+
+        container.bind(_OwnerPort, Gated)
+        report = container.validate(raise_on_error=False)
+
+        missing = self._missing(report)
+        assert missing and all(i.severity is Severity.ERROR for i in missing)  # type: ignore[attr-defined]
+        assert not any(i.kind is IssueKind.CONDITION_INACTIVE for i in report.issues)
+        assert report.ok is False
+
+    def test_active_requires_provider_with_missing_dep_still_errors(
+        self, container: DIContainer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from providify import Configuration, Provider, Requires
+
+        monkeypatch.setenv("P34_GATE_PROVIDER_ON", "on")
+
+        @Configuration
+        class Config:
+            @Requires(env="P34_GATE_PROVIDER_ON", value="on")
+            @Provider(singleton=True)
+            def product(self, m: _OwnerMissing) -> _OwnerProduct:
+                return _OwnerProduct()
+
+        container.install(Config)
+        report = container.validate(raise_on_error=False)
+
+        assert len(self._missing(report)) == 1
+        assert report.ok is False
+
+    def test_condition_toggle_is_reflected_on_next_validate(
+        self, container: DIContainer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """E2 — lazy: the same container reports per its CURRENT condition state."""
+        from providify import Requires, Singleton
+
+        monkeypatch.delenv("P34_GATE_TOGGLE", raising=False)
+
+        @Singleton
+        @Requires(env="P34_GATE_TOGGLE", value="on")
+        class Gated(_OwnerPort):
+            def __init__(self, m: Inject[_OwnerMissing]) -> None:
+                self.m = m
+
+        container.bind(_OwnerPort, Gated)
+        assert container.validate(raise_on_error=False).ok is True
+
+        monkeypatch.setenv("P34_GATE_TOGGLE", "on")
+        assert self._missing(container.validate(raise_on_error=False))
+
+    def test_dependent_of_inactive_owner_still_reports_missing_binding(
+        self, container: DIContainer
+    ) -> None:
+        """Candidate side unchanged (plan 015): an ACTIVE dependent of the
+        inactive owner gets exactly one MISSING_BINDING; the inactive owner's
+        own unbound dependency contributes none."""
+        from providify import Component, Requires, Singleton
+        from providify.validation import Severity
+
+        @Requires(condition=lambda: False)
+        @Component
+        class Gated(_OwnerPort):
+            def __init__(self, m: Inject[_OwnerMissing]) -> None:
+                self.m = m
+
+        @Singleton
+        class Dependent(_OwnerDependent):
+            def __init__(self, port: _OwnerPort) -> None:
+                self.port = port
+
+        container.bind(_OwnerPort, Gated)
+        container.register(Dependent)
+        report = container.validate(raise_on_error=False)
+
+        missing = self._missing(report)
+        assert len(missing) == 1
+        assert missing[0].severity is Severity.ERROR  # type: ignore[attr-defined]
+        assert missing[0].requested == "_OwnerPort"  # type: ignore[attr-defined]
+
+    def test_inactive_owner_scope_tier_still_runs(self, container: DIContainer) -> None:
+        """Pass 1 stays unfiltered (plan 005): an inactive owner's scope leak
+        is still reported — only the pass-2 graph walk is skipped."""
+        from providify import Component, Requires, Singleton
+        from providify.validation import IssueKind
+
+        @Component
+        class Shortlived(_OwnerMissing):
+            pass
+
+        @Requires(condition=lambda: False)
+        @Singleton
+        class Gated(_OwnerPort):
+            def __init__(self, m: _OwnerMissing) -> None:
+                self.m = m
+
+        container.bind(_OwnerMissing, Shortlived)
+        container.bind(_OwnerPort, Gated)
+        report = container.validate(raise_on_error=False)
+
+        assert any(i.kind in (IssueKind.SCOPE_LEAK, IssueKind.LIVE_REQUIRED) for i in report.issues)

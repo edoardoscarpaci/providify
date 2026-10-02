@@ -6094,7 +6094,11 @@ class DIContainer:
         for its dependents even though the binding is registered — call
         :meth:`activate_profile` (or construct with ``profiles=...``) or
         satisfy the condition (env var / flag) before validating each
-        deployment configuration you care about.
+        deployment configuration you care about. Symmetrically, an
+        **inactive** binding's own dependencies are not graph-checked
+        (no ``MISSING_BINDING``/``AMBIGUOUS_BINDING`` for its injection
+        points) — ``get()`` can never construct it under the current state;
+        its scope-tier checks and ``CONDITION_INACTIVE`` still run.
 
         Args:
             raise_on_error: When ``True`` (default), raises
@@ -6524,6 +6528,22 @@ class DIContainer:
                 issues.append(shadowed_issue)
 
             if unresolved:
+                continue
+
+            # ── Pass 2 owner gate — an inactive binding is not part of the
+            # wired graph. _filter() already drops it as a CANDIDATE; this
+            # drops it as an OWNER, so pass 2 mirrors get() on both sides of
+            # every edge. Without it, a @Requires/@Profile/@Alternative-
+            # excluded binding — which get() can never construct — had its
+            # own unbound dependencies reported as MISSING_BINDING ERRORs,
+            # describing a deployment other than the one being validated
+            # (varco P34). Passes 1/1b/1c/1d above stay unfiltered by design
+            # (plan 005/015: CONDITION_INACTIVE, scope leaks, E14 raising
+            # predicates). Dropping the owner's edges cannot hide a cycle:
+            # no active edge can point INTO an inactive binding, so it was
+            # never on one. Evaluated after pass 1c, so a raising predicate
+            # has already propagated there (E14) before we get here.
+            if not self._binding_is_active(binding):
                 continue
 
             # ── Pass 2: graph tier — missing / ambiguous / cycle edges ────
