@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] — 2026-10-02
+
+### Fixed
+
+- `validate()` graph-checked the **own** injection points of an inactive
+  binding (`@Requires` condition false, `@Profile`-excluded, or a
+  not-enabled `@Alternative`), reporting their unbound dependencies as
+  `MISSING_BINDING` **ERRORs** — beside the `CONDITION_INACTIVE` INFO for
+  the same binding, and twice for a `bind(Iface, Impl)` pair. Pass 2 now
+  skips an owner for which `_binding_is_active()` is `False`, mirroring
+  `get()` on both sides of an edge as the docstring promises. Passes
+  1/1b/1c/1d are unchanged (scope leaks, `CONDITION_INACTIVE`, raising
+  predicates still reported/propagated); dependents of an inactive binding
+  still get `MISSING_BINDING` exactly as before.
+  **Behaviour change:** a report that was `ok=False` solely because of an
+  inactive binding's own missing dependency is now `ok=True`; validate with
+  the condition/profile on to check that deployment. (varco P34.)
+
 ## [2.1.0] — 2026-09-13
 
 ### Fixed
@@ -772,7 +790,8 @@ deprecation policy in [CONTRIBUTING.md](CONTRIBUTING.md#versioning-and-deprecati
 
 ---
 
-[Unreleased]: https://github.com/edoardoscarpaci/providify/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/edoardoscarpaci/providify/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/edoardoscarpaci/providify/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/edoardoscarpaci/providify/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/edoardoscarpaci/providify/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/edoardoscarpaci/providify/releases/tag/v2.0.0
